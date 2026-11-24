@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Cronotofy",
+    "description": "Apple Liquid Glass UI, AI cover-based dynamic theme, animated personal album wall, and real-time listening analytics for Spotify Desktop — 100% local, no login required.",
+    "preview": "preview.png",
+    "main": "cronotofy.js",
+    "readme": "README.md",
+    "authors": [
+      {
+        "name": "EdwHtx",
+        "url": "https://github.com/EdwHtx"
+      }
+    ],
+    "tags": ["liquid-glass", "dynamic-theme", "analytics", "album-wall", "ui"]
+  }
+]
