@@ -728,7 +728,7 @@
   }
 
   // spicetify-cronotofy/src/aiColorEngine.ts
-  var AI_PALETTE_CACHE_KEY = "cronotofy_ai_palettes_v3";
+  var AI_PALETTE_CACHE_KEY = "cronotofy_ai_palettes_v4";
   var GEMINI_KEY_STORAGE_KEY = "cronotofy_gemini_api_key";
   var MAX_CACHE_ENTRIES = 120;
   function clamp(v, min, max) {
@@ -846,20 +846,20 @@
     const isMono = accentSeed.C < 0.032 && ambientSeed.C < 0.032;
     const accentTuple = isMono ? [226, 232, 240] : oklchToSrgbSafe(
       clamp(accentSeed.L, 0.68, 0.79),
-      clamp(accentSeed.C, 0.16, 0.25),
+      clamp(accentSeed.C, 0.095, 0.245),
       accentSeed.H
     );
     const accent2Tuple = isMono ? [203, 213, 225] : oklchToSrgbSafe(
       clamp(accent2Seed.L, 0.64, 0.76),
-      clamp(accent2Seed.C, 0.14, 0.23),
+      clamp(accent2Seed.C, 0.09, 0.225),
       accent2Seed.H
     );
     const accentSoftTuple = isMono ? [241, 245, 249] : oklchToSrgbSafe(
       0.85,
-      clamp(accentSeed.C * 0.62, 0.075, 0.155),
+      clamp(accentSeed.C * 0.62, 0.065, 0.155),
       accentSeed.H
     );
-    const ambC = isMono ? 8e-3 : clamp(ambientSeed.C * 0.68, 0.04, 0.095);
+    const ambC = isMono ? 8e-3 : clamp(ambientSeed.C * 0.68, 0.032, 0.092);
     const ambH = isMono ? 225 : ambientSeed.H;
     const bgMainTuple = oklchToSrgbSafe(0.165, ambC, ambH);
     const bgSidebarTuple = oklchToSrgbSafe(0.14, ambC * 0.9, ambH);
@@ -898,12 +898,12 @@
     const lch3 = oklabToOklch(rgbToOklab(...rgb3));
     const accentSeed = {
       L: lch1.C < 0.032 ? 0.9 : clamp(lch1.L * 0.35 + 0.49, 0.68, 0.79),
-      C: lch1.C < 0.032 ? lch1.C : clamp(Math.max(lch1.C * 1.18, 0.165), 0.16, 0.25),
+      C: lch1.C < 0.032 ? lch1.C : lch1.C < 0.09 ? clamp(lch1.C * 1.45, 0.095, 0.175) : clamp(lch1.C * 1.16, 0.155, 0.245),
       H: lch1.H
     };
     const accent2Seed = {
       L: lch2.C < 0.032 ? 0.85 : clamp(lch2.L * 0.35 + 0.47, 0.64, 0.76),
-      C: lch2.C < 0.032 ? lch2.C : clamp(Math.max(lch2.C * 1.14, 0.145), 0.14, 0.23),
+      C: lch2.C < 0.032 ? lch2.C : lch2.C < 0.09 ? clamp(lch2.C * 1.35, 0.09, 0.165) : clamp(lch2.C * 1.12, 0.14, 0.225),
       H: lch2.H
     };
     return buildPaletteFromOklchSeeds(accentSeed, accent2Seed, lch3, sourceImageUrl);
@@ -913,6 +913,7 @@
     if (totalPixels === 0 || rgba.length < totalPixels * 4) return null;
     const samples = [];
     let totalAreaWeight = 0;
+    let totalChromaticArea = 0;
     for (let y = 0; y < height; y++) {
       const ny = (y + 0.5) / height - 0.5;
       for (let x = 0; x < width; x++) {
@@ -923,34 +924,31 @@
         const g = rgba[idx + 1];
         const b = rgba[idx + 2];
         const lab = rgbToOklab(r, g, b);
-        if (lab.L < 0.08 || lab.L > 0.96) continue;
+        if (lab.L < 0.055 || lab.L > 0.965) continue;
         const C = Math.hypot(lab.a, lab.b);
         const nx = (x + 0.5) / width - 0.5;
         const focus = Math.exp(-1.8 * (nx * nx + ny * ny));
-        let edge = 0;
-        if (x + 1 < width && y + 1 < height) {
-          const rightIdx = idx + 4;
-          const downIdx = idx + width * 4;
-          const dr = Math.abs(r - rgba[rightIdx]) + Math.abs(r - rgba[downIdx]);
-          const dg = Math.abs(g - rgba[rightIdx + 1]) + Math.abs(g - rgba[downIdx + 1]);
-          const db = Math.abs(b - rgba[rightIdx + 2]) + Math.abs(b - rgba[downIdx + 2]);
-          edge = clamp((dr + dg + db) / 260, 0, 1);
-        }
-        const areaW = 0.65 + 0.35 * focus + 0.3 * edge;
-        const chromaBoost = 0.25 + Math.pow(Math.min(0.32, C) / 0.18, 1.65);
-        const w = areaW * chromaBoost;
+        const areaW = 0.72 + 0.28 * focus;
         totalAreaWeight += areaW;
-        samples.push({ L: lab.L, a: lab.a, b: lab.b, C, w, areaW });
+        if (C >= 0.03) {
+          totalChromaticArea += areaW;
+        }
+        samples.push({ L: lab.L, a: lab.a, b: lab.b, C, areaW });
       }
     }
     if (samples.length === 0) return null;
-    const k = Math.min(6, samples.length);
+    const chromaticCoverage = totalChromaticArea / Math.max(1, totalAreaWeight);
+    if (chromaticCoverage < 0.08) {
+      const monoSeed = { L: 0.9, C: 5e-3, H: 225 };
+      return buildPaletteFromOklchSeeds(monoSeed, monoSeed, { L: 0.22, C: 5e-3, H: 225 }, sourceImageUrl);
+    }
+    const k = Math.min(8, samples.length);
     const centroids = [];
     let firstIdx = 0;
     let firstBestScore = -1;
     for (let i = 0; i < samples.length; i++) {
       const s = samples[i];
-      const score = s.w * (0.4 + s.C * 4.5);
+      const score = s.areaW * (0.65 + 0.35 * Math.min(1, s.C / 0.16));
       if (score > firstBestScore) {
         firstBestScore = score;
         firstIdx = i;
@@ -969,7 +967,7 @@
         const db = s.b - prev.b;
         const d2 = dL * dL + da * da + db * db;
         if (d2 < minDistSq[i]) minDistSq[i] = d2;
-        const wd = minDistSq[i] * s.w;
+        const wd = minDistSq[i] * s.areaW * (0.65 + 0.35 * Math.min(1, s.C / 0.16));
         if (wd > bestWeightedDist) {
           bestWeightedDist = wd;
           bestIdx = i;
@@ -977,14 +975,11 @@
       }
       centroids.push({ L: samples[bestIdx].L, a: samples[bestIdx].a, b: samples[bestIdx].b });
     }
-    const assignments = new Int32Array(samples.length);
-    const sumW = new Float64Array(k);
     const sumArea = new Float64Array(k);
     const sumL = new Float64Array(k);
     const sumA = new Float64Array(k);
     const sumB = new Float64Array(k);
     for (let iter = 0; iter < 12; iter++) {
-      sumW.fill(0);
       sumArea.fill(0);
       sumL.fill(0);
       sumA.fill(0);
@@ -1004,19 +999,17 @@
             bestC = c;
           }
         }
-        assignments[i] = bestC;
-        sumW[bestC] += s.w;
         sumArea[bestC] += s.areaW;
-        sumL[bestC] += s.L * s.w;
-        sumA[bestC] += s.a * s.w;
-        sumB[bestC] += s.b * s.w;
+        sumL[bestC] += s.L * s.areaW;
+        sumA[bestC] += s.a * s.areaW;
+        sumB[bestC] += s.b * s.areaW;
       }
       for (let c = 0; c < k; c++) {
-        if (sumW[c] > 0) {
+        if (sumArea[c] > 0) {
           centroids[c] = {
-            L: sumL[c] / sumW[c],
-            a: sumA[c] / sumW[c],
-            b: sumB[c] / sumW[c]
+            L: sumL[c] / sumArea[c],
+            a: sumA[c] / sumArea[c],
+            b: sumB[c] / sumArea[c]
           };
         }
       }
@@ -1032,26 +1025,41 @@
         b: ctr.b,
         C: lch.C,
         H: lch.H,
-        areaShare: sumArea[c] / Math.max(1, totalAreaWeight)
+        areaShare: sumArea[c] / Math.max(1, totalAreaWeight),
+        familyArea: sumArea[c] / Math.max(1, totalAreaWeight)
       });
     }
     if (clusters.length === 0) return null;
-    const significant = clusters.filter((cl) => cl.areaShare >= 0.02);
+    for (const cl of clusters) {
+      if (cl.C < 0.025) continue;
+      let fam = 0;
+      for (const other of clusters) {
+        if (other.C >= 0.025 && circularHueDistance(cl.H, other.H) <= 32) {
+          fam += other.areaShare;
+        }
+      }
+      cl.familyArea = fam;
+    }
+    const significant = clusters.filter((cl) => cl.areaShare >= 0.015);
     const evalPool = significant.length > 0 ? significant : clusters;
     const maxSignificantChroma = Math.max(...evalPool.map((cl) => cl.C));
-    if (maxSignificantChroma < 0.032) {
+    if (maxSignificantChroma < 0.028) {
       const monoSeed = { L: 0.9, C: 5e-3, H: 225 };
       return buildPaletteFromOklchSeeds(monoSeed, monoSeed, { L: 0.22, C: 5e-3, H: 225 }, sourceImageUrl);
     }
-    const accentCandidates = evalPool.filter((cl) => cl.C >= 0.05 && cl.L >= 0.2 && cl.L <= 0.9);
+    const hasDominantFamily = evalPool.some(
+      (cl) => cl.C >= 0.03 && cl.L >= 0.14 && cl.L <= 0.9 && cl.familyArea >= 0.14
+    );
+    const accentCandidates = evalPool.filter((cl) => cl.C >= 0.03 && cl.L >= 0.14 && cl.L <= 0.9);
     const accentPool = accentCandidates.length > 0 ? accentCandidates : evalPool;
     let primary = accentPool[0];
     let bestAccentScore = -1;
     for (const cl of accentPool) {
-      const vibrancy = Math.pow(cl.C, 1.65);
-      const lightnessBalance = clamp(1 - 0.55 * Math.abs(cl.L - 0.58), 0.35, 1);
-      const presence = Math.pow(Math.max(0.015, cl.areaShare), 0.38);
-      const score = vibrancy * lightnessBalance * presence;
+      const antiSpeck = hasDominantFamily && cl.familyArea < 0.13 ? Math.pow(cl.familyArea / 0.13, 2.4) : 1;
+      const areaFactor = Math.pow(Math.max(0.01, cl.familyArea), 0.85) * Math.pow(Math.max(0.01, cl.areaShare), 0.3);
+      const chromaFactor = Math.pow(Math.min(cl.C, 0.22), 0.65);
+      const lightnessBalance = clamp(1 - 0.5 * Math.abs(cl.L - 0.54), 0.42, 1);
+      const score = areaFactor * chromaFactor * lightnessBalance * antiSpeck;
       if (score > bestAccentScore) {
         bestAccentScore = score;
         primary = cl;
@@ -1060,10 +1068,10 @@
     let secondary = null;
     let bestSecondaryScore = -1;
     for (const cl of evalPool) {
-      if (cl.C < 0.055) continue;
+      if (cl.C < 0.045 || cl.familyArea < 0.06) continue;
       const dist = circularHueDistance(primary.H, cl.H);
       if (dist < 26) continue;
-      const score = Math.pow(cl.C, 1.4) * Math.pow(Math.max(0.015, cl.areaShare), 0.35) * (0.7 + 0.3 * Math.min(1, dist / 90));
+      const score = Math.pow(cl.familyArea, 0.65) * Math.pow(Math.min(cl.C, 0.22), 0.75) * (0.7 + 0.3 * Math.min(1, dist / 90));
       if (score > bestSecondaryScore) {
         bestSecondaryScore = score;
         secondary = cl;
@@ -1073,31 +1081,32 @@
     let bestAmbientScore = -1;
     for (const cl of evalPool) {
       const moodWeight = cl.L <= 0.72 ? 1 : 0.45;
-      const chromaHint = 0.65 + Math.min(0.8, cl.C * 4);
-      const score = cl.areaShare * moodWeight * chromaHint * (1 - Math.abs(cl.L - 0.34) * 0.4);
+      const chromaHint = 0.75 + Math.min(0.45, cl.C * 2.5);
+      const score = (cl.familyArea * 0.6 + cl.areaShare * 0.4) * moodWeight * chromaHint * (1 - Math.abs(cl.L - 0.32) * 0.35);
       if (score > bestAmbientScore) {
         bestAmbientScore = score;
         ambientCluster = cl;
       }
     }
+    const primaryBlend = primary.familyArea >= 0.18 ? 0.14 : 0;
     const ambientBlendLab = {
-      L: ambientCluster.L * 0.62 + primary.L * 0.38,
-      a: ambientCluster.a * 0.62 + primary.a * 0.38,
-      b: ambientCluster.b * 0.62 + primary.b * 0.38
+      L: ambientCluster.L * (1 - primaryBlend) + primary.L * primaryBlend,
+      a: ambientCluster.a * (1 - primaryBlend) + primary.a * primaryBlend,
+      b: ambientCluster.b * (1 - primaryBlend) + primary.b * primaryBlend
     };
     const ambientLch = oklabToOklch(ambientBlendLab);
     const primarySeed = {
       L: clamp(primary.L * 0.35 + 0.49, 0.68, 0.79),
-      C: clamp(Math.max(primary.C * 1.18, 0.165), 0.16, 0.25),
+      C: primary.C < 0.09 ? clamp(primary.C * 1.45, 0.095, 0.175) : clamp(primary.C * 1.16, 0.155, 0.245),
       H: primary.H
     };
     const secondarySeed = secondary ? {
       L: clamp(secondary.L * 0.35 + 0.47, 0.64, 0.76),
-      C: clamp(Math.max(secondary.C * 1.14, 0.145), 0.14, 0.23),
+      C: secondary.C < 0.09 ? clamp(secondary.C * 1.35, 0.09, 0.165) : clamp(secondary.C * 1.12, 0.14, 0.225),
       H: secondary.H
     } : {
       L: clamp(primarySeed.L - 0.03, 0.64, 0.76),
-      C: clamp(primarySeed.C * 0.88, 0.14, 0.22),
+      C: clamp(primarySeed.C * 0.88, 0.09, 0.22),
       H: (primarySeed.H + 24) % 360
     };
     return buildPaletteFromOklchSeeds(primarySeed, secondarySeed, ambientLch, sourceImageUrl);
@@ -1256,7 +1265,7 @@
     try {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
       const trackContext = trackMeta.title ? `Track: "${trackMeta.title}"${trackMeta.artist ? ` by ${trackMeta.artist}` : ""}.` : "";
-      const prompt = `You are a music app art director extracting an Apple Liquid Glass UI color palette from this album cover. ${trackContext} Choose 3 exact #RRGGBB hex colors: 1) accentHex: the signature vibrant iconic color of the cover (bright enough to glow on dark glass; avoid muddy beige/brown if lush foliage, neon, crimson, or vibrant tones exist). 2) accent2Hex: a harmonious secondary color present in the artwork. 3) ambientHex: the deep atmospheric mood color for frosted glass tinting. Respond ONLY with valid JSON: {"accentHex":"#......","accent2Hex":"#......","ambientHex":"#......"}.`;
+      const prompt = `You are a music app art director extracting an Apple Liquid Glass UI color palette from this album cover. ${trackContext} Choose 3 exact #RRGGBB hex colors based on the dominant visual area and overall mood (NEVER let a tiny bright accent spot covering under 15% of the artwork hijack accentHex or ambientHex): 1) accentHex: the dominant iconic color representing the main mood/surface of the cover (balanced for dark glass; preserve cool slate/steel blues or monochrome silver when dominant). 2) accent2Hex: a harmonious secondary color clearly present in the artwork. 3) ambientHex: the deep atmospheric background mood color for frosted glass tinting. Respond ONLY with valid JSON: {"accentHex":"#......","accent2Hex":"#......","ambientHex":"#......"}.`;
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1302,7 +1311,7 @@
 
   // spicetify-cronotofy/src/dynamicTheme.ts
   var DYNAMIC_THEME_STYLE_ID = "cronotofy-dynamic-theme-style";
-  var LAST_PALETTE_STORAGE_KEY = "cronotofy_last_song_palette_v3";
+  var LAST_PALETTE_STORAGE_KEY = "cronotofy_last_song_palette_v4";
   var DEFAULT_PALETTE = {
     sourceImageUrl: "",
     isDynamic: false,
@@ -1378,6 +1387,8 @@
 .Root__main-view,
 .Root__nav-bar,
 .Root__now-playing-bar,
+.main-nowPlayingBar-nowPlayingBar,
+.main-nowPlayingBar-left,
 .Root__right-sidebar,
 #main {
   transition: background-color 0.7s ease, border-color 0.5s ease;
@@ -1442,8 +1453,28 @@ html.cronotofy-playing-theme .Root__globalNav::before {
 }
 
 html.cronotofy-playing-theme .Root__now-playing-bar {
-  background-color: rgba(var(--cronotofy-bg-sidebar-rgb), 0.26) !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.14) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  border-top: none !important;
+}
+
+html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar {
+  background: linear-gradient(
+    180deg,
+    rgba(var(--cronotofy-bg-card-rgb), 0.56) 0%,
+    rgba(var(--cronotofy-bg-sidebar-rgb), 0.66) 100%
+  ) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb), 0.22) !important;
+  box-shadow:
+    0 14px 36px -6px rgba(0, 0, 0, 0.64),
+    0 0 24px -10px rgba(var(--cronotofy-accent-rgb), 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+  background: rgba(var(--cronotofy-bg-main-rgb), 0.46) !important;
+  border-color: rgba(var(--cronotofy-accent-rgb), 0.16) !important;
 }
 
 html.cronotofy-playing-theme [data-testid="progress-bar"] [data-testid="progress-bar-background"] > div,
@@ -4168,6 +4199,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   // spicetify-cronotofy/src/chromeWidgets.ts
   var NAV_BTN_ID = "cronotofy-nav-btn";
   var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
+  var VOLUME_PCT_ID = "cronotofy-volume-pct";
   function isCronotofyRoute(pathname) {
     const path = pathname ?? (typeof Spicetify !== "undefined" ? Spicetify?.Platform?.History?.location?.pathname : "") ?? (typeof window !== "undefined" ? window.location.pathname : "");
     return typeof path === "string" && path.startsWith("/cronotofy");
@@ -4186,8 +4218,13 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       this.telemetryEl = null;
       this.sessionPill = null;
       this.todayPill = null;
+      this.volumePctEl = null;
       this.lastSessionText = "";
       this.lastTodayText = "";
+      this.lastVolumeText = "";
+      this.boundVolumeBars = /* @__PURE__ */ new WeakSet();
+      this.boundScrollViewports = /* @__PURE__ */ new WeakSet();
+      this.bannerScrollRaf = false;
       this.observer = null;
       this.rafPending = false;
       this.initialized = false;
@@ -4199,12 +4236,15 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       this.initialized = true;
       this.ensureMounted();
       this.updateTelemetry();
+      this.updateVolumePct();
       this.syncActiveRoute();
       this.tracker.subscribe(() => {
         this.updateTelemetry();
+        this.updateVolumePct();
       });
       Spicetify?.Platform?.History?.listen?.((loc) => {
         this.syncActiveRoute(loc?.pathname);
+        this.syncBannerScroll();
       });
       if (document.body && typeof MutationObserver !== "undefined") {
         this.observer = new MutationObserver(() => {
@@ -4249,9 +4289,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       wrap.title = "Cronotofy";
       wrap.setAttribute("aria-label", "Cronotofy");
       const sessionPill = document.createElement("span");
-      sessionPill.className = "cronotofy-npb-pill";
+      sessionPill.className = "cronotofy-npb-pill cronotofy-npb-session";
       const todayPill = document.createElement("span");
-      todayPill.className = "cronotofy-npb-pill";
+      todayPill.className = "cronotofy-npb-pill cronotofy-npb-today";
       wrap.append(sessionPill, todayPill);
       wrap.addEventListener("click", (e) => {
         e.preventDefault();
@@ -4266,6 +4306,42 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       this.sessionPill = sessionPill;
       this.todayPill = todayPill;
       return wrap;
+    }
+    getOrCreateVolumePct() {
+      if (this.volumePctEl) return this.volumePctEl;
+      const span = document.createElement("span");
+      span.id = VOLUME_PCT_ID;
+      span.setAttribute("aria-hidden", "true");
+      this.volumePctEl = span;
+      return span;
+    }
+    readVolumePercent() {
+      const player = Spicetify?.Player;
+      if (player?.getMute?.() === true) return 0;
+      const input = document.querySelector(
+        '[data-testid="volume-bar"] input[type="range"]'
+      );
+      if (input) {
+        const val = Number(input.value);
+        if (Number.isFinite(val)) {
+          return Math.round(Math.max(0, Math.min(1, val)) * 100);
+        }
+      }
+      const vol = player?.getVolume?.();
+      if (typeof vol === "number" && Number.isFinite(vol)) {
+        return Math.round(Math.max(0, Math.min(1, vol)) * 100);
+      }
+      return null;
+    }
+    updateVolumePct() {
+      const pct = this.readVolumePercent();
+      if (pct === null) return;
+      const el = this.getOrCreateVolumePct();
+      const text = `${pct}%`;
+      if (this.lastVolumeText !== text) {
+        this.lastVolumeText = text;
+        el.textContent = text;
+      }
     }
     ensureMounted() {
       const searchContainer = document.querySelector(".main-globalNav-searchContainer");
@@ -4286,6 +4362,53 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           leftBar.appendChild(telemetry);
         }
       }
+      const volumeBar = document.querySelector('[data-testid="volume-bar"]');
+      if (volumeBar) {
+        const volEl = this.getOrCreateVolumePct();
+        const orphan = document.getElementById(VOLUME_PCT_ID);
+        if (orphan && orphan !== volEl) orphan.remove();
+        if (volEl.parentElement !== volumeBar || volumeBar.lastElementChild !== volEl) {
+          volumeBar.appendChild(volEl);
+        }
+        if (!this.boundVolumeBars.has(volumeBar)) {
+          this.boundVolumeBars.add(volumeBar);
+          const schedule = () => requestAnimationFrame(() => this.updateVolumePct());
+          for (const ev of ["input", "change", "wheel", "click", "pointerup"]) {
+            volumeBar.addEventListener(ev, schedule, { passive: true });
+          }
+        }
+        this.updateVolumePct();
+      }
+      const viewport = document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".Root__main-view .main-view-container__scroll-node");
+      if (viewport && !this.boundScrollViewports.has(viewport)) {
+        this.boundScrollViewports.add(viewport);
+        viewport.addEventListener(
+          "scroll",
+          () => {
+            if (this.bannerScrollRaf) return;
+            this.bannerScrollRaf = true;
+            requestAnimationFrame(() => {
+              this.bannerScrollRaf = false;
+              this.syncBannerScroll();
+            });
+          },
+          { passive: true }
+        );
+      }
+      this.syncBannerScroll();
+    }
+    syncBannerScroll() {
+      const viewport = document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".Root__main-view .main-view-container__scroll-node");
+      const y = viewport ? -Math.max(0, Math.round(viewport.scrollTop)) : 0;
+      const val = `${y}px`;
+      const banners = document.querySelectorAll(
+        '.MlWLm9_5qALi6Ay0_OCr, .FNyVAJwiyJvKSs7fgcmI, .Root__main-view div:has(> [data-testid="background-image"])'
+      );
+      banners.forEach((el) => {
+        if (el.style.getPropertyValue("--cronotofy-banner-y") !== val) {
+          el.style.setProperty("--cronotofy-banner-y", val);
+        }
+      });
     }
     syncActiveRoute(pathname) {
       const active = this.options.isOpen ? this.options.isOpen() : isCronotofyRoute(pathname);
@@ -4437,6 +4560,21 @@ body,
   z-index: 1;
 }
 
+.Root__top-container {
+  grid-template-areas:
+    "top-banner top-banner top-banner"
+    "global-nav global-nav global-nav"
+    "left-sidebar main-view right-sidebar" !important;
+  grid-template-rows: auto auto 1fr !important;
+}
+
+.Root__main-view .main-view-container__scroll-node-child,
+.Root__nav-bar [data-overlayscrollbars-viewport],
+.Root__right-sidebar [data-overlayscrollbars-viewport],
+#cronotofy-ext-host {
+  padding-bottom: 92px !important;
+}
+
 /* Top Global Nav Bar \u2014 Clean Dark Apple Liquid Glass
    Keep backdrop-filter on ::before so .Root__globalNav stays above .Root__main-view
    and descendants (Recent Searches dropdown) are not trapped behind a Backdrop Root */
@@ -4561,16 +4699,75 @@ body,
   border-radius: 18px !important;
 }
 
-/* Bottom Player Bar \u2014 Clean Dark Apple Liquid Glass Dock */
-.Root__now-playing-bar {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.14) !important;
+/* Right Sidebar Lyrics Preview \u2014 Unified Dark Liquid Glass (fix opaque mask/color overlap) */
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0,
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0.YWvtYcp4OVsd4WMPoZOq,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0.YWvtYcp4OVsd4WMPoZOq {
+  --lyrics-color-background: transparent !important;
+  --lyrics-color-active: #ffffff !important;
+  --lyrics-color-inactive: rgba(255, 255, 255, 0.56) !important;
+  --lyrics-color-passed: rgba(255, 255, 255, 0.72) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
+  background-color: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 18px !important;
   box-shadow:
-    0 -10px 28px -8px rgba(0, 0, 0, 0.48),
-    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .ZZZvR59MO7b3EXPV7ZmC,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .ZZZvR59MO7b3EXPV7ZmC {
+  -webkit-mask-image: linear-gradient(transparent 0%, #000 14%, #000 72%, transparent 100%) !important;
+  mask-image: linear-gradient(transparent 0%, #000 14%, #000 72%, transparent 100%) !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .jQyqeKFeNAxw188HTqK4,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .jQyqeKFeNAxw188HTqK4 {
+  background: transparent !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.62) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(10px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(160%) !important;
+}
+
+[data-testid="NPV_Panel_OpenDiv"] section:has(.NknVk8hYvXI6ovbE8Zj0) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Bottom Player Bar \u2014 Floating Smoked Liquid Glass Capsule */
+.Root__now-playing-bar {
+  position: fixed !important;
+  left: 50% !important;
+  bottom: 10px !important;
+  transform: translateX(-50%) !important;
+  z-index: 60 !important;
+  width: min(880px, calc(100vw - 24px)) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  overflow: visible !important;
+  pointer-events: none !important;
 }
 
 .Root__now-playing-bar footer,
@@ -4578,6 +4775,17 @@ body,
 .main-nowPlayingBar-container {
   background: transparent !important;
   background-color: transparent !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  margin: 0 auto !important;
+  overflow: visible !important;
+  pointer-events: none !important;
+}
+
+.RgDSkGVKeiIGEZLtWcYj {
+  background: transparent !important;
+  overflow: visible !important;
+  height: auto !important;
 }
 
 /* Center Panel (.Root__main-view) \u2014 Near-invisible shell so cards float cleanly */
@@ -4599,7 +4807,66 @@ html.cronotofy-route-active .Root__main-view {
 .main-home-home,
 .main-actionBarBackground-background,
 .main-entityHeader-backgroundColor,
-.main-entityHeader-overlay {
+.main-entityHeader-backgroundColor[data-seamless-gradient],
+.main-entityHeader-overlay,
+[data-testid="overscroll-background"],
+.P1kwly6O5plr1VQVdOLV {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+/* Artist / Entity Banner \u2014 scroll smoothly with the page and feather into Liquid Glass */
+.MlWLm9_5qALi6Ay0_OCr,
+.FNyVAJwiyJvKSs7fgcmI,
+.Root__main-view div:has(> [data-testid="background-image"]) {
+  transform: translate3d(0, var(--cronotofy-banner-y, 0px), 0) !important;
+  will-change: transform;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 72%, transparent 100%) !important;
+  mask-image: linear-gradient(180deg, #000 0%, #000 72%, transparent 100%) !important;
+}
+
+.MlWLm9_5qALi6Ay0_OCr [data-testid="background-image"],
+.FNyVAJwiyJvKSs7fgcmI [data-testid="background-image"],
+.b7x0AwQ51vLACMAHB71B,
+.L0UgUY1nWxdZ3XyrJNMt {
+  animation: none !important;
+  transform: none !important;
+}
+
+/* Soft neutral readability scrim on the banner \u2014 never mix Spotify's opaque artist color curtain */
+.venMPE3QitySGonlITLf,
+.AE3dcjFNJ9068_vrnLB6,
+.Root__main-view [data-testid="background-image"] + div {
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.06) 0%,
+    rgba(0, 0, 0, 0.28) 65%,
+    rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.72) 100%
+  ) !important;
+}
+
+.venMPE3QitySGonlITLf::after,
+.AE3dcjFNJ9068_vrnLB6::after,
+.Root__main-view [data-testid="background-image"] + div::after {
+  display: none !important;
+  opacity: 0 !important;
+  background: none !important;
+  animation: none !important;
+}
+
+/* Scrolled sticky topbar on Spotify pages (Artist/Album/Playlist) \u2014 clean dark Liquid Glass */
+.main-topBar-background {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
+  background-image: none !important;
+  backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+.main-topBar-overlay {
+  background: transparent !important;
   background-color: transparent !important;
 }
 
@@ -4718,110 +4985,358 @@ html.cronotofy-route-active .main-topBar-overlay {
   }
 }
 
-/* Bottom bar: place Current session & Today beside the active song */
-.main-nowPlayingBar-left {
+/* Bottom Floating Capsule Grid: [controls | recessed track card + Cronotofy telemetry | extras + volume%] + full-width progress bar */
+.main-nowPlayingBar-nowPlayingBar {
+  display: grid !important;
+  grid-template-columns: auto minmax(220px, 1fr) auto !important;
+  grid-template-rows: auto auto !important;
+  grid-template-areas:
+    "controls track extras"
+    "progress progress progress" !important;
+  align-items: center !important;
+  column-gap: 10px !important;
+  row-gap: 4px !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 68px !important;
+  padding: 7px 20px 7px !important;
+  border-radius: 999px !important;
+  background: linear-gradient(
+    180deg,
+    rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.56) 0%,
+    rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.64) 100%
+  ) !important;
+  backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow:
+    0 14px 36px -6px rgba(0, 0, 0, 0.62),
+    0 0 0 1px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  overflow: visible !important;
+  position: relative !important;
+  pointer-events: auto !important;
+}
+
+.main-nowPlayingBar-center,
+.main-nowPlayingBar-center .player-controls {
+  display: contents !important;
+  container-type: normal !important;
+  width: auto !important;
+  max-width: none !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .player-controls__buttons {
+  grid-area: controls !important;
+  width: auto !important;
+  margin: 0 !important;
+  gap: 4px !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  flex-shrink: 0 !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .player-controls__left,
+.main-nowPlayingBar-nowPlayingBar .player-controls__right {
+  flex: 0 0 auto !important;
+  gap: 2px !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="control-button-playpause"] {
+  width: 32px !important;
+  height: 32px !important;
+  min-width: 32px !important;
+  min-height: 32px !important;
+  transition: transform 0.15s ease !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .playback-bar {
+  grid-area: progress !important;
+  width: 100% !important;
+  padding: 0 8px !important;
+  --playback-bar-grid-gap: 10px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .playback-bar [data-testid="playback-position"],
+.main-nowPlayingBar-nowPlayingBar .playback-bar [data-testid="playback-duration"] {
+  font-size: 10.5px !important;
+  font-variant-numeric: tabular-nums !important;
+  opacity: 0.78 !important;
+  min-width: 32px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="playback-progressbar"] [data-testid="progress-bar-background"] {
+  background-color: rgba(255, 255, 255, 0.14) !important;
+  border-radius: 999px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+  grid-area: track !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 400px !important;
+  justify-self: center !important;
+  padding: 4px 8px 4px 5px !important;
+  border-radius: 12px !important;
+  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.44) !important;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 4px 14px rgba(0, 0, 0, 0.26) !important;
   display: flex !important;
   flex-direction: row !important;
   align-items: center !important;
-  gap: 8px !important;
-  overflow: clip !important;
-  min-width: 0 !important;
+  justify-content: space-between !important;
+  gap: 7px !important;
+  overflow: hidden !important;
+  container-type: normal !important;
 }
 
 .main-nowPlayingBar-left > :not(#cronotofy-npb-telemetry) {
   order: 0;
-  flex: 0 1 auto;
+  flex: 1 1 auto;
   min-width: 0;
 }
 
 .main-nowPlayingBar-left [data-testid="now-playing-widget"] {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-  overflow: hidden;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  overflow: hidden !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-nowPlayingWidget-coverArt,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-coverSlotCollapsed-container,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .QjXBPUJOGqRvUKoKLwBv,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .hx8RwqDIY4ZzmBQcomN5,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] [data-testid="cover-art-button"] {
+  width: 36px !important;
+  height: 36px !important;
+  min-width: 36px !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  margin-inline-end: 2px !important;
+}
+
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-nowPlayingWidget-coverArt img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-coverSlotCollapsed-container img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .QjXBPUJOGqRvUKoKLwBv img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] [data-testid="cover-art-button"] img {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+}
+
+.main-nowPlayingBar-left .tUoHgXvEUCxKvXSJQmH9,
+.main-nowPlayingBar-left .main-nowPlayingWidget-trackInfo {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  margin: 0 4px !important;
+}
+
+.main-nowPlayingBar-left .N3In4008lBbhQsHzxo9g {
+  margin: 0 2px !important;
+  gap: 6px !important;
+  flex-shrink: 0 !important;
+}
+
+[data-testid="bpm-key-metadata"] {
+  gap: 2px !important;
+  margin-inline: 2px !important;
+}
+
+[data-testid="bpm-key-metadata"] .FQzlEc9iLGlUtjpCFOUx > *,
+[data-testid="bpm-key-metadata"] > div:nth-child(2) > * {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16) !important;
+  background-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16) !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.30) !important;
+  border-radius: 6px !important;
+  padding: 1px 5px !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  line-height: 1.25 !important;
+  box-shadow: none !important;
+  filter: none !important;
 }
 
 #cronotofy-npb-telemetry {
   order: 99 !important;
   font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
   display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  flex: 0 0 auto;
   min-width: 0;
-  max-width: 46%;
+  max-width: 138px;
   z-index: 2;
   cursor: pointer;
   background: transparent;
   border: none;
-  padding: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 0 8px 8px 0;
+  padding: 2px 4px 2px 8px;
   margin: 0;
-  text-align: left;
+  text-align: right;
   color: inherit;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+
+#cronotofy-npb-telemetry:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.12);
 }
 
 .cronotofy-npb-pill {
   display: inline-flex;
   align-items: center;
-  padding: 4px 10px;
-  border-radius: 9999px;
-  font-size: 11px;
-  font-weight: 600;
+  gap: 5px;
+  padding: 0;
+  border-radius: 0;
   line-height: 1.25;
   white-space: nowrap;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
-  color: var(--cronotofy-accent-soft, #f1f5f9);
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  box-shadow:
-    0 10px 28px -8px rgba(0, 0, 0, 0.48),
-    inset 0 1px 0 rgba(255, 255, 255, 0.24),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
-  transition: transform 0.15s ease, border-color 0.2s ease, background-color 0.2s ease;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
-#cronotofy-npb-telemetry:hover .cronotofy-npb-pill {
-  border-color: rgba(255, 255, 255, 0.26);
-  transform: translateY(-1px);
+.cronotofy-npb-pill.cronotofy-npb-session {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+}
+
+.cronotofy-npb-pill.cronotofy-npb-session::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--cronotofy-accent, #e2e8f0);
+  box-shadow: 0 0 6px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.7);
+}
+
+.cronotofy-npb-pill.cronotofy-npb-today {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.68);
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-right {
+  grid-area: extras !important;
+  width: auto !important;
+  min-width: 0 !important;
+  flex: 0 0 auto !important;
+  justify-content: flex-end !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-extraControls {
+  gap: 2px !important;
+  flex-wrap: nowrap !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  margin-right: 4px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] .GRePaldGFb3UeyjULrVd {
+  width: 32px !important;
+  min-width: 32px !important;
+  transition: width 0.2s cubic-bezier(0.22, 1, 0.36, 1) !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:hover .GRePaldGFb3UeyjULrVd,
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:focus-within .GRePaldGFb3UeyjULrVd {
+  width: 68px !important;
+}
+
+#cronotofy-volume-pct {
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.80);
+  min-width: 30px;
+  text-align: right;
+  pointer-events: none;
+  user-select: none;
+  line-height: 1;
+}
+
+.main-nowPlayingBar-container .main-connectBar-connectBar {
+  margin: 5px auto 0 !important;
+  border-radius: 999px !important;
+  width: fit-content !important;
+  padding-inline: 14px !important;
+  pointer-events: auto !important;
 }
 
 @media (max-width: 1440px) {
   #cronotofy-npb-telemetry {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 3px;
-    max-width: 150px;
+    max-width: 142px;
+    padding-left: 8px;
   }
 
-  .cronotofy-npb-pill {
-    padding: 2px 8px;
+  .cronotofy-npb-pill.cronotofy-npb-session {
     font-size: 10px;
   }
-}
 
-@media (max-width: 1060px) {
-  .main-nowPlayingBar-left {
-    gap: 6px !important;
-  }
-
-  #cronotofy-npb-telemetry {
-    gap: 2px;
-    max-width: 118px;
-  }
-
-  .cronotofy-npb-pill {
-    padding: 1.5px 6px;
+  .cronotofy-npb-pill.cronotofy-npb-today {
     font-size: 9.5px;
   }
 }
 
-@media (max-width: 820px) {
+@media (max-width: 1060px) {
+  .main-nowPlayingBar-nowPlayingBar {
+    padding: 8px 16px 7px !important;
+    column-gap: 10px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+    gap: 6px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] .GRePaldGFb3UeyjULrVd {
+    width: 22px !important;
+    min-width: 22px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:hover .GRePaldGFb3UeyjULrVd,
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:focus-within .GRePaldGFb3UeyjULrVd {
+    width: 62px !important;
+  }
+
   #cronotofy-npb-telemetry {
+    max-width: 116px;
+  }
+}
+
+@media (max-width: 820px) {
+  .main-nowPlayingBar-nowPlayingBar {
+    border-radius: 26px !important;
+    padding: 8px 12px 7px !important;
+  }
+
+  #cronotofy-npb-telemetry,
+  #cronotofy-volume-pct {
     display: none;
   }
 }
@@ -5038,106 +5553,110 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       if (window.__CRONOTOFY_MOD__) {
         return;
       }
-      const tracker = new ListeningTracker();
-      const themeController = new DynamicThemeController();
-      const globalWall = new GlobalAlbumWallController();
-      const chromeWidgets = new CronotofyChromeWidgets(tracker, {
-        onOpen: options.onOpen,
-        isOpen: options.isOpen
-      });
-      let lastThemeKey = "";
-      const syncThemeFromPlayer = () => {
-        const live = tracker.getLiveTrack();
-        if (!live || !live.albumImageUrl) return;
-        const key = `${live.uri}|${live.albumImageUrl}`;
-        if (key === lastThemeKey) return;
-        lastThemeKey = key;
-        void themeController.updateFromLiveTrack(live);
-      };
-      const seedThemeIfNeeded = async () => {
-        if (themeController.getPalette().isDynamic) return;
-        const snap = tracker.getSnapshot();
-        const localCover = snap.recentPlays.find((p) => p.albumImageUrl) || snap.tracks.find((t) => t.albumImageUrl);
-        if (localCover?.albumImageUrl) {
-          await themeController.seedFromCoverIfNeeded(localCover.albumImageUrl, localCover.uri);
+      try {
+        const tracker = new ListeningTracker();
+        const themeController = new DynamicThemeController();
+        const globalWall = new GlobalAlbumWallController();
+        const chromeWidgets = new CronotofyChromeWidgets(tracker, {
+          onOpen: options.onOpen,
+          isOpen: options.isOpen
+        });
+        let lastThemeKey = "";
+        const syncThemeFromPlayer = () => {
+          const live = tracker.getLiveTrack();
+          if (!live || !live.albumImageUrl) return;
+          const key = `${live.uri}|${live.albumImageUrl}`;
+          if (key === lastThemeKey) return;
+          lastThemeKey = key;
+          void themeController.updateFromLiveTrack(live);
+        };
+        const seedThemeIfNeeded = async () => {
           if (themeController.getPalette().isDynamic) return;
-        }
-        try {
-          const recent = await Spicetify.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/player/recently-played?limit=1"
-          ).catch(() => null);
-          const recentTrack = recent?.items?.[0]?.track;
-          const recentImg = normalizeSpotifyImage(recentTrack?.album?.images?.[0]?.url);
-          if (recentImg) {
-            await themeController.seedFromCoverIfNeeded(recentImg, recentTrack?.uri);
+          const snap = tracker.getSnapshot();
+          const localCover = snap.recentPlays.find((p) => p.albumImageUrl) || snap.tracks.find((t) => t.albumImageUrl);
+          if (localCover?.albumImageUrl) {
+            await themeController.seedFromCoverIfNeeded(localCover.albumImageUrl, localCover.uri);
             if (themeController.getPalette().isDynamic) return;
           }
-          const top = await Spicetify.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/top/tracks?time_range=short_term&limit=1"
-          ).catch(() => null);
-          const topTrack = top?.items?.[0];
-          const topImg = normalizeSpotifyImage(topTrack?.album?.images?.[0]?.url);
-          if (topImg) {
-            await themeController.seedFromCoverIfNeeded(topImg, topTrack?.uri);
+          try {
+            const recent = await Spicetify.CosmosAsync?.get(
+              "https://api.spotify.com/v1/me/player/recently-played?limit=1"
+            ).catch(() => null);
+            const recentTrack = recent?.items?.[0]?.track;
+            const recentImg = normalizeSpotifyImage(recentTrack?.album?.images?.[0]?.url);
+            if (recentImg) {
+              await themeController.seedFromCoverIfNeeded(recentImg, recentTrack?.uri);
+              if (themeController.getPalette().isDynamic) return;
+            }
+            const top = await Spicetify.CosmosAsync?.get(
+              "https://api.spotify.com/v1/me/top/tracks?time_range=short_term&limit=1"
+            ).catch(() => null);
+            const topTrack = top?.items?.[0];
+            const topImg = normalizeSpotifyImage(topTrack?.album?.images?.[0]?.url);
+            if (topImg) {
+              await themeController.seedFromCoverIfNeeded(topImg, topTrack?.uri);
+            }
+          } catch {
           }
-        } catch {
-        }
-      };
-      window.__CRONOTOFY_MOD__ = {
-        version: CRONOTOFY_MOD_CONFIG.version,
-        getUser: () => resolveCurrentSpotifyUser(),
-        getTrackerSnapshot: () => tracker.getSnapshot(),
-        getLiveTrack: () => tracker.getLiveTrack(),
-        syncNow: () => tracker.syncNow(),
-        subscribe: (fn) => {
-          const unsubTracker = tracker.subscribe(fn);
-          const unsubTheme = themeController.subscribe(fn);
-          return () => {
-            unsubTracker();
-            unsubTheme();
-          };
-        },
-        clearLocalHistory: () => tracker.clearLocalHistory(),
-        getDynamicPalette: () => themeController.getPalette(),
-        isDynamicThemeEnabled: () => themeController.isEnabled(),
-        setDynamicThemeEnabled: (enabled) => {
-          themeController.setEnabled(enabled);
-          lastThemeKey = "";
+        };
+        window.__CRONOTOFY_MOD__ = {
+          version: CRONOTOFY_MOD_CONFIG.version,
+          getUser: () => resolveCurrentSpotifyUser(),
+          getTrackerSnapshot: () => tracker.getSnapshot(),
+          getLiveTrack: () => tracker.getLiveTrack(),
+          syncNow: () => tracker.syncNow(),
+          subscribe: (fn) => {
+            const unsubTracker = tracker.subscribe(fn);
+            const unsubTheme = themeController.subscribe(fn);
+            return () => {
+              unsubTracker();
+              unsubTheme();
+            };
+          },
+          clearLocalHistory: () => tracker.clearLocalHistory(),
+          getDynamicPalette: () => themeController.getPalette(),
+          isDynamicThemeEnabled: () => themeController.isEnabled(),
+          setDynamicThemeEnabled: (enabled) => {
+            themeController.setEnabled(enabled);
+            lastThemeKey = "";
+            syncThemeFromPlayer();
+          },
+          setGeminiApiKey: (apiKey) => {
+            setGeminiApiKey(apiKey);
+            lastThemeKey = "";
+            const live = tracker.getLiveTrack();
+            if (live) {
+              void themeController.updateFromLiveTrack(live);
+            }
+          },
+          hasGeminiApiKey: () => Boolean(getConfiguredGeminiApiKey()),
+          updateWallCovers: (covers) => {
+            globalWall.updateCovers(covers);
+            if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
+              void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
+            }
+          }
+        };
+        void tracker.init().then(() => {
           syncThemeFromPlayer();
-        },
-        setGeminiApiKey: (apiKey) => {
-          setGeminiApiKey(apiKey);
-          lastThemeKey = "";
-          const live = tracker.getLiveTrack();
-          if (live) {
-            void themeController.updateFromLiveTrack(live);
-          }
-        },
-        hasGeminiApiKey: () => Boolean(getConfiguredGeminiApiKey()),
-        updateWallCovers: (covers) => {
-          globalWall.updateCovers(covers);
-          if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
-            void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
-          }
-        }
-      };
-      void tracker.init().then(() => {
+          void seedThemeIfNeeded();
+        });
+        void globalWall.init();
+        chromeWidgets.init();
+        options.onChromeReady?.(chromeWidgets);
+        tracker.subscribe(syncThemeFromPlayer);
+        Spicetify.Player.addEventListener?.("songchange", () => {
+          tracker.onSongChange();
+          syncThemeFromPlayer();
+        });
+        Spicetify.Player.addEventListener?.("onplaypause", () => {
+          tracker.onPlayPause();
+          syncThemeFromPlayer();
+        });
         syncThemeFromPlayer();
-        void seedThemeIfNeeded();
-      });
-      void globalWall.init();
-      chromeWidgets.init();
-      options.onChromeReady?.(chromeWidgets);
-      tracker.subscribe(syncThemeFromPlayer);
-      Spicetify.Player.addEventListener?.("songchange", () => {
-        tracker.onSongChange();
-        syncThemeFromPlayer();
-      });
-      Spicetify.Player.addEventListener?.("onplaypause", () => {
-        tracker.onPlayPause();
-        syncThemeFromPlayer();
-      });
-      syncThemeFromPlayer();
+      } catch (err) {
+        console.warn("[Cronotofy] startup error:", err);
+      }
     };
     tryStart();
   }
