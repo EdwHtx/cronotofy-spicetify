@@ -555,13 +555,6 @@
         tooltipIdle: "Sleep timer (Alt+Shift+S)",
         tooltipActive: (detail) => `Sleep timer: ${detail} (right-click to cancel)`
       },
-      wallMode: {
-        label: "Wall",
-        auto: "Auto",
-        vertical: "Vertical",
-        horizontal: "Horizontal",
-        toast: (modeLabel) => `Background wall: ${modeLabel}`
-      },
       time: {
         justNow: "Just now",
         secondsAgo: (s) => `${s}s ago`,
@@ -684,13 +677,6 @@
         triggeredToast: "Temporizador finalizado \u2014 reproducci\xF3n pausada",
         tooltipIdle: "Temporizador de sue\xF1o (Alt+Shift+S)",
         tooltipActive: (detail) => `Temporizador: ${detail} (clic derecho para cancelar)`
-      },
-      wallMode: {
-        label: "Fondo",
-        auto: "Auto",
-        vertical: "Vertical",
-        horizontal: "Horizontal",
-        toast: (modeLabel) => `Mural de portadas: ${modeLabel}`
       },
       time: {
         justNow: "Hace un momento",
@@ -815,13 +801,6 @@
         tooltipIdle: "Temporizador (Alt+Shift+S)",
         tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
       },
-      wallMode: {
-        label: "Fundo",
-        auto: "Auto",
-        vertical: "Vertical",
-        horizontal: "Horizontal",
-        toast: (modeLabel) => `Mural de capas: ${modeLabel}`
-      },
       time: {
         justNow: "Agora mesmo",
         secondsAgo: (s) => `H\xE1 ${s}s`,
@@ -944,13 +923,6 @@
         triggeredToast: "Minuteur termin\xE9 \u2014 lecture en pause",
         tooltipIdle: "Minuteur de veille (Alt+Shift+S)",
         tooltipActive: (detail) => `Minuteur : ${detail} (clic droit pour annuler)`
-      },
-      wallMode: {
-        label: "Fond",
-        auto: "Auto",
-        vertical: "Vertical",
-        horizontal: "Horizontal",
-        toast: (modeLabel) => `Mur de pochettes : ${modeLabel}`
       },
       time: {
         justNow: "\xC0 l'instant",
@@ -1075,13 +1047,6 @@
         tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
         tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
       },
-      wallMode: {
-        label: "Hintergrund",
-        auto: "Auto",
-        vertical: "Vertikal",
-        horizontal: "Horizontal",
-        toast: (modeLabel) => `Cover-Wand: ${modeLabel}`
-      },
       time: {
         justNow: "Gerade eben",
         secondsAgo: (s) => `Vor ${s}s`,
@@ -1204,13 +1169,6 @@
         triggeredToast: "Timer scaduto \u2014 riproduzione in pausa",
         tooltipIdle: "Timer spegnimento (Alt+Shift+S)",
         tooltipActive: (detail) => `Timer: ${detail} (tasto destro per annullare)`
-      },
-      wallMode: {
-        label: "Sfondo",
-        auto: "Auto",
-        vertical: "Verticale",
-        horizontal: "Orizzontale",
-        toast: (modeLabel) => `Muro copertine: ${modeLabel}`
       },
       time: {
         justNow: "Proprio ora",
@@ -3253,42 +3211,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
 }
 
-.cronotofy-controls-right {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-
-.cronotofy-wall-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  box-shadow:
-    0 8px 22px -6px rgba(0, 0, 0, 0.40),
-    inset 0 1px 0 rgba(255, 255, 255, 0.26);
-  color: #e2e8f0;
-  font-size: 11.5px;
-  font-weight: 700;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
-}
-
-.cronotofy-wall-btn:hover {
-  color: #ffffff;
-  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.44);
-  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.14);
-}
-
 .cronotofy-kpi-head {
   display: flex;
   align-items: center;
@@ -4055,9 +3977,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     const [timeRange, setTimeRange] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTimeRange);
     const [searchQuery, setSearchQuery] = useState("");
     const [confirmClear, setConfirmClear] = useState(false);
-    const [wallMode, setWallMode] = useState(
-      () => window.__CRONOTOFY_MOD__?.getWallMode?.() ?? "auto"
-    );
     const [user, setUser] = useState(null);
     const [topTracks, setTopTracks] = useState([]);
     const [topArtists, setTopArtists] = useState([]);
@@ -4386,14 +4305,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
       }
     }, [t]);
-    const handleCycleWallMode = useCallback(() => {
-      const order = ["auto", "vertical", "horizontal"];
-      const next = order[(order.indexOf(wallMode) + 1) % order.length];
-      setWallMode(next);
-      window.__CRONOTOFY_MOD__?.setWallMode?.(next);
-      const label = next === "auto" ? t.wallMode.auto : next === "vertical" ? t.wallMode.vertical : t.wallMode.horizontal;
-      Spicetify?.showNotification?.(t.wallMode.toast(label));
-    }, [wallMode, t]);
     const formatArtistStat = (artist) => {
       if (artist.popularity > 0) return t.entities.popularityLabel(artist.popularity);
       if (artist.periodTrackCount && artist.periodTrackCount > 0) {
@@ -4644,17 +4555,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         onClick: () => setSearchQuery("")
       },
       "\xD7"
-    )), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-right" }, /* @__PURE__ */ Spicetify.React.createElement(
-      "button",
-      {
-        type: "button",
-        className: "cronotofy-wall-btn",
-        onClick: handleCycleWallMode,
-        title: t.wallMode.label,
-        "aria-label": t.wallMode.label
-      },
-      /* @__PURE__ */ Spicetify.React.createElement("span", null, t.wallMode.label, ":", " ", wallMode === "auto" ? t.wallMode.auto : wallMode === "vertical" ? t.wallMode.vertical : t.wallMode.horizontal)
-    ), activeTab !== "live" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-periods" }, ["short_term", "medium_term", "long_term"].map((r) => /* @__PURE__ */ Spicetify.React.createElement(
+    )), activeTab !== "live" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-periods" }, ["short_term", "medium_term", "long_term"].map((r) => /* @__PURE__ */ Spicetify.React.createElement(
       "button",
       {
         key: r,
@@ -4663,7 +4564,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         onClick: () => setTimeRange(r)
       },
       periodLabels[r]
-    ))))), loading && topTracks.length === 0 && activeTab !== "live" ? /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty" }, t.loadingAnalytics) : null, activeTab === "overview" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-head" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.recordedTime), snapshot.streakDays >= 2 && /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.streak.daysBadge(snapshot.streakDays))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.kpis.todayLabel, " \xB7 ", t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds)))), /* @__PURE__ */ Spicetify.React.createElement(
+    )))), loading && topTracks.length === 0 && activeTab !== "live" ? /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty" }, t.loadingAnalytics) : null, activeTab === "overview" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-head" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.recordedTime), snapshot.streakDays >= 2 && /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.streak.daysBadge(snapshot.streakDays))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.kpis.todayLabel, " \xB7 ", t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds)))), /* @__PURE__ */ Spicetify.React.createElement(
       "div",
       {
         className: "cronotofy-card",
@@ -5423,21 +5324,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   // spicetify-cronotofy/src/globalWall.ts
   var GLOBAL_WALL_STYLE_ID = "cronotofy-global-wall-style";
   var GLOBAL_WALL_ROOT_ID = "cronotofy-global-wall";
-  var WALL_MODE_STORAGE_KEY = "cronotofy_wall_mode_v1";
-  function loadWallMode() {
-    try {
-      const raw = localStorage.getItem(WALL_MODE_STORAGE_KEY);
-      if (raw === "vertical" || raw === "horizontal" || raw === "auto") return raw;
-    } catch {
-    }
-    return "auto";
-  }
-  function saveWallMode(mode) {
-    try {
-      localStorage.setItem(WALL_MODE_STORAGE_KEY, mode);
-    } catch {
-    }
-  }
   var GLOBAL_WALL_CSS = `
 #${GLOBAL_WALL_ROOT_ID} {
   position: fixed;
@@ -5452,22 +5338,32 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
 .cronotofy-gwall-grid {
   position: absolute;
-  inset: -160px -140px;
+  inset: -120px -90px;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  justify-content: center;
+  gap: 18px;
+  transform: rotate(-2.5deg) scale(1.1);
+}
+
+.cronotofy-gwall-wing {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 18px;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.cronotofy-gwall-center {
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 18px;
-  transform: rotate(-3deg) scale(1.12);
-  opacity: 1;
-  transition: opacity 0.35s ease;
-}
-
-.cronotofy-gwall-grid.is-vertical {
-  flex-direction: row;
-  align-items: flex-start;
-  justify-content: center;
-  gap: 18px;
-  transform: rotate(-2.5deg) scale(1.12);
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .cronotofy-gwall-row {
@@ -6002,6 +5898,8 @@ html.cronotofy-route-active .main-topBar-overlay {
 
 @media (max-width: 1100px) {
   .cronotofy-gwall-grid,
+  .cronotofy-gwall-wing,
+  .cronotofy-gwall-center,
   .cronotofy-gwall-row,
   .cronotofy-gwall-col {
     gap: 14px;
@@ -6011,6 +5909,12 @@ html.cronotofy-route-active .main-topBar-overlay {
     width: 98px;
     height: 98px;
     border-radius: 12px;
+  }
+}
+
+@media (max-width: 760px) {
+  .cronotofy-gwall-wing > :nth-child(3) {
+    display: none;
   }
 }
 
@@ -6461,24 +6365,6 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       this.renderSignature = "";
       this.userId = "default";
       this.initialized = false;
-      this.mode = loadWallMode();
-      this.activeOrientation = this.mode === "horizontal" ? "horizontal" : "vertical";
-    }
-    getMode() {
-      return this.mode;
-    }
-    setMode(mode) {
-      this.mode = mode;
-      saveWallMode(mode);
-      if (mode === "vertical" || mode === "horizontal") {
-        this.activeOrientation = mode;
-      }
-      this.renderWall(true);
-    }
-    onSongChange() {
-      if (this.mode !== "auto" || this.currentCovers.length === 0) return;
-      this.activeOrientation = this.activeOrientation === "vertical" ? "horizontal" : "vertical";
-      this.renderWall(true);
     }
     async init() {
       if (this.initialized) return;
@@ -6596,68 +6482,63 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       }
       this.currentCovers = unique;
       if (seedKey) this.userId = seedKey;
-      this.renderWall(false);
+      this.renderWall();
     }
-    renderWall(force) {
+    renderWall() {
       if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
       const unique = deduplicateWallCovers(this.currentCovers);
       if (unique.length === 0) return;
       const firstId = unique[0]?.id || "";
       const lastId = unique[unique.length - 1]?.id || "";
-      const sig = `${this.activeOrientation}:${unique.length}:${firstId}:${lastId}`;
-      if (!force && this.renderSignature === sig) return;
+      const sig = `combined:${unique.length}:${firstId}:${lastId}`;
+      if (this.renderSignature === sig) return;
       this.renderSignature = sig;
       const container = this.ensureMounted();
       if (!container) return;
+      const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", 14, 9);
       const speeds = ["88s", "104s", "80s", "98s", "84s", "110s", "94s", "102s", "86s", "96s"];
-      const grid = document.createElement("div");
-      if (this.activeOrientation === "vertical") {
-        const colCount = 12;
-        const minPerCol = 7;
-        const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", colCount, minPerCol);
-        grid.className = "cronotofy-gwall-grid is-vertical";
-        lanes.forEach((colItems, colIndex) => {
+      const createTile = (cover) => {
+        const tile = document.createElement("div");
+        tile.className = "cronotofy-gwall-tile";
+        const img = document.createElement("img");
+        img.src = cover.imageUrl;
+        img.alt = "";
+        img.loading = "lazy";
+        tile.appendChild(img);
+        return tile;
+      };
+      const buildWing = (wingLanes, startDirIdx) => {
+        const wing = document.createElement("div");
+        wing.className = "cronotofy-gwall-wing";
+        wingLanes.forEach((colItems, idx) => {
           const col = document.createElement("div");
-          const dir = colIndex % 2 === 0 ? "up" : "down";
+          const dir = (idx + startDirIdx) % 2 === 0 ? "up" : "down";
           col.className = `cronotofy-gwall-col ${dir}`;
-          col.style.setProperty("--cronotofy-gmarquee-duration", speeds[colIndex % speeds.length]);
-          const doubled = [...colItems, ...colItems];
-          for (const cover of doubled) {
-            const tile = document.createElement("div");
-            tile.className = "cronotofy-gwall-tile";
-            const img = document.createElement("img");
-            img.src = cover.imageUrl;
-            img.alt = "";
-            img.loading = "lazy";
-            tile.appendChild(img);
-            col.appendChild(tile);
+          col.style.setProperty("--cronotofy-gmarquee-duration", speeds[(idx + startDirIdx) % speeds.length]);
+          for (const cover of [...colItems, ...colItems]) {
+            col.appendChild(createTile(cover));
           }
-          grid.appendChild(col);
+          wing.appendChild(col);
         });
-      } else {
-        const rowCount = 6;
-        const minPerRow = 12;
-        const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", rowCount, minPerRow);
-        grid.className = "cronotofy-gwall-grid";
-        lanes.forEach((rowItems, rowIndex) => {
-          const row = document.createElement("div");
-          const dir = rowIndex % 2 === 0 ? "left" : "right";
-          row.className = `cronotofy-gwall-row ${dir}`;
-          row.style.setProperty("--cronotofy-gmarquee-duration", speeds[rowIndex % speeds.length]);
-          const doubled = [...rowItems, ...rowItems];
-          for (const cover of doubled) {
-            const tile = document.createElement("div");
-            tile.className = "cronotofy-gwall-tile";
-            const img = document.createElement("img");
-            img.src = cover.imageUrl;
-            img.alt = "";
-            img.loading = "lazy";
-            tile.appendChild(img);
-            row.appendChild(tile);
-          }
-          grid.appendChild(row);
-        });
-      }
+        return wing;
+      };
+      const leftWing = buildWing(lanes.slice(0, 3), 0);
+      const centerZone = document.createElement("div");
+      centerZone.className = "cronotofy-gwall-center";
+      lanes.slice(3, 11).forEach((rowItems, rowIndex) => {
+        const row = document.createElement("div");
+        const dir = rowIndex % 2 === 0 ? "left" : "right";
+        row.className = `cronotofy-gwall-row ${dir}`;
+        row.style.setProperty("--cronotofy-gmarquee-duration", speeds[(rowIndex + 3) % speeds.length]);
+        for (const cover of [...rowItems, ...rowItems]) {
+          row.appendChild(createTile(cover));
+        }
+        centerZone.appendChild(row);
+      });
+      const rightWing = buildWing(lanes.slice(11, 14), 1);
+      const grid = document.createElement("div");
+      grid.className = "cronotofy-gwall-grid";
+      grid.append(leftWing, centerZone, rightWing);
       const scrim = document.createElement("div");
       scrim.className = "cronotofy-gwall-scrim";
       container.replaceChildren(grid, scrim);
@@ -7626,9 +7507,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
             if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
               void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
             }
-          },
-          getWallMode: () => globalWall.getMode(),
-          setWallMode: (mode) => globalWall.setMode(mode)
+          }
         };
         void tracker.init().then(() => {
           syncThemeFromPlayer();
@@ -7642,7 +7521,6 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         Spicetify.Player.addEventListener?.("songchange", () => {
           tracker.onSongChange();
           syncThemeFromPlayer();
-          globalWall.onSongChange();
         });
         Spicetify.Player.addEventListener?.("onplaypause", () => {
           tracker.onPlayPause();
