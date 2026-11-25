@@ -5338,32 +5338,12 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
 .cronotofy-gwall-grid {
   position: absolute;
-  inset: -120px -90px;
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  justify-content: center;
-  gap: 18px;
-  transform: rotate(-2.5deg) scale(1.1);
-}
-
-.cronotofy-gwall-wing {
-  display: flex;
-  flex-direction: row;
-  align-items: flex-start;
-  gap: 18px;
-  flex: 0 0 auto;
-  overflow: hidden;
-}
-
-.cronotofy-gwall-center {
+  inset: -140px -120px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 18px;
-  flex: 1 1 0;
-  min-width: 0;
-  overflow: hidden;
+  transform: rotate(-3deg) scale(1.12);
 }
 
 .cronotofy-gwall-row {
@@ -5374,29 +5354,12 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   will-change: transform;
 }
 
-.cronotofy-gwall-col {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 18px;
-  height: max-content;
-  will-change: transform;
-}
-
 .cronotofy-gwall-row.left {
-  animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 92s) linear infinite;
+  animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 118s) linear infinite;
 }
 
 .cronotofy-gwall-row.right {
-  animation: cronotofyGlobalMarqueeRight var(--cronotofy-gmarquee-duration, 100s) linear infinite;
-}
-
-.cronotofy-gwall-col.up {
-  animation: cronotofyGlobalMarqueeUp var(--cronotofy-gmarquee-duration, 92s) linear infinite;
-}
-
-.cronotofy-gwall-col.down {
-  animation: cronotofyGlobalMarqueeDown var(--cronotofy-gmarquee-duration, 100s) linear infinite;
+  animation: cronotofyGlobalMarqueeRight var(--cronotofy-gmarquee-duration, 130s) linear infinite;
 }
 
 @keyframes cronotofyGlobalMarqueeLeft {
@@ -5411,24 +5374,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 @keyframes cronotofyGlobalMarqueeRight {
   0% {
     transform: translate3d(-50%, 0, 0);
-  }
-  100% {
-    transform: translate3d(0, 0, 0);
-  }
-}
-
-@keyframes cronotofyGlobalMarqueeUp {
-  0% {
-    transform: translate3d(0, 0, 0);
-  }
-  100% {
-    transform: translate3d(0, -50%, 0);
-  }
-}
-
-@keyframes cronotofyGlobalMarqueeDown {
-  0% {
-    transform: translate3d(0, -50%, 0);
   }
   100% {
     transform: translate3d(0, 0, 0);
@@ -5898,10 +5843,7 @@ html.cronotofy-route-active .main-topBar-overlay {
 
 @media (max-width: 1100px) {
   .cronotofy-gwall-grid,
-  .cronotofy-gwall-wing,
-  .cronotofy-gwall-center,
-  .cronotofy-gwall-row,
-  .cronotofy-gwall-col {
+  .cronotofy-gwall-row {
     gap: 14px;
   }
 
@@ -5909,12 +5851,6 @@ html.cronotofy-route-active .main-topBar-overlay {
     width: 98px;
     height: 98px;
     border-radius: 12px;
-  }
-}
-
-@media (max-width: 760px) {
-  .cronotofy-gwall-wing > :nth-child(3) {
-    display: none;
   }
 }
 
@@ -6490,55 +6426,32 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       if (unique.length === 0) return;
       const firstId = unique[0]?.id || "";
       const lastId = unique[unique.length - 1]?.id || "";
-      const sig = `combined:${unique.length}:${firstId}:${lastId}`;
+      const sig = `horizontal:${unique.length}:${firstId}:${lastId}`;
       if (this.renderSignature === sig) return;
       this.renderSignature = sig;
       const container = this.ensureMounted();
       if (!container) return;
-      const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", 14, 9);
-      const speeds = ["88s", "104s", "80s", "98s", "84s", "110s", "94s", "102s", "86s", "96s"];
-      const createTile = (cover) => {
-        const tile = document.createElement("div");
-        tile.className = "cronotofy-gwall-tile";
-        const img = document.createElement("img");
-        img.src = cover.imageUrl;
-        img.alt = "";
-        img.loading = "lazy";
-        tile.appendChild(img);
-        return tile;
-      };
-      const buildWing = (wingLanes, startDirIdx) => {
-        const wing = document.createElement("div");
-        wing.className = "cronotofy-gwall-wing";
-        wingLanes.forEach((colItems, idx) => {
-          const col = document.createElement("div");
-          const dir = (idx + startDirIdx) % 2 === 0 ? "up" : "down";
-          col.className = `cronotofy-gwall-col ${dir}`;
-          col.style.setProperty("--cronotofy-gmarquee-duration", speeds[(idx + startDirIdx) % speeds.length]);
-          for (const cover of [...colItems, ...colItems]) {
-            col.appendChild(createTile(cover));
-          }
-          wing.appendChild(col);
-        });
-        return wing;
-      };
-      const leftWing = buildWing(lanes.slice(0, 3), 0);
-      const centerZone = document.createElement("div");
-      centerZone.className = "cronotofy-gwall-center";
-      lanes.slice(3, 11).forEach((rowItems, rowIndex) => {
+      const rows = buildAlbumWallLanes(unique, this.userId || "cronotofy", 6, 12);
+      const speeds = ["118s", "136s", "110s", "130s", "114s", "142s"];
+      const grid = document.createElement("div");
+      grid.className = "cronotofy-gwall-grid";
+      rows.forEach((rowItems, rowIndex) => {
         const row = document.createElement("div");
         const dir = rowIndex % 2 === 0 ? "left" : "right";
         row.className = `cronotofy-gwall-row ${dir}`;
-        row.style.setProperty("--cronotofy-gmarquee-duration", speeds[(rowIndex + 3) % speeds.length]);
+        row.style.setProperty("--cronotofy-gmarquee-duration", speeds[rowIndex % speeds.length]);
         for (const cover of [...rowItems, ...rowItems]) {
-          row.appendChild(createTile(cover));
+          const tile = document.createElement("div");
+          tile.className = "cronotofy-gwall-tile";
+          const img = document.createElement("img");
+          img.src = cover.imageUrl;
+          img.alt = "";
+          img.loading = "lazy";
+          tile.appendChild(img);
+          row.appendChild(tile);
         }
-        centerZone.appendChild(row);
+        grid.appendChild(row);
       });
-      const rightWing = buildWing(lanes.slice(11, 14), 1);
-      const grid = document.createElement("div");
-      grid.className = "cronotofy-gwall-grid";
-      grid.append(leftWing, centerZone, rightWing);
       const scrim = document.createElement("div");
       scrim.className = "cronotofy-gwall-scrim";
       container.replaceChildren(grid, scrim);
