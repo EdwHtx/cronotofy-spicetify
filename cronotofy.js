@@ -1,6 +1,6 @@
 "use strict";
 (() => {
-  // src/config.ts
+  // spicetify-cronotofy/src/config.ts
   var CRONOTOFY_MOD_CONFIG = {
     version: "2.0.0",
     tracking: {
@@ -10,10 +10,10 @@
       maxRecentPlays: 150
     },
     albumWall: {
-      cachePrefix: "cronotofy_wall_covers_v1",
+      cachePrefix: "cronotofy_wall_covers_v2",
       cacheTtlMs: 6 * 60 * 60 * 1e3,
-      maxArtistsToFetch: 10,
-      maxCoversPerArtist: 12
+      maxArtistsToFetch: 16,
+      maxCoversPerArtist: 16
     },
     ui: {
       defaultTab: "overview",
@@ -24,16 +24,21 @@
     }
   };
 
-  // src/spotifyData.ts
+  // spicetify-cronotofy/src/spotifyData.ts
   var USER_TOP_CONTENT_HASH = "61b7353d3625780022dbc63d459eb64cd609e7e5e2a820f9160d65030efe2e15";
   var ARTIST_DISCOGRAPHY_HASH = "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599";
+  var ARTIST_OVERVIEW_HASH = "eafb1620d783ece118e72fbfede2b0064483e029d3c1aafafa1c2de0e25a89e7";
   var GQL_RANGE = {
     short_term: "SHORT_TERM",
     medium_term: "MID_TERM",
     long_term: "LONG_TERM"
   };
+  var artistOverviewCache = /* @__PURE__ */ new Map();
   function idFromUri(uri) {
     return String(uri || "").split(":").pop() || "";
+  }
+  function normalizeArtistKey(name) {
+    return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   }
   function firstSourceUrl(sources) {
     if (!Array.isArray(sources) || sources.length === 0) return "";
@@ -163,7 +168,7 @@
       return [];
     }
   }
-  async function fetchLibraryArtistsFromDesktop(limit = 50) {
+  async function fetchLibraryArtistsFromDesktop(limit = 100) {
     try {
       const libApi = Spicetify?.Platform?.LibraryAPI;
       if (!libApi) return [];
@@ -172,10 +177,14 @@
         const res = await libApi.getArtists({ offset: 0, limit });
         items = Array.isArray(res?.items) ? res.items : [];
       } else if (typeof libApi.getContents === "function") {
-        const res = await libApi.getContents({ filters: ["2"], offset: 0, limit });
+        const res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
         items = Array.isArray(res?.items) ? res.items : [];
       }
-      return items.filter((a) => a && (a.uri || a.id) && a.name).map((a) => {
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "artist" || uri.startsWith("spotify:artist:");
+      }).slice(0, limit).map((a) => {
         const uri = String(a.uri || `spotify:artist:${a.id}`);
         const id = a.id ? String(a.id) : idFromUri(uri);
         const imgUrl = a.images?.[0]?.url || firstSourceUrl(a.visuals?.avatarImage?.sources) || "";
@@ -192,6 +201,218 @@
     } catch {
       return [];
     }
+  }
+  async function fetchLibraryAlbumsFromDesktop(limit = 100) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi || typeof libApi.getContents !== "function") return [];
+      let res = await libApi.getContents({ filters: ["0"], offset: 0, limit });
+      let items = Array.isArray(res?.items) ? res.items : [];
+      if (items.length === 0) {
+        res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
+        items = Array.isArray(res?.items) ? res.items : [];
+      }
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "album" || uri.startsWith("spotify:album:");
+      }).slice(0, limit).map((a) => {
+        const uri = String(a.uri || `spotify:album:${a.id}`);
+        const id = a.id ? String(a.id) : idFromUri(uri);
+        const imageUrl = String(
+          a.images?.[0]?.url || firstSourceUrl(a.coverArt?.sources) || ""
+        );
+        const artistName = Array.isArray(a.artists) ? a.artists.map((art) => art?.name).filter(Boolean).join(", ") : String(a.artist?.name || "");
+        return {
+          id,
+          uri,
+          name: String(a.name),
+          artistName,
+          imageUrl
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchArtistAvatarFromDesktop(artistId) {
+    if (!artistId || artistId.startsWith("local:")) return null;
+    if (artistOverviewCache.has(artistId)) {
+      return artistOverviewCache.get(artistId) ?? null;
+    }
+    try {
+      const data = await requestDesktopGraphQL("queryArtistOverview", ARTIST_OVERVIEW_HASH, {
+        uri: `spotify:artist:${artistId}`,
+        locale: ""
+      });
+      const union = data?.artistUnion;
+      const imageUrl = firstSourceUrl(union?.visuals?.avatarImage?.sources) || firstSourceUrl(union?.visuals?.headerImage?.sources) || "";
+      const monthlyListeners = Number(union?.stats?.monthlyListeners || 0);
+      const result = imageUrl || monthlyListeners > 0 ? { imageUrl, monthlyListeners } : null;
+      artistOverviewCache.set(artistId, result);
+      return result;
+    } catch {
+      artistOverviewCache.set(artistId, null);
+      return null;
+    }
+  }
+  function reconcileTopArtists(params) {
+    const {
+      rawTopArtists,
+      periodTracks,
+      likedTracks = [],
+      savedAlbums = [],
+      followedArtists = [],
+      trackedTracks = [],
+      minTargetCount = 15,
+      getGenresForName
+    } = params;
+    const byKey = /* @__PURE__ */ new Map();
+    const idToKey = /* @__PURE__ */ new Map();
+    const nameToKey = /* @__PURE__ */ new Map();
+    const ensureEvidence = (id, name) => {
+      const cleanName = (name || "").trim();
+      const norm = normalizeArtistKey(cleanName);
+      const cleanId = id && !id.startsWith("local:") ? id.trim() : void 0;
+      if (!cleanName && !cleanId) return null;
+      let key = (cleanId ? idToKey.get(cleanId) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      if (!key) {
+        key = cleanId || `name:${norm}`;
+        byKey.set(key, {
+          key,
+          id: cleanId,
+          name: cleanName || cleanId || "",
+          periodTrackCount: 0,
+          periodTrackScore: 0,
+          likedCount: 0,
+          savedAlbumCount: 0,
+          isFollowed: false,
+          trackedSeconds: 0,
+          fallbackImageUrl: ""
+        });
+      }
+      const ev = byKey.get(key);
+      if (cleanId && !ev.id) ev.id = cleanId;
+      if (cleanName && (!ev.name || ev.name === ev.id)) ev.name = cleanName;
+      if (cleanId) idToKey.set(cleanId, key);
+      if (norm) nameToKey.set(norm, key);
+      return ev;
+    };
+    const lookupEvidence = (id, name) => {
+      const norm = normalizeArtistKey(name);
+      const key = (id ? idToKey.get(id) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      return key ? byKey.get(key) : void 0;
+    };
+    periodTracks.forEach((tr, idx) => {
+      const baseWeight = Math.max(1, periodTracks.length - idx);
+      const artists = tr.artistNamesList && tr.artistNamesList.length > 0 ? tr.artistNamesList : tr.artistName.split(",").map((s, artIdx) => ({ id: artIdx === 0 ? tr.artistId : void 0, name: s.trim() })).filter((x) => Boolean(x.name));
+      artists.forEach((art, artIdx) => {
+        const ev = ensureEvidence(art.id, art.name);
+        if (!ev) return;
+        ev.periodTrackCount += 1;
+        ev.periodTrackScore += artIdx === 0 ? baseWeight : Math.max(1, Math.round(baseWeight * 0.45));
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) {
+          ev.fallbackImageUrl = tr.albumImageUrl;
+        }
+      });
+    });
+    for (const tr of likedTracks) {
+      const artists = Array.isArray(tr?.artists) ? tr.artists : [];
+      const img = String(tr?.album?.images?.[0]?.url || "");
+      for (const a of artists) {
+        if (!a?.name) continue;
+        const ev = ensureEvidence(a.id ? String(a.id) : void 0, String(a.name));
+        if (!ev) continue;
+        ev.likedCount += 1;
+        if (!ev.fallbackImageUrl && img) ev.fallbackImageUrl = img;
+      }
+    }
+    for (const alb of savedAlbums) {
+      if (!alb?.artistName) continue;
+      for (const part of alb.artistName.split(",")) {
+        const ev = ensureEvidence(void 0, part);
+        if (!ev) continue;
+        ev.savedAlbumCount += 1;
+        if (!ev.fallbackImageUrl && alb.imageUrl) ev.fallbackImageUrl = alb.imageUrl;
+      }
+    }
+    for (const fa of followedArtists) {
+      if (!fa?.name) continue;
+      const ev = ensureEvidence(fa.id ? String(fa.id) : void 0, String(fa.name));
+      if (!ev) continue;
+      ev.isFollowed = true;
+      const img = String(fa.images?.[0]?.url || "");
+      if (img) ev.fallbackImageUrl = img;
+    }
+    for (const tr of trackedTracks) {
+      if (!tr?.artistName || !(tr.totalSeconds > 0)) continue;
+      const parts = tr.artistName.split(",").map((s) => s.trim()).filter(Boolean);
+      parts.forEach((namePart, idx) => {
+        const ev = ensureEvidence(idx === 0 ? tr.artistId : void 0, namePart);
+        if (!ev) return;
+        ev.trackedSeconds += idx === 0 ? tr.totalSeconds : Math.round(tr.totalSeconds * 0.5);
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) ev.fallbackImageUrl = tr.albumImageUrl;
+      });
+    }
+    const hasUserEvidence = periodTracks.length > 0 || likedTracks.length > 0 || savedAlbums.length > 0 || trackedTracks.length > 0;
+    const isVerified = (ev) => Boolean(
+      ev && (ev.periodTrackCount > 0 || ev.likedCount > 0 || ev.savedAlbumCount > 0 || ev.isFollowed || ev.trackedSeconds > 0)
+    );
+    const verifiedRaw = hasUserEvidence ? rawTopArtists.filter((raw) => isVerified(lookupEvidence(raw.id, raw.name))) : rawTopArtists;
+    const baseRaw = verifiedRaw.length > 0 ? verifiedRaw : rawTopArtists;
+    const combined = [];
+    const usedEvidenceKeys = /* @__PURE__ */ new Set();
+    baseRaw.forEach((raw, idx) => {
+      const ev = lookupEvidence(raw.id, raw.name);
+      if (ev) usedEvidenceKeys.add(ev.key);
+      const rankBoost = Math.max(24, 100 - idx * 3);
+      const evidenceBoost = ev ? ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120) : 0;
+      combined.push({
+        artist: raw,
+        ev,
+        rawScore: rankBoost * 3 + evidenceBoost
+      });
+    });
+    if (combined.length < minTargetCount) {
+      const candidates = Array.from(byKey.values()).filter(
+        (ev) => !usedEvidenceKeys.has(ev.key) && (ev.periodTrackCount > 0 || periodTracks.length === 0 && (ev.trackedSeconds >= 60 || ev.likedCount > 0))
+      ).sort((a, b) => {
+        const scoreA = a.periodTrackScore * 10 + Math.min(25, a.likedCount * 3) + Math.min(20, a.savedAlbumCount * 5) + Math.min(30, a.trackedSeconds / 90);
+        const scoreB = b.periodTrackScore * 10 + Math.min(25, b.likedCount * 3) + Math.min(20, b.savedAlbumCount * 5) + Math.min(30, b.trackedSeconds / 90);
+        return scoreB - scoreA;
+      });
+      for (const ev of candidates) {
+        if (combined.length >= minTargetCount) break;
+        usedEvidenceKeys.add(ev.key);
+        const id = ev.id || `local:${normalizeArtistKey(ev.name)}`;
+        const score = ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120);
+        combined.push({
+          artist: {
+            id,
+            uri: ev.id ? `spotify:artist:${ev.id}` : "",
+            name: ev.name,
+            imageUrl: ev.fallbackImageUrl,
+            genres: getGenresForName ? getGenresForName(ev.name) : [],
+            popularity: 0,
+            followers: 0
+          },
+          ev,
+          rawScore: score
+        });
+      }
+    }
+    const maxScore = combined.reduce((m, c) => Math.max(m, c.rawScore), 1);
+    return combined.map((entry, idx) => {
+      const fallbackScore = Math.max(24, Math.round(98 - idx * 3.2));
+      const scaled = maxScore > 0 ? Math.round(entry.rawScore / maxScore * 98) : fallbackScore;
+      const affinityScore = Math.min(99, Math.max(24, scaled));
+      return {
+        ...entry.artist,
+        affinityScore,
+        periodTrackCount: entry.ev?.periodTrackCount ?? 0,
+        trackedSeconds: entry.ev?.trackedSeconds ?? 0
+      };
+    });
   }
   async function fetchArtistDiscographyFromDesktop(artistId, limit = 12) {
     if (!artistId) return [];
@@ -221,7 +442,7 @@
     return out;
   }
 
-  // src/i18n.ts
+  // spicetify-cronotofy/src/i18n.ts
   var TRANSLATIONS = {
     en: {
       brandSubtitle: "Native music analytics \xB7 Real-time telemetry",
@@ -286,7 +507,7 @@
         untitled: "Untitled",
         unknownArtist: "Unknown Artist",
         popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top tracks`,
+        topTracksCount: (n) => `${n} ${n === 1 ? "top track" : "top tracks"}`,
         songSingular: "track",
         songPlural: "tracks",
         playSingular: "play",
@@ -333,6 +554,13 @@
         triggeredToast: "Sleep timer finished \u2014 playback paused",
         tooltipIdle: "Sleep timer (Alt+Shift+S)",
         tooltipActive: (detail) => `Sleep timer: ${detail} (right-click to cancel)`
+      },
+      wallMode: {
+        label: "Wall",
+        auto: "Auto",
+        vertical: "Vertical",
+        horizontal: "Horizontal",
+        toast: (modeLabel) => `Background wall: ${modeLabel}`
       },
       time: {
         justNow: "Just now",
@@ -409,7 +637,7 @@
         untitled: "Sin t\xEDtulo",
         unknownArtist: "Artista desconocido",
         popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top tracks`,
+        topTracksCount: (n) => `${n} ${n === 1 ? "top canci\xF3n" : "top canciones"}`,
         songSingular: "canci\xF3n",
         songPlural: "canciones",
         playSingular: "play",
@@ -456,6 +684,13 @@
         triggeredToast: "Temporizador finalizado \u2014 reproducci\xF3n pausada",
         tooltipIdle: "Temporizador de sue\xF1o (Alt+Shift+S)",
         tooltipActive: (detail) => `Temporizador: ${detail} (clic derecho para cancelar)`
+      },
+      wallMode: {
+        label: "Fondo",
+        auto: "Auto",
+        vertical: "Vertical",
+        horizontal: "Horizontal",
+        toast: (modeLabel) => `Mural de portadas: ${modeLabel}`
       },
       time: {
         justNow: "Hace un momento",
@@ -580,6 +815,13 @@
         tooltipIdle: "Temporizador (Alt+Shift+S)",
         tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
       },
+      wallMode: {
+        label: "Fundo",
+        auto: "Auto",
+        vertical: "Vertical",
+        horizontal: "Horizontal",
+        toast: (modeLabel) => `Mural de capas: ${modeLabel}`
+      },
       time: {
         justNow: "Agora mesmo",
         secondsAgo: (s) => `H\xE1 ${s}s`,
@@ -702,6 +944,13 @@
         triggeredToast: "Minuteur termin\xE9 \u2014 lecture en pause",
         tooltipIdle: "Minuteur de veille (Alt+Shift+S)",
         tooltipActive: (detail) => `Minuteur : ${detail} (clic droit pour annuler)`
+      },
+      wallMode: {
+        label: "Fond",
+        auto: "Auto",
+        vertical: "Vertical",
+        horizontal: "Horizontal",
+        toast: (modeLabel) => `Mur de pochettes : ${modeLabel}`
       },
       time: {
         justNow: "\xC0 l'instant",
@@ -826,6 +1075,13 @@
         tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
         tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
       },
+      wallMode: {
+        label: "Hintergrund",
+        auto: "Auto",
+        vertical: "Vertikal",
+        horizontal: "Horizontal",
+        toast: (modeLabel) => `Cover-Wand: ${modeLabel}`
+      },
       time: {
         justNow: "Gerade eben",
         secondsAgo: (s) => `Vor ${s}s`,
@@ -949,6 +1205,13 @@
         tooltipIdle: "Timer spegnimento (Alt+Shift+S)",
         tooltipActive: (detail) => `Timer: ${detail} (tasto destro per annullare)`
       },
+      wallMode: {
+        label: "Sfondo",
+        auto: "Auto",
+        vertical: "Verticale",
+        horizontal: "Orizzontale",
+        toast: (modeLabel) => `Muro copertine: ${modeLabel}`
+      },
       time: {
         justNow: "Proprio ora",
         secondsAgo: (s) => `${s}s fa`,
@@ -1010,7 +1273,7 @@
     });
   }
 
-  // src/tracker.ts
+  // spicetify-cronotofy/src/tracker.ts
   var STORAGE_PREFIX = CRONOTOFY_MOD_CONFIG.tracking.storagePrefix;
   var MAX_RECENT_PLAYS = CRONOTOFY_MOD_CONFIG.tracking.maxRecentPlays;
   var MIN_PLAY_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.minPlaySeconds;
@@ -1164,25 +1427,6 @@ ${track.externalUrl}`;
     if (resolvingUserPromise && !forceRefresh) return resolvingUserPromise;
     resolvingUserPromise = (async () => {
       try {
-        if (Spicetify?.CosmosAsync?.get) {
-          const me = await Spicetify.CosmosAsync.get("https://api.spotify.com/v1/me");
-          if (me && me.id) {
-            const avatarUrl = normalizeSpotifyImage(me.images?.[0]?.url);
-            const user = {
-              id: String(me.id),
-              displayName: String(me.display_name || me.id),
-              email: me.email ? String(me.email) : void 0,
-              country: me.country ? String(me.country) : void 0,
-              avatarUrl: avatarUrl || void 0,
-              profileUrl: me.external_urls?.spotify || `https://open.spotify.com/user/${encodeURIComponent(me.id)}`
-            };
-            cachedUser = user;
-            return user;
-          }
-        }
-      } catch {
-      }
-      try {
         const apiUser = await Spicetify?.Platform?.UserAPI?.getUser?.();
         if (apiUser) {
           const rawUri = String(apiUser.uri || "");
@@ -1196,6 +1440,25 @@ ${track.externalUrl}`;
               displayName: String(apiUser.displayName || apiUser.name || id),
               avatarUrl: avatarUrl || void 0,
               profileUrl: `https://open.spotify.com/user/${encodeURIComponent(id)}`
+            };
+            cachedUser = user;
+            return user;
+          }
+        }
+      } catch {
+      }
+      try {
+        if (Spicetify?.CosmosAsync?.get) {
+          const me = await Spicetify.CosmosAsync.get("https://api.spotify.com/v1/me");
+          if (me && me.id) {
+            const avatarUrl = normalizeSpotifyImage(me.images?.[0]?.url);
+            const user = {
+              id: String(me.id),
+              displayName: String(me.display_name || me.id),
+              email: me.email ? String(me.email) : void 0,
+              country: me.country ? String(me.country) : void 0,
+              avatarUrl: avatarUrl || void 0,
+              profileUrl: me.external_urls?.spotify || `https://open.spotify.com/user/${encodeURIComponent(me.id)}`
             };
             cachedUser = user;
             return user;
@@ -1448,12 +1711,41 @@ ${track.externalUrl}`;
     }
   };
 
-  // src/albumWall.ts
+  // spicetify-cronotofy/src/albumWall.ts
   function normalizeImageKey(url) {
     const clean = (url || "").trim().split("?")[0];
     const scdnMatch = clean.match(/i\.scdn\.co\/image\/([a-zA-Z0-9]+)/);
     if (scdnMatch) return scdnMatch[1];
     return clean;
+  }
+  function normalizeAlbumTitleKey(title, artistName) {
+    let cleanTitle = (title || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (!cleanTitle) return "";
+    cleanTitle = cleanTitle.replace(
+      /\s*[\(\[]\s*(?:instrumental|deluxe|super deluxe|explicit|clean|bonus|expanded|remaster(?:ed)?|remix(?:es)?|live|acoustic|acustico|version|edition|edicion|from\s+[^)\]]*|anniversary|mono|stereo)[^)\]]*[\)\]]/gi,
+      ""
+    ).replace(/\s*-\s*(?:single|ep|deluxe|instrumental|explicit|clean|remastered).*$/i, "").replace(/[^a-z0-9]+/g, " ").trim();
+    if (!cleanTitle) return "";
+    const primaryArtist = (artistName || "").split(",")[0].toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+    return primaryArtist ? `${cleanTitle}::${primaryArtist}` : cleanTitle;
+  }
+  function deduplicateWallCovers(covers) {
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
+    const unique = [];
+    for (const cover of covers) {
+      if (!cover) continue;
+      const url = normalizeSpotifyImage(cover.imageUrl);
+      if (!url) continue;
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) continue;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) continue;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
+      unique.push({ ...cover, imageUrl: url });
+    }
+    return unique;
   }
   function deterministicShuffle(items, seedStr) {
     const arr = [...items];
@@ -1494,14 +1786,18 @@ ${track.externalUrl}`;
   }
   async function collectFavoriteArtistCovers(params) {
     const { userId, artistCandidates, seedTrackCovers } = params;
-    const seenImages = /* @__PURE__ */ new Set();
     const collected = [];
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
     const addCover = (cover) => {
       const url = normalizeSpotifyImage(cover.imageUrl);
       if (!url) return;
-      const key = normalizeImageKey(url);
-      if (!key || seenImages.has(key)) return;
-      seenImages.add(key);
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) return;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) return;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
       collected.push({ ...cover, imageUrl: url });
     };
     for (const c of seedTrackCovers) {
@@ -1512,61 +1808,37 @@ ${track.externalUrl}`;
       for (const c of cached) {
         addCover(c);
       }
-      if (collected.length >= 16) {
+      if (collected.length >= 130) {
         return collected;
       }
     }
     const artistsWithId = [];
     const seenArtistIds = /* @__PURE__ */ new Set();
     for (const a of artistCandidates) {
-      if (a.id && !seenArtistIds.has(a.id)) {
+      if (a.id && !a.id.startsWith("local:") && !seenArtistIds.has(a.id)) {
         seenArtistIds.add(a.id);
         artistsWithId.push({ id: a.id, name: a.name });
         if (artistsWithId.length >= CRONOTOFY_MOD_CONFIG.albumWall.maxArtistsToFetch) break;
       }
     }
     const maxPerArtist = CRONOTOFY_MOD_CONFIG.albumWall.maxCoversPerArtist;
-    const batchSize = 3;
+    const batchSize = 4;
     for (let i = 0; i < artistsWithId.length; i += batchSize) {
       const batch = artistsWithId.slice(i, i + batchSize);
       await Promise.all(
         batch.map(async (artist) => {
-          let addedAny = false;
           try {
-            const res = await Spicetify?.CosmosAsync?.get(
-              `https://api.spotify.com/v1/artists/${encodeURIComponent(
-                artist.id
-              )}/albums?include_groups=album,single&limit=${maxPerArtist}`
-            );
-            const items = Array.isArray(res?.items) ? res.items : [];
-            for (const alb of items) {
-              const img = normalizeSpotifyImage(alb?.images?.[0]?.url);
-              if (!img) continue;
-              addedAny = true;
+            const gqlAlbums = await fetchArtistDiscographyFromDesktop(artist.id, maxPerArtist);
+            for (const alb of gqlAlbums) {
               addCover({
-                id: String(alb.id || `${artist.id}-${alb.name}`),
-                title: String(alb.name || ""),
+                id: alb.id,
+                title: alb.name,
                 artistName: artist.name,
-                imageUrl: img,
-                releaseType: String(alb.album_group || alb.album_type || "album")
+                imageUrl: alb.imageUrl,
+                releaseType: alb.releaseType
               });
             }
           } catch {
-          }
-          if (!addedAny) {
-            try {
-              const gqlAlbums = await fetchArtistDiscographyFromDesktop(artist.id, maxPerArtist);
-              for (const alb of gqlAlbums) {
-                addCover({
-                  id: alb.id,
-                  title: alb.name,
-                  artistName: artist.name,
-                  imageUrl: alb.imageUrl,
-                  releaseType: alb.releaseType
-                });
-              }
-            } catch {
-            }
           }
         })
       );
@@ -1576,24 +1848,47 @@ ${track.externalUrl}`;
     }
     return collected;
   }
-  function buildAlbumWallRows(covers, seedKey, rowCount = 6) {
-    if (covers.length === 0) return [];
-    const shuffled = deterministicShuffle(covers, seedKey || "cronotofy");
-    const rows = Array.from({ length: rowCount }, () => []);
+  function buildAlbumWallLanes(covers, seedKey, laneCount, minPerLane) {
+    const unique = deduplicateWallCovers(covers);
+    if (unique.length === 0 || laneCount <= 0) return [];
+    const shuffled = deterministicShuffle(unique, seedKey || "cronotofy");
+    const lanes = Array.from({ length: laneCount }, () => []);
     shuffled.forEach((cover, idx) => {
-      rows[idx % rowCount].push(cover);
+      lanes[idx % laneCount].push(cover);
     });
-    return rows.map((row, rIdx) => {
-      const filled = [...row];
-      while (filled.length < 12) {
-        const offset = (rIdx * 3 + filled.length) % shuffled.length;
-        filled.push(shuffled[offset]);
+    if (minPerLane <= 0) return lanes;
+    const target = Math.min(minPerLane, shuffled.length);
+    return lanes.map((lane, lIdx) => {
+      if (lane.length >= target) return lane;
+      const filled = [...lane];
+      const usedInLane = new Set(filled.map((c) => normalizeImageKey(c.imageUrl)));
+      const nearby = /* @__PURE__ */ new Set();
+      for (const offset of [-2, -1, 1, 2]) {
+        const neighbor = lanes[lIdx + offset];
+        if (!neighbor) continue;
+        for (const c of neighbor) nearby.add(normalizeImageKey(c.imageUrl));
+      }
+      const startOffset = (lIdx * 7 + Math.floor(shuffled.length / 2)) % shuffled.length;
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        if (nearby.has(key) && shuffled.length > filled.length + nearby.size) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
+      }
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
       }
       return filled;
     });
   }
 
-  // src/aiColorEngine.ts
+  // spicetify-cronotofy/src/aiColorEngine.ts
   var AI_PALETTE_CACHE_KEY = "cronotofy_ai_palettes_v4";
   var GEMINI_KEY_STORAGE_KEY = "cronotofy_gemini_api_key";
   var MAX_CACHE_ENTRIES = 120;
@@ -2178,7 +2473,7 @@ ${track.externalUrl}`;
     }
   }
 
-  // src/dynamicTheme.ts
+  // spicetify-cronotofy/src/dynamicTheme.ts
   var DYNAMIC_THEME_STYLE_ID = "cronotofy-dynamic-theme-style";
   var LAST_PALETTE_STORAGE_KEY = "cronotofy_last_song_palette_v4";
   var THEME_ENABLED_STORAGE_KEY = "cronotofy_dynamic_theme_enabled_v1";
@@ -2544,7 +2839,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     }
   };
 
-  // src/styles.ts
+  // spicetify-cronotofy/src/styles.ts
   var STYLE_ID = "cronotofy-spicetify-styles";
   var CSS_TEXT = `
 .cronotofy-page {
@@ -2956,6 +3251,54 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     inset 0 1px 0 rgba(255, 255, 255, 0.26);
   backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
   -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+}
+
+.cronotofy-controls-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.cronotofy-wall-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  box-shadow:
+    0 8px 22px -6px rgba(0, 0, 0, 0.40),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26);
+  color: #e2e8f0;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+
+.cronotofy-wall-btn:hover {
+  color: #ffffff;
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.44);
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.14);
+}
+
+.cronotofy-kpi-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.cronotofy-kpi-head .cronotofy-kpi-label {
+  margin-bottom: 0;
 }
 
 .cronotofy-period-btn {
@@ -3551,7 +3894,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     document.head.appendChild(style);
   }
 
-  // src/app.tsx
+  // spicetify-cronotofy/src/app.tsx
   var FALLBACK_ARTIST_GENRES = {
     "rauw alejandro": ["reggaeton", "synth-pop", "urbano latino"],
     "bad bunny": ["reggaeton", "trap latino", "urbano latino"],
@@ -3580,7 +3923,18 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     "taylor swift": ["pop", "synth-pop"],
     "j balvin": ["reggaeton", "urbano latino"],
     yandel: ["reggaeton", "urbano latino"],
-    arcangel: ["reggaeton", "trap latino"]
+    arcangel: ["reggaeton", "trap latino"],
+    "jay wheeler": ["reggaeton", "pop urbano", "urbano latino"],
+    clarent: ["urbano latino", "trap latino"],
+    "cris mj": ["reggaeton", "urbano chileno"],
+    "playboi carti": ["trap", "rage", "hip hop"],
+    "kanye west": ["hip hop", "rap"],
+    "juice wrld": ["emo rap", "melodic rap"],
+    future: ["trap", "hip hop"],
+    "metro boomin": ["trap", "hip hop"],
+    bizarrap: ["urbano latino", "electronic"],
+    "wisin & yandel": ["reggaeton", "urbano latino"],
+    "the marias": ["indie pop", "psychedelic soul"]
   };
   function normalizeLookupName(name) {
     return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
@@ -3589,8 +3943,10 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     const norm = normalizeLookupName(name);
     if (!norm) return [];
     if (FALLBACK_ARTIST_GENRES[norm]) return FALLBACK_ARTIST_GENRES[norm];
-    for (const [key, genres] of Object.entries(FALLBACK_ARTIST_GENRES)) {
-      if (norm.includes(key) || key.includes(norm)) return genres;
+    if (norm.length >= 4) {
+      for (const [key, genres] of Object.entries(FALLBACK_ARTIST_GENRES)) {
+        if (key.length >= 4 && (norm.includes(key) || key.includes(norm))) return genres;
+      }
     }
     return [];
   }
@@ -3699,6 +4055,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     const [timeRange, setTimeRange] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTimeRange);
     const [searchQuery, setSearchQuery] = useState("");
     const [confirmClear, setConfirmClear] = useState(false);
+    const [wallMode, setWallMode] = useState(
+      () => window.__CRONOTOFY_MOD__?.getWallMode?.() ?? "auto"
+    );
     const [user, setUser] = useState(null);
     const [topTracks, setTopTracks] = useState([]);
     const [topArtists, setTopArtists] = useState([]);
@@ -3837,30 +4196,28 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         if (bridgeUser) {
           setUser(bridgeUser);
         }
-        const [desktopTop, tracksRes, artistsRes, recentRes, savedRes, libTracks, libArtists] = await Promise.all([
+        const [desktopTop, libTracks, libAlbums, libArtists] = await Promise.all([
           fetchTopContentFromDesktop(range, 50).catch(() => ({ tracks: [], artists: [] })),
-          Spicetify?.CosmosAsync?.get(
-            `https://api.spotify.com/v1/me/top/tracks?time_range=${range}&limit=50`
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            `https://api.spotify.com/v1/me/top/artists?time_range=${range}&limit=50`
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/player/recently-played?limit=50"
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/tracks?limit=50"
-          ).catch(() => null),
-          fetchLibraryTracksFromDesktop(50).catch(() => []),
+          fetchLibraryTracksFromDesktop(150).catch(() => []),
+          fetchLibraryAlbumsFromDesktop(100).catch(() => []),
           fetchLibraryArtistsFromDesktop(50).catch(() => [])
         ]);
         if (seq !== loadSeqRef.current) return;
-        const localSnap = window.__CRONOTOFY_MOD__?.getTrackerSnapshot?.() ?? EMPTY_SNAPSHOT;
-        if (recentRes && Array.isArray(recentRes.items) && recentRes.items.length > 0) {
-          setRecentApiCount(recentRes.items.length);
-        } else {
-          setRecentApiCount(localSnap.recentPlays.length);
+        let tracksRes = null;
+        let artistsRes = null;
+        if (desktopTop.tracks.length === 0 && desktopTop.artists.length === 0 && Spicetify?.CosmosAsync?.get) {
+          [tracksRes, artistsRes] = await Promise.all([
+            Spicetify.CosmosAsync.get(
+              `https://api.spotify.com/v1/me/top/tracks?time_range=${range}&limit=50`
+            ).catch(() => null),
+            Spicetify.CosmosAsync.get(
+              `https://api.spotify.com/v1/me/top/artists?time_range=${range}&limit=50`
+            ).catch(() => null)
+          ]);
+          if (seq !== loadSeqRef.current) return;
         }
+        const localSnap = window.__CRONOTOFY_MOD__?.getTrackerSnapshot?.() ?? EMPTY_SNAPSHOT;
+        setRecentApiCount(localSnap.recentPlays.length);
         const mappedTracks = [];
         const seenTrackIds = /* @__PURE__ */ new Set();
         const pushApiTrack = (tr) => {
@@ -3886,23 +4243,11 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
             popularity: Number(tr.popularity || 0)
           });
         };
-        if (tracksRes && Array.isArray(tracksRes.items) && tracksRes.items.length > 0) {
-          for (const tr of tracksRes.items) pushApiTrack(tr);
-        }
-        if (mappedTracks.length === 0 && desktopTop.tracks.length > 0) {
+        if (desktopTop.tracks.length > 0) {
           for (const tr of desktopTop.tracks) pushApiTrack(tr);
         }
-        if (mappedTracks.length === 0 && recentRes && Array.isArray(recentRes.items)) {
-          for (const item of recentRes.items) {
-            pushApiTrack(item?.track);
-            if (mappedTracks.length >= 50) break;
-          }
-        }
-        if (mappedTracks.length === 0 && savedRes && Array.isArray(savedRes.items)) {
-          for (const item of savedRes.items) {
-            pushApiTrack(item?.track);
-            if (mappedTracks.length >= 50) break;
-          }
+        if (mappedTracks.length === 0 && tracksRes && Array.isArray(tracksRes.items)) {
+          for (const tr of tracksRes.items) pushApiTrack(tr);
         }
         if (mappedTracks.length === 0 && libTracks.length > 0) {
           for (const tr of libTracks) {
@@ -3928,175 +4273,65 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           }
         }
         setTopTracks(mappedTracks);
-        const rawArtistItems = artistsRes && Array.isArray(artistsRes.items) && artistsRes.items.length > 0 ? artistsRes.items : desktopTop.artists.length > 0 ? desktopTop.artists : [];
-        let mappedArtists = [];
-        if (rawArtistItems.length > 0) {
-          const artistIds = rawArtistItems.map((a) => a?.id ? String(a.id) : "").filter((id) => /^[a-zA-Z0-9]+$/.test(id)).slice(0, 50);
-          const needsEnrich = rawArtistItems.some(
-            (a) => !Array.isArray(a?.genres) || a.genres.length === 0 || !Number(a?.popularity)
-          );
-          const enrichedById = /* @__PURE__ */ new Map();
-          if (needsEnrich && artistIds.length > 0 && Spicetify?.CosmosAsync?.get) {
-            try {
-              const batchRes = await Spicetify.CosmosAsync.get(
-                `https://api.spotify.com/v1/artists?ids=${artistIds.join(",")}`
-              );
-              if (seq !== loadSeqRef.current) return;
-              if (Array.isArray(batchRes?.artists)) {
-                for (const ea of batchRes.artists) {
-                  if (ea && ea.id) enrichedById.set(String(ea.id), ea);
-                }
-              }
-            } catch {
-            }
-          }
-          mappedArtists = rawArtistItems.filter((a) => a && a.id).map((a, idx) => {
-            const id = String(a.id);
-            const ea = enrichedById.get(id);
-            const name = String(ea?.name || a.name || t.entities.unknownArtist);
-            const rawGenres = Array.isArray(ea?.genres) && ea.genres.length > 0 ? ea.genres.map(String) : Array.isArray(a.genres) && a.genres.length > 0 ? a.genres.map(String) : getFallbackGenresForArtist(name);
-            const popularity = Number(
-              ea?.popularity || a.popularity || Math.max(45, 98 - idx * 2)
-            );
-            return {
-              id,
-              uri: String(a.uri || `spotify:artist:${id}`),
-              name,
-              imageUrl: normalizeSpotifyImage(a.images?.[0]?.url) || normalizeSpotifyImage(ea?.images?.[0]?.url) || "",
-              genres: rawGenres,
-              popularity,
-              followers: Number(ea?.followers?.total || a.followers?.total || 0)
-            };
-          });
-        }
-        if (mappedArtists.length === 0) {
-          const aggMap = /* @__PURE__ */ new Map();
-          mappedTracks.forEach((track, idx) => {
-            const baseWeight = Math.max(1, mappedTracks.length - idx);
-            const list = track.artistNamesList && track.artistNamesList.length > 0 ? track.artistNamesList : [{ id: track.artistId, name: track.artistName }];
-            list.forEach((art, artIdx) => {
-              const cleanName = art.name.trim();
-              if (!cleanName) return;
-              const norm = normalizeLookupName(cleanName);
-              const key = art.id || norm;
-              const weight = artIdx === 0 ? baseWeight : Math.max(1, Math.round(baseWeight * 0.45));
-              const existing = aggMap.get(key) || (art.id ? aggMap.get(norm) : void 0);
-              if (existing) {
-                existing.score += weight;
-                if (art.id && !existing.id) existing.id = art.id;
-                if (!existing.imageUrl && track.albumImageUrl) {
-                  existing.imageUrl = track.albumImageUrl;
-                }
-              } else {
-                aggMap.set(key, {
-                  id: art.id,
-                  name: cleanName,
-                  score: weight,
-                  imageUrl: track.albumImageUrl || "",
-                  genres: getFallbackGenresForArtist(cleanName)
-                });
-              }
-            });
-          });
-          const addSecondaryArtists = (items) => {
-            if (!Array.isArray(items)) return;
-            for (const item of items) {
-              const tr = item?.track || item;
-              if (!tr || !Array.isArray(tr.artists)) continue;
-              for (const a of tr.artists) {
-                if (!a?.name) continue;
-                const norm = normalizeLookupName(String(a.name));
-                const key = a.id ? String(a.id) : norm;
-                const existing = aggMap.get(key) || aggMap.get(norm);
-                if (existing) {
-                  existing.score += 4;
-                  if (a.id && !existing.id) existing.id = String(a.id);
-                } else {
-                  aggMap.set(key, {
-                    id: a.id ? String(a.id) : void 0,
-                    name: String(a.name),
-                    score: 4,
-                    imageUrl: normalizeSpotifyImage(tr.album?.images?.[0]?.url),
-                    genres: getFallbackGenresForArtist(String(a.name))
-                  });
-                }
-              }
-            }
+        const rawArtistSource = desktopTop.artists.length > 0 ? desktopTop.artists : artistsRes && Array.isArray(artistsRes.items) ? artistsRes.items : [];
+        const hasNativePortraitIds = /* @__PURE__ */ new Set();
+        const rawTopArtists = rawArtistSource.filter((a) => a && a.id && a.name).map((a) => {
+          const id = String(a.id);
+          const name = String(a.name);
+          const imageUrl = normalizeSpotifyImage(a.images?.[0]?.url);
+          if (imageUrl) hasNativePortraitIds.add(id);
+          return {
+            id,
+            uri: String(a.uri || `spotify:artist:${id}`),
+            name,
+            imageUrl,
+            genres: Array.isArray(a.genres) && a.genres.length > 0 ? a.genres.map(String) : getFallbackGenresForArtist(name),
+            popularity: Number(a.popularity || 0),
+            followers: Number(a.followers?.total || 0)
           };
-          addSecondaryArtists(recentRes?.items);
-          addSecondaryArtists(savedRes?.items);
-          addSecondaryArtists(libTracks);
-          for (const la of libArtists) {
-            if (!la?.name) continue;
-            const norm = normalizeLookupName(String(la.name));
-            const key = la.id ? String(la.id) : norm;
-            const existing = aggMap.get(key) || aggMap.get(norm);
-            const img = normalizeSpotifyImage(la.images?.[0]?.url);
-            if (existing) {
-              existing.score += 8;
-              if (la.id && !existing.id) existing.id = String(la.id);
-              if (img) existing.imageUrl = img;
-            } else {
-              aggMap.set(key, {
-                id: la.id ? String(la.id) : void 0,
-                name: String(la.name),
-                score: 8,
-                imageUrl: img,
-                genres: getFallbackGenresForArtist(String(la.name))
-              });
+        });
+        const reconciled = reconcileTopArtists({
+          rawTopArtists,
+          periodTracks: mappedTracks,
+          likedTracks: libTracks,
+          savedAlbums: libAlbums,
+          followedArtists: libArtists,
+          trackedTracks: localSnap.tracks,
+          minTargetCount: 15,
+          getGenresForName: getFallbackGenresForArtist
+        });
+        const mappedArtists = reconciled.map((a) => ({
+          id: a.id,
+          uri: a.uri,
+          name: a.name,
+          imageUrl: a.imageUrl,
+          genres: a.genres.length > 0 ? a.genres : getFallbackGenresForArtist(a.name),
+          popularity: a.popularity,
+          followers: a.followers,
+          affinityScore: a.affinityScore,
+          periodTrackCount: a.periodTrackCount,
+          trackedSeconds: a.trackedSeconds
+        }));
+        setTopArtists(mappedArtists);
+        const needPortraitIds = mappedArtists.filter((a) => !a.id.startsWith("local:") && (!hasNativePortraitIds.has(a.id) || !a.imageUrl)).slice(0, 10).map((a) => a.id);
+        if (needPortraitIds.length > 0) {
+          void Promise.all(
+            needPortraitIds.map(async (id) => ({ id, info: await fetchArtistAvatarFromDesktop(id) }))
+          ).then((avatars) => {
+            if (seq !== loadSeqRef.current) return;
+            const byId = /* @__PURE__ */ new Map();
+            for (const item of avatars) {
+              if (item.info?.imageUrl) byId.set(item.id, item.info.imageUrl);
             }
-          }
-          const aggregated = Array.from(aggMap.values()).sort((a, b) => b.score - a.score).slice(0, 40);
-          const idsToEnrich = aggregated.map((a) => a.id).filter((id) => Boolean(id && /^[a-zA-Z0-9]+$/.test(id))).slice(0, 50);
-          const enrichedById = /* @__PURE__ */ new Map();
-          if (idsToEnrich.length > 0 && Spicetify?.CosmosAsync?.get) {
-            try {
-              const batchRes = await Spicetify.CosmosAsync.get(
-                `https://api.spotify.com/v1/artists?ids=${idsToEnrich.join(",")}`
+            if (byId.size > 0) {
+              setTopArtists(
+                (prev) => prev.map((art) => byId.has(art.id) ? { ...art, imageUrl: byId.get(art.id) } : art)
               );
-              if (seq !== loadSeqRef.current) return;
-              if (Array.isArray(batchRes?.artists)) {
-                for (const ea of batchRes.artists) {
-                  if (ea && ea.id) enrichedById.set(String(ea.id), ea);
-                }
-              }
-            } catch {
             }
-          }
-          const maxScore = aggregated[0]?.score || 1;
-          mappedArtists = aggregated.map((item) => {
-            const ea = item.id ? enrichedById.get(item.id) : void 0;
-            const genres = Array.isArray(ea?.genres) && ea.genres.length > 0 ? ea.genres.map(String) : item.genres.length > 0 ? item.genres : getFallbackGenresForArtist(item.name);
-            const imageUrl = normalizeSpotifyImage(ea?.images?.[0]?.url) || item.imageUrl;
-            const popularity = Number(
-              ea?.popularity || Math.min(98, Math.max(45, Math.round(item.score / maxScore * 95)))
-            );
-            return {
-              id: item.id || `local:${normalizeLookupName(item.name)}`,
-              uri: item.id ? `spotify:artist:${item.id}` : "",
-              name: String(ea?.name || item.name),
-              imageUrl,
-              genres,
-              popularity,
-              followers: Number(ea?.followers?.total || 0)
-            };
           });
         }
-        setTopArtists(mappedArtists);
         if (CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) {
           const seedCovers = [];
-          const addSeedTrack = (tr) => {
-            if (!tr) return;
-            const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
-            if (img) {
-              seedCovers.push({
-                id: String(tr.album?.id || tr.id || img),
-                title: String(tr.album?.name || tr.name || ""),
-                artistName: String(tr.artists?.[0]?.name || ""),
-                imageUrl: img
-              });
-            }
-          };
           for (const tr of mappedTracks) {
             if (tr.albumImageUrl) {
               seedCovers.push({
@@ -4107,17 +4342,31 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
               });
             }
           }
-          if (Array.isArray(recentRes?.items)) {
-            for (const item of recentRes.items) addSeedTrack(item?.track);
+          for (const alb of libAlbums) {
+            if (alb.imageUrl) {
+              seedCovers.push({
+                id: alb.id,
+                title: alb.name,
+                artistName: alb.artistName,
+                imageUrl: alb.imageUrl
+              });
+            }
           }
-          if (Array.isArray(savedRes?.items)) {
-            for (const item of savedRes.items) addSeedTrack(item?.track);
+          for (const tr of libTracks) {
+            const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
+            if (img) {
+              seedCovers.push({
+                id: String(tr.album?.id || tr.id || img),
+                title: String(tr.album?.name || tr.name || ""),
+                artistName: String(tr.artists?.[0]?.name || ""),
+                imageUrl: img
+              });
+            }
           }
-          for (const tr of libTracks) addSeedTrack(tr);
           if (seedCovers.length > 0) {
             window.__CRONOTOFY_MOD__?.updateWallCovers?.(seedCovers);
           }
-          const artistCandidates = mappedArtists.slice(0, 14).map((a) => ({
+          const artistCandidates = mappedArtists.slice(0, 16).map((a) => ({
             id: a.id.startsWith("local:") ? void 0 : a.id,
             name: a.name
           }));
@@ -4137,6 +4386,24 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
       }
     }, [t]);
+    const handleCycleWallMode = useCallback(() => {
+      const order = ["auto", "vertical", "horizontal"];
+      const next = order[(order.indexOf(wallMode) + 1) % order.length];
+      setWallMode(next);
+      window.__CRONOTOFY_MOD__?.setWallMode?.(next);
+      const label = next === "auto" ? t.wallMode.auto : next === "vertical" ? t.wallMode.vertical : t.wallMode.horizontal;
+      Spicetify?.showNotification?.(t.wallMode.toast(label));
+    }, [wallMode, t]);
+    const formatArtistStat = (artist) => {
+      if (artist.popularity > 0) return t.entities.popularityLabel(artist.popularity);
+      if (artist.periodTrackCount && artist.periodTrackCount > 0) {
+        return t.entities.topTracksCount(artist.periodTrackCount);
+      }
+      if (artist.trackedSeconds && artist.trackedSeconds > 0) {
+        return formatSecondsHuman(artist.trackedSeconds);
+      }
+      return t.entities.spotifyArtist;
+    };
     useEffect(() => {
       void loadAnalyticsData(timeRange);
     }, [timeRange, loadAnalyticsData]);
@@ -4377,7 +4644,17 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         onClick: () => setSearchQuery("")
       },
       "\xD7"
-    )), activeTab !== "live" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-periods" }, ["short_term", "medium_term", "long_term"].map((r) => /* @__PURE__ */ Spicetify.React.createElement(
+    )), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-right" }, /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-wall-btn",
+        onClick: handleCycleWallMode,
+        title: t.wallMode.label,
+        "aria-label": t.wallMode.label
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("span", null, t.wallMode.label, ":", " ", wallMode === "auto" ? t.wallMode.auto : wallMode === "vertical" ? t.wallMode.vertical : t.wallMode.horizontal)
+    ), activeTab !== "live" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-periods" }, ["short_term", "medium_term", "long_term"].map((r) => /* @__PURE__ */ Spicetify.React.createElement(
       "button",
       {
         key: r,
@@ -4386,7 +4663,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         onClick: () => setTimeRange(r)
       },
       periodLabels[r]
-    )))), loading && topTracks.length === 0 && activeTab !== "live" ? /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty" }, t.loadingAnalytics) : null, activeTab === "overview" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.recordedTime), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.kpis.todayLabel, " \xB7 ", t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds)), snapshot.streakDays >= 2 ? ` \xB7 ${t.streak.daysBadge(snapshot.streakDays)}` : "")), /* @__PURE__ */ Spicetify.React.createElement(
+    ))))), loading && topTracks.length === 0 && activeTab !== "live" ? /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty" }, t.loadingAnalytics) : null, activeTab === "overview" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-head" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.recordedTime), snapshot.streakDays >= 2 && /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.streak.daysBadge(snapshot.streakDays))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.kpis.todayLabel, " \xB7 ", t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds)))), /* @__PURE__ */ Spicetify.React.createElement(
       "div",
       {
         className: "cronotofy-card",
@@ -4428,7 +4705,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           className: "cronotofy-thumb circle"
         }
       ), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, artist.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, artist.genres.slice(0, 2).join(", ") || t.entities.spotifyArtist))),
-      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.entities.popularityLabel(artist.popularity))
+      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, formatArtistStat(artist))
     )), topArtists.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, t.empty.noArtistsPeriod))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.top5Tracks), /* @__PURE__ */ Spicetify.React.createElement(
       "button",
       {
@@ -4507,12 +4784,17 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           onPress: () => void handlePlayOrToggleUri(artist.uri, artist.name)
         }
       ))),
-      /* @__PURE__ */ Spicetify.React.createElement("div", null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-meta" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, "#", idx + 1), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-entity-stat" }, t.entities.popularityLabel(artist.popularity))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title", style: { marginTop: 8, fontSize: 14 } }, artist.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, artist.genres.slice(0, 2).join(" \xB7 ") || t.entities.spotifyArtist)),
+      /* @__PURE__ */ Spicetify.React.createElement("div", null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-meta" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, "#", idx + 1), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-entity-stat" }, formatArtistStat(artist))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title", style: { marginTop: 8, fontSize: 14 } }, artist.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, artist.genres.slice(0, 2).join(" \xB7 ") || t.entities.spotifyArtist)),
       /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-genre-bar-bg", style: { marginTop: "auto" } }, /* @__PURE__ */ Spicetify.React.createElement(
         "div",
         {
           className: "cronotofy-genre-bar-fill",
-          style: { width: `${Math.min(100, Math.max(8, artist.popularity))}%` }
+          style: {
+            width: `${Math.min(
+              100,
+              Math.max(8, artist.popularity || artist.affinityScore || 50)
+            )}%`
+          }
         }
       ))
     )), !loading && filteredArtists.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty", style: { gridColumn: "1 / -1" } }, normalizedFilter && topArtists.length > 0 ? t.search.noResults : t.empty.noArtistsFound)), activeTab === "tracks" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.tracksRanking(periodLabels[timeRange])), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.sections.tracksBadge(filteredTracks.length))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, filteredTracks.map((track, idx) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: track.id, className: "cronotofy-row" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), track.albumImageUrl && /* @__PURE__ */ Spicetify.React.createElement("img", { src: track.albumImageUrl, alt: track.name, className: "cronotofy-thumb" }), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, track.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, track.artistName, track.albumName ? ` \xB7 ${track.albumName}` : ""))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-actions" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-track-duration" }, formatDurationMs(track.durationMs)), /* @__PURE__ */ Spicetify.React.createElement(
@@ -4657,7 +4939,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     );
   }
 
-  // src/sleepTimer.ts
+  // spicetify-cronotofy/src/sleepTimer.ts
   var SLEEP_TIMER_CYCLE = [
     "off",
     "end-of-track",
@@ -4755,7 +5037,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     }
   };
 
-  // src/chromeWidgets.ts
+  // spicetify-cronotofy/src/chromeWidgets.ts
   var NAV_BTN_ID = "cronotofy-nav-btn";
   var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
   var VOLUME_PCT_ID = "cronotofy-volume-pct";
@@ -5138,9 +5420,24 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     }
   };
 
-  // src/globalWall.ts
+  // spicetify-cronotofy/src/globalWall.ts
   var GLOBAL_WALL_STYLE_ID = "cronotofy-global-wall-style";
   var GLOBAL_WALL_ROOT_ID = "cronotofy-global-wall";
+  var WALL_MODE_STORAGE_KEY = "cronotofy_wall_mode_v1";
+  function loadWallMode() {
+    try {
+      const raw = localStorage.getItem(WALL_MODE_STORAGE_KEY);
+      if (raw === "vertical" || raw === "horizontal" || raw === "auto") return raw;
+    } catch {
+    }
+    return "auto";
+  }
+  function saveWallMode(mode) {
+    try {
+      localStorage.setItem(WALL_MODE_STORAGE_KEY, mode);
+    } catch {
+    }
+  }
   var GLOBAL_WALL_CSS = `
 #${GLOBAL_WALL_ROOT_ID} {
   position: fixed;
@@ -5155,12 +5452,22 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
 .cronotofy-gwall-grid {
   position: absolute;
-  inset: -140px -120px;
+  inset: -160px -140px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 18px;
   transform: rotate(-3deg) scale(1.12);
+  opacity: 1;
+  transition: opacity 0.35s ease;
+}
+
+.cronotofy-gwall-grid.is-vertical {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 18px;
+  transform: rotate(-2.5deg) scale(1.12);
 }
 
 .cronotofy-gwall-row {
@@ -5171,12 +5478,29 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   will-change: transform;
 }
 
+.cronotofy-gwall-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  height: max-content;
+  will-change: transform;
+}
+
 .cronotofy-gwall-row.left {
   animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 92s) linear infinite;
 }
 
 .cronotofy-gwall-row.right {
   animation: cronotofyGlobalMarqueeRight var(--cronotofy-gmarquee-duration, 100s) linear infinite;
+}
+
+.cronotofy-gwall-col.up {
+  animation: cronotofyGlobalMarqueeUp var(--cronotofy-gmarquee-duration, 92s) linear infinite;
+}
+
+.cronotofy-gwall-col.down {
+  animation: cronotofyGlobalMarqueeDown var(--cronotofy-gmarquee-duration, 100s) linear infinite;
 }
 
 @keyframes cronotofyGlobalMarqueeLeft {
@@ -5197,10 +5521,28 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   }
 }
 
+@keyframes cronotofyGlobalMarqueeUp {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(0, -50%, 0);
+  }
+}
+
+@keyframes cronotofyGlobalMarqueeDown {
+  0% {
+    transform: translate3d(0, -50%, 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
 .cronotofy-gwall-tile {
-  width: 118px;
-  height: 118px;
-  border-radius: 14px;
+  width: 148px;
+  height: 148px;
+  border-radius: 16px;
   overflow: hidden;
   flex-shrink: 0;
   opacity: 0.68;
@@ -5660,13 +6002,14 @@ html.cronotofy-route-active .main-topBar-overlay {
 
 @media (max-width: 1100px) {
   .cronotofy-gwall-grid,
-  .cronotofy-gwall-row {
+  .cronotofy-gwall-row,
+  .cronotofy-gwall-col {
     gap: 14px;
   }
 
   .cronotofy-gwall-tile {
-    width: 92px;
-    height: 92px;
+    width: 98px;
+    height: 98px;
     border-radius: 12px;
   }
 }
@@ -6118,6 +6461,24 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       this.renderSignature = "";
       this.userId = "default";
       this.initialized = false;
+      this.mode = loadWallMode();
+      this.activeOrientation = this.mode === "horizontal" ? "horizontal" : "vertical";
+    }
+    getMode() {
+      return this.mode;
+    }
+    setMode(mode) {
+      this.mode = mode;
+      saveWallMode(mode);
+      if (mode === "vertical" || mode === "horizontal") {
+        this.activeOrientation = mode;
+      }
+      this.renderWall(true);
+    }
+    onSongChange() {
+      if (this.mode !== "auto" || this.currentCovers.length === 0) return;
+      this.activeOrientation = this.activeOrientation === "vertical" ? "horizontal" : "vertical";
+      this.renderWall(true);
     }
     async init() {
       if (this.initialized) return;
@@ -6129,22 +6490,13 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
       this.loadCachedImmediately(this.userId);
       if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
       try {
-        const [desktopTop, tracksRes, artistsRes, recentRes, savedRes, libTracks, libArtists] = await Promise.all([
+        const [topShort, topMid, topLong, libTracks, libAlbums, libArtists] = await Promise.all([
+          fetchTopContentFromDesktop("short_term", 50).catch(() => ({ tracks: [], artists: [] })),
           fetchTopContentFromDesktop("medium_term", 50).catch(() => ({ tracks: [], artists: [] })),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/top/tracks?time_range=medium_term&limit=50"
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=25"
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/player/recently-played?limit=30"
-          ).catch(() => null),
-          Spicetify?.CosmosAsync?.get(
-            "https://api.spotify.com/v1/me/tracks?limit=30"
-          ).catch(() => null),
-          fetchLibraryTracksFromDesktop(40).catch(() => []),
-          fetchLibraryArtistsFromDesktop(25).catch(() => [])
+          fetchTopContentFromDesktop("long_term", 50).catch(() => ({ tracks: [], artists: [] })),
+          fetchLibraryTracksFromDesktop(150).catch(() => []),
+          fetchLibraryAlbumsFromDesktop(100).catch(() => []),
+          fetchLibraryArtistsFromDesktop(50).catch(() => [])
         ]);
         const seedCovers = [];
         const artistCandidates = [];
@@ -6174,35 +6526,30 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
             }
           }
         };
-        for (const a of desktopTop.artists) {
+        for (const a of [...topShort.artists, ...topMid.artists, ...topLong.artists, ...libArtists]) {
           if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
         }
-        if (Array.isArray(artistsRes?.items)) {
-          for (const a of artistsRes.items) {
-            if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
+        for (const alb of libAlbums) {
+          if (alb.imageUrl) {
+            seedCovers.push({
+              id: alb.id,
+              title: alb.name,
+              artistName: alb.artistName,
+              imageUrl: alb.imageUrl
+            });
           }
         }
-        for (const a of libArtists) {
-          if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
+        for (const tr of [...topShort.tracks, ...topMid.tracks, ...topLong.tracks, ...libTracks]) {
+          pushTrackSeed(tr);
         }
-        for (const tr of desktopTop.tracks) pushTrackSeed(tr);
-        if (Array.isArray(tracksRes?.items)) {
-          for (const tr of tracksRes.items) pushTrackSeed(tr);
-        }
-        if (Array.isArray(recentRes?.items)) {
-          for (const item of recentRes.items) pushTrackSeed(item?.track);
-        }
-        if (Array.isArray(savedRes?.items)) {
-          for (const item of savedRes.items) pushTrackSeed(item?.track);
-        }
-        for (const tr of libTracks) pushTrackSeed(tr);
-        if (seedCovers.length > 0 && this.currentCovers.length === 0) {
-          this.updateCovers(seedCovers, this.userId);
+        const uniqueSeeds = deduplicateWallCovers(seedCovers);
+        if (uniqueSeeds.length > 0 && this.currentCovers.length === 0) {
+          this.updateCovers(uniqueSeeds, this.userId);
         }
         const enriched = await collectFavoriteArtistCovers({
           userId: this.userId,
-          artistCandidates: artistCandidates.slice(0, 14),
-          seedTrackCovers: seedCovers
+          artistCandidates: artistCandidates.slice(0, 16),
+          seedTrackCovers: uniqueSeeds
         });
         if (enriched.length > 0) {
           this.updateCovers(enriched, this.userId);
@@ -6242,49 +6589,82 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
     updateCovers(covers, seedKey) {
       if (!Array.isArray(covers) || covers.length === 0) return;
       if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
-      const cleanCovers = covers.filter((c) => Boolean(c && c.imageUrl));
-      if (cleanCovers.length === 0) return;
-      const firstId = cleanCovers[0]?.id || "";
-      const lastId = cleanCovers[cleanCovers.length - 1]?.id || "";
-      const sig = `${cleanCovers.length}:${firstId}:${lastId}`;
-      if (this.renderSignature === sig) return;
-      if (this.currentCovers.length >= cleanCovers.length && this.renderSignature !== "") {
+      const unique = deduplicateWallCovers(covers);
+      if (unique.length === 0) return;
+      if (this.currentCovers.length >= unique.length && this.renderSignature !== "") {
         return;
       }
-      this.currentCovers = cleanCovers;
-      this.renderSignature = sig;
+      this.currentCovers = unique;
       if (seedKey) this.userId = seedKey;
+      this.renderWall(false);
+    }
+    renderWall(force) {
+      if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
+      const unique = deduplicateWallCovers(this.currentCovers);
+      if (unique.length === 0) return;
+      const firstId = unique[0]?.id || "";
+      const lastId = unique[unique.length - 1]?.id || "";
+      const sig = `${this.activeOrientation}:${unique.length}:${firstId}:${lastId}`;
+      if (!force && this.renderSignature === sig) return;
+      this.renderSignature = sig;
       const container = this.ensureMounted();
       if (!container) return;
-      const rows = buildAlbumWallRows(cleanCovers, this.userId || "cronotofy", 7);
-      const speeds = ["88s", "104s", "80s", "98s", "84s", "110s", "94s"];
+      const speeds = ["88s", "104s", "80s", "98s", "84s", "110s", "94s", "102s", "86s", "96s"];
       const grid = document.createElement("div");
-      grid.className = "cronotofy-gwall-grid";
-      rows.forEach((rowItems, rowIndex) => {
-        const row = document.createElement("div");
-        const dir = rowIndex % 2 === 0 ? "left" : "right";
-        row.className = `cronotofy-gwall-row ${dir}`;
-        row.style.setProperty("--cronotofy-gmarquee-duration", speeds[rowIndex % speeds.length]);
-        const doubled = [...rowItems, ...rowItems];
-        for (const cover of doubled) {
-          const tile = document.createElement("div");
-          tile.className = "cronotofy-gwall-tile";
-          const img = document.createElement("img");
-          img.src = cover.imageUrl;
-          img.alt = "";
-          img.loading = "lazy";
-          tile.appendChild(img);
-          row.appendChild(tile);
-        }
-        grid.appendChild(row);
-      });
+      if (this.activeOrientation === "vertical") {
+        const colCount = 12;
+        const minPerCol = 7;
+        const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", colCount, minPerCol);
+        grid.className = "cronotofy-gwall-grid is-vertical";
+        lanes.forEach((colItems, colIndex) => {
+          const col = document.createElement("div");
+          const dir = colIndex % 2 === 0 ? "up" : "down";
+          col.className = `cronotofy-gwall-col ${dir}`;
+          col.style.setProperty("--cronotofy-gmarquee-duration", speeds[colIndex % speeds.length]);
+          const doubled = [...colItems, ...colItems];
+          for (const cover of doubled) {
+            const tile = document.createElement("div");
+            tile.className = "cronotofy-gwall-tile";
+            const img = document.createElement("img");
+            img.src = cover.imageUrl;
+            img.alt = "";
+            img.loading = "lazy";
+            tile.appendChild(img);
+            col.appendChild(tile);
+          }
+          grid.appendChild(col);
+        });
+      } else {
+        const rowCount = 6;
+        const minPerRow = 12;
+        const lanes = buildAlbumWallLanes(unique, this.userId || "cronotofy", rowCount, minPerRow);
+        grid.className = "cronotofy-gwall-grid";
+        lanes.forEach((rowItems, rowIndex) => {
+          const row = document.createElement("div");
+          const dir = rowIndex % 2 === 0 ? "left" : "right";
+          row.className = `cronotofy-gwall-row ${dir}`;
+          row.style.setProperty("--cronotofy-gmarquee-duration", speeds[rowIndex % speeds.length]);
+          const doubled = [...rowItems, ...rowItems];
+          for (const cover of doubled) {
+            const tile = document.createElement("div");
+            tile.className = "cronotofy-gwall-tile";
+            const img = document.createElement("img");
+            img.src = cover.imageUrl;
+            img.alt = "";
+            img.loading = "lazy";
+            tile.appendChild(img);
+            row.appendChild(tile);
+          }
+          grid.appendChild(row);
+        });
+      }
       const scrim = document.createElement("div");
       scrim.className = "cronotofy-gwall-scrim";
       container.replaceChildren(grid, scrim);
     }
   };
 
-  // src/neonLyrics.ts
+  // spicetify-cronotofy/src/neonLyrics.ts
   var NEON_LYRICS_STYLE_ID = "cronotofy-neon-lyrics-style";
   var VINYL_HOST_ID = "cronotofy-lyrics-vinyl";
   var BROWSE_TIMEOUT_MS = 1e4;
@@ -6357,6 +6737,38 @@ html.cronotofy-lyrics-open .main-view-container__scroll-node-child {
 
 html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua {
   display: none !important;
+}
+
+/* Lift Spotify's floating Sync button cleanly above the Now Playing bar capsule */
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW {
+  bottom: 120px !important;
+  z-index: 75 !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP),
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) {
+  pointer-events: auto !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button {
+  pointer-events: auto !important;
+  cursor: pointer !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.78) !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48) !important;
+  backdrop-filter: blur(14px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.58),
+    0 0 18px -4px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.45) !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button:hover,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.26) !important;
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
 }
 
 /* Hide underlying panels in Cinema Lyrics so no vertical bar bleeds behind vinyl */
@@ -6798,6 +7210,12 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       this.handlePlayerUpdate = () => {
         this.syncVinyl(findFullLyricsContainer());
       };
+      this.handleDocumentClick = (e) => {
+        const target = e.target;
+        if (target?.closest?.(".rxth_Ddcp6DIwLpwR4ZW")) {
+          this.clearBrowseReveal();
+        }
+      };
     }
     init() {
       if (this.initialized || typeof document === "undefined") return;
@@ -6807,6 +7225,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       if (typeof window !== "undefined") {
         window.addEventListener("keydown", this.handleKeydown);
       }
+      document.addEventListener("click", this.handleDocumentClick, true);
       Spicetify?.Player?.addEventListener?.("songchange", this.handlePlayerUpdate);
       Spicetify?.Player?.addEventListener?.("onplaypause", this.handlePlayerUpdate);
       if (document.body && typeof MutationObserver !== "undefined") {
@@ -7109,11 +7528,12 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       if (typeof window !== "undefined") {
         window.removeEventListener("keydown", this.handleKeydown);
       }
-      Spicetify?.Player?.removeEventListener?.("songchange", this.handlePlayerUpdate);
-      Spicetify?.Player?.removeEventListener?.("onplaypause", this.handlePlayerUpdate);
       if (typeof document !== "undefined") {
+        document.removeEventListener("click", this.handleDocumentClick, true);
         document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
       }
+      Spicetify?.Player?.removeEventListener?.("songchange", this.handlePlayerUpdate);
+      Spicetify?.Player?.removeEventListener?.("onplaypause", this.handlePlayerUpdate);
       this.clearBrowseReveal();
       this.resetSongState();
       this.syncVinyl(null);
@@ -7121,7 +7541,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
     }
   };
 
-  // src/bootstrap.ts
+  // spicetify-cronotofy/src/bootstrap.ts
   function bootstrapCronotofy(options = {}) {
     const tryStart = () => {
       if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform) {
@@ -7158,19 +7578,11 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
             if (themeController.getPalette().isDynamic) return;
           }
           try {
-            const recent = await Spicetify.CosmosAsync?.get(
-              "https://api.spotify.com/v1/me/player/recently-played?limit=1"
-            ).catch(() => null);
-            const recentTrack = recent?.items?.[0]?.track;
-            const recentImg = normalizeSpotifyImage(recentTrack?.album?.images?.[0]?.url);
-            if (recentImg) {
-              await themeController.seedFromCoverIfNeeded(recentImg, recentTrack?.uri);
-              if (themeController.getPalette().isDynamic) return;
-            }
-            const top = await Spicetify.CosmosAsync?.get(
-              "https://api.spotify.com/v1/me/top/tracks?time_range=short_term&limit=1"
-            ).catch(() => null);
-            const topTrack = top?.items?.[0];
+            const desktopTop = await fetchTopContentFromDesktop("short_term", 3).catch(() => ({
+              tracks: [],
+              artists: []
+            }));
+            const topTrack = desktopTop.tracks?.[0];
             const topImg = normalizeSpotifyImage(topTrack?.album?.images?.[0]?.url);
             if (topImg) {
               await themeController.seedFromCoverIfNeeded(topImg, topTrack?.uri);
@@ -7214,7 +7626,9 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
             if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
               void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
             }
-          }
+          },
+          getWallMode: () => globalWall.getMode(),
+          setWallMode: (mode) => globalWall.setMode(mode)
         };
         void tracker.init().then(() => {
           syncThemeFromPlayer();
@@ -7228,6 +7642,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         Spicetify.Player.addEventListener?.("songchange", () => {
           tracker.onSongChange();
           syncThemeFromPlayer();
+          globalWall.onSongChange();
         });
         Spicetify.Player.addEventListener?.("onplaypause", () => {
           tracker.onPlayPause();
@@ -7241,7 +7656,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
     tryStart();
   }
 
-  // src/marketplaceEntry.ts
+  // spicetify-cronotofy/src/marketplaceEntry.ts
   var EXT_HOST_ID = "cronotofy-ext-host";
   (function initCronotofyMarketplaceExtension() {
     let hostEl = null;
