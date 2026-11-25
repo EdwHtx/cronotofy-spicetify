@@ -3388,7 +3388,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     useEffect(() => {
       const pageEl = pageRef.current;
       if (!pageEl) return;
-      const findScrollParent = (el) => {
+      const findScrollParent2 = (el) => {
         let cur = el?.parentElement || null;
         while (cur) {
           const style = window.getComputedStyle(cur);
@@ -3399,7 +3399,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
         return document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".main-view-container__scroll-node") || document.querySelector("[data-overlayscrollbars-viewport]");
       };
-      const scrollContainer = findScrollParent(pageEl);
+      const scrollContainer = findScrollParent2(pageEl);
       let openThreshold = 60;
       let closeThreshold = 28;
       const measureThresholds = () => {
@@ -5543,6 +5543,817 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
     }
   };
 
+  // spicetify-cronotofy/src/neonLyrics.ts
+  var NEON_LYRICS_STYLE_ID = "cronotofy-neon-lyrics-style";
+  var VINYL_HOST_ID = "cronotofy-lyrics-vinyl";
+  var BROWSE_TIMEOUT_MS = 3e4;
+  function computeCharDisintegration(index, codePoint) {
+    const hash = Math.abs((index + 1) * 73 + codePoint * 31);
+    return {
+      dx: hash % 59 - 14,
+      dy: -16 - Math.floor(hash / 7) % 35,
+      rot: Math.floor(hash / 13) % 57 - 26,
+      spark: index % 3 === 0
+    };
+  }
+  function findFullLyricsContainer() {
+    return Array.from(document.querySelectorAll(".u42Yq3ZaAiFZXbkvIpwy .z5jGVvMKwt3RUCcmlwby")).find(
+      (el) => !el.closest(".NknVk8hYvXI6ovbE8Zj0")
+    ) || null;
+  }
+  function findScrollParent(el) {
+    let cur = el.parentElement;
+    while (cur && cur !== document.documentElement) {
+      if (cur.hasAttribute("data-overlayscrollbars-viewport")) {
+        return cur;
+      }
+      const overflowY = window.getComputedStyle(cur).overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && cur.scrollHeight >= cur.clientHeight) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  var NEON_LYRICS_CSS = `
+/* Full Lyrics View \u2014 Transparent Album-Wall Backdrop (never flat cover tint) */
+html.cronotofy-lyrics-open .Root__main-view {
+  position: relative !important;
+  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.04) !important;
+  background-image: none !important;
+}
+
+html.cronotofy-lyrics-open .Root__cinema-view,
+html.cronotofy-lyrics-open .wtCMUhX_QmNKSCghbq4h,
+html.cronotofy-lyrics-open .jGYHNMjn1dKKjOUSxUdN,
+html.cronotofy-lyrics-open .frs5ZPluzLbWTu5dCHr0,
+html.cronotofy-lyrics-open .SJ6kQcks6OWaQD8WvlrE,
+html.cronotofy-lyrics-open .KQ5SDwOFi3U9EYsWMAag,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::before,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::after,
+html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport],
+html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport] > div,
+html.cronotofy-lyrics-open .Ke_cNZcH3Yvd2QEbgKJk::before,
+.wYWhVPZoG93lR7ogMIug,
+.Ii0P5lvVrAzHgsutQTVz,
+.u42Yq3ZaAiFZXbkvIpwy,
+html.cronotofy-lyrics-open .main-topBar-background,
+html.cronotofy-lyrics-open .main-topBar-overlay,
+html.cronotofy-lyrics-open .main-view-container__scroll-node,
+html.cronotofy-lyrics-open .main-view-container__scroll-node-child {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  outline: none !important;
+  border: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  --lyrics-color-background: transparent !important;
+  --cinema-mode-bg-color-from: transparent !important;
+  --cinema-mode-bg-color-to: transparent !important;
+}
+
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua {
+  display: none !important;
+}
+
+/* Hide underlying panels in Cinema Lyrics so no vertical bar bleeds behind vinyl */
+html.cronotofy-cinema-lyrics .Root__right-sidebar,
+html.cronotofy-cinema-lyrics .Root__right-sidebar-peek,
+html.cronotofy-cinema-lyrics .Root__nav-bar,
+html.cronotofy-cinema-lyrics .Root__main-view {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/* Shared layout geometry: large spinning vinyl on left + lyrics neatly beside it */
+:root {
+  --nl-vinyl-left: clamp(24px, 3vw, 48px);
+  --nl-vinyl-size: clamp(260px, 24vw, 340px);
+  --nl-vinyl-gap: clamp(28px, 3vw, 48px);
+}
+
+html.cronotofy-cinema-lyrics {
+  --nl-vinyl-left: clamp(44px, 8vw, 150px);
+  --nl-vinyl-size: clamp(340px, 30vw, 460px);
+  --nl-vinyl-gap: clamp(36px, 3.8vw, 64px);
+}
+
+.u42Yq3ZaAiFZXbkvIpwy {
+  align-items: flex-start !important;
+  padding-inline-start: calc(var(--nl-vinyl-left) + var(--nl-vinyl-size) + var(--nl-vinyl-gap)) !important;
+  padding-inline-end: clamp(28px, 4vw, 72px) !important;
+  box-sizing: border-box !important;
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .z5jGVvMKwt3RUCcmlwby {
+  width: 100% !important;
+  max-width: 840px !important;
+  font-size: clamp(2.45rem, 3.9vw, 3.95rem) !important;
+  line-height: 1.24 !important;
+  letter-spacing: -0.015em;
+}
+
+/* Hide unsung and unenhanced passed lines smoothly when not scrolling */
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.y45YX8smwP4lW13IQulz:not(.cronotofy-nl-enhanced),
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.l_p6nU70V4sJ7XaycCp3:not(.cronotofy-nl-enhanced) {
+  opacity: 0 !important;
+  transition: opacity 0.8s ease;
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced {
+  position: relative;
+}
+
+/* Keep React's text node in place untouched while visually presenting the kinetic stage */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced > .lyrics-lyricsContent-text {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.cronotofy-nl-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.24;
+}
+
+.cronotofy-nl-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.cronotofy-nl-space {
+  display: inline-block;
+  width: 0.28em;
+}
+
+.cronotofy-nl-ch {
+  display: inline-block;
+  position: relative;
+  will-change: transform, opacity, filter;
+  transform-origin: center 65%;
+}
+
+/* Upcoming & already-finished lines: fade smoothly away when idle */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.y45YX8smwP4lW13IQulz .cronotofy-nl-ch,
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-gone .cronotofy-nl-ch {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.8s ease, filter 0.6s ease;
+}
+
+/* Manual scroll reveal (stays visible for 30s after last scroll gesture) */
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:not(.cronotofy-nl-active):not(.cronotofy-nl-disintegrating) .cronotofy-nl-ch,
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr:not(.cronotofy-nl-enhanced) {
+  opacity: 0.48 !important;
+  filter: none !important;
+  transform: none !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow: 0 0 12px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.32);
+  transition: opacity 0.45s ease !important;
+  pointer-events: auto;
+}
+
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:hover .cronotofy-nl-ch {
+  opacity: 0.94 !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow: 0 0 18px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
+}
+
+/* Active line: fluid diagonal neon materialization tinted with active cover palette */
+@keyframes cronotofyNeonFluidIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(-10px, 16px, 0) scale(0.88) skewX(-6deg);
+    filter: blur(10px) brightness(2);
+  }
+  45% {
+    opacity: 0.92;
+    transform: translate3d(1px, 1px, 0) scale(1.01) skewX(0deg);
+    filter: blur(1.2px) brightness(1.3);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1) skewX(0deg);
+    filter: blur(0px) brightness(1);
+  }
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-active .cronotofy-nl-ch {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow:
+    0 0 4px rgba(255, 255, 255, 0.72),
+    0 0 12px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 1),
+    0 0 28px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.85),
+    0 0 54px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.55),
+    0 0 88px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.42);
+  animation: cronotofyNeonFluidIn 640ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--i, 0) * var(--in-step, 28ms));
+}
+
+/* Passed bar: progressive ash/ember disintegration + glowing sparks */
+@keyframes cronotofyNeonCharDisintegrate {
+  0% {
+    opacity: 1;
+    color: var(--cronotofy-accent-soft, #f1f5f9);
+    transform: translate3d(0, 0, 0) rotate(0deg) scale(1);
+    filter: blur(0px);
+  }
+  22% {
+    opacity: 0.92;
+    color: var(--cronotofy-accent-soft, #f1f5f9);
+    text-shadow:
+      0 0 18px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+      0 0 38px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.65);
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.14), calc(var(--dy, -24px) * 0.14), 0)
+      rotate(calc(var(--rot, 8deg) * 0.14))
+      scale(1.03);
+    filter: blur(0.6px);
+  }
+  62% {
+    opacity: 0.38;
+    color: var(--cronotofy-accent, #e2e8f0);
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.65), calc(var(--dy, -24px) * 0.65), 0)
+      rotate(calc(var(--rot, 8deg) * 0.65))
+      scale(0.72);
+    filter: blur(3.8px);
+  }
+  100% {
+    opacity: 0;
+    color: var(--cronotofy-accent-2, #94a3b8);
+    transform: translate3d(var(--dx, 12px), var(--dy, -24px), 0) rotate(var(--rot, 8deg)) scale(0.3);
+    filter: blur(9px);
+  }
+}
+
+@keyframes cronotofyNeonSpark {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 0, 0) scale(0.4);
+  }
+  25% {
+    opacity: 1;
+    transform: translate3d(calc(var(--dx, 12px) * 0.3), calc(var(--dy, -24px) * 0.4), 0) scale(1.1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(calc(var(--dx, 12px) * 1.35), calc(var(--dy, -24px) * 1.45), 0) scale(0.15);
+  }
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+  animation: cronotofyNeonCharDisintegrate 860ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 16ms));
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  pointer-events: none;
+  background: var(--cronotofy-accent, #e2e8f0);
+  box-shadow:
+    0 0 8px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+    0 0 14px #ffffff;
+  animation: cronotofyNeonSpark 780ms ease-out forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 16ms) + 60ms);
+}
+
+/* Right-side slow spinning vinyl record */
+@keyframes cronotofyVinylSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+#${VINYL_HOST_ID} {
+  position: absolute;
+  left: var(--nl-vinyl-left);
+  right: auto;
+  top: 47%;
+  transform: translateY(-50%);
+  z-index: 6;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: var(--nl-vinyl-size);
+  opacity: 1;
+  transition: opacity 0.4s ease;
+}
+
+#${VINYL_HOST_ID}.is-fixed {
+  position: fixed;
+  left: var(--nl-vinyl-left);
+  right: auto;
+  top: 47%;
+  transform: translateY(-50%);
+  z-index: 50;
+}
+
+html.cronotofy-ext-open #${VINYL_HOST_ID} {
+  display: none !important;
+}
+
+.cronotofy-vinyl-stage {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  position: relative;
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.68),
+    0 0 64px -8px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.46);
+}
+
+.cronotofy-vinyl-disc {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: repeating-radial-gradient(
+    circle at center,
+    rgba(255, 255, 255, 0.045) 0px,
+    rgba(255, 255, 255, 0.045) 1px,
+    rgba(6, 8, 12, 0.94) 2px,
+    rgba(14, 18, 26, 0.96) 4px
+  );
+  border: 1.5px solid rgba(255, 255, 255, 0.16);
+  animation: cronotofyVinylSpin 24s linear infinite;
+  will-change: transform;
+}
+
+#${VINYL_HOST_ID}.is-paused .cronotofy-vinyl-disc {
+  animation-play-state: paused;
+}
+
+.cronotofy-vinyl-sheen {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(
+    from 25deg,
+    transparent 0deg,
+    rgba(255, 255, 255, 0.13) 34deg,
+    transparent 74deg,
+    transparent 180deg,
+    rgba(255, 255, 255, 0.09) 216deg,
+    transparent 255deg
+  );
+}
+
+.cronotofy-vinyl-cover {
+  width: 68%;
+  height: 68%;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48);
+  box-shadow: 0 0 20px rgba(0, 0, 0, 0.55);
+  background: rgba(11, 15, 23, 0.85);
+}
+
+.cronotofy-vinyl-spindle {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #060910 42%, rgba(255, 255, 255, 0.34) 55%, #111722 72%);
+  border: 1.5px solid rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.cronotofy-vinyl-meta {
+  text-align: center;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cronotofy-vinyl-title {
+  font-family: var(--encore-title-font-stack, SpotifyMixUITitle, sans-serif);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow: 0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.65);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-vinyl-artist {
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1120px) {
+  :root {
+    --nl-vinyl-size: 230px;
+    --nl-vinyl-left: 24px;
+    --nl-vinyl-gap: 26px;
+  }
+
+  html.cronotofy-cinema-lyrics {
+    --nl-vinyl-size: 280px;
+    --nl-vinyl-left: 32px;
+    --nl-vinyl-gap: 32px;
+  }
+}
+
+@media (max-width: 880px) {
+  #${VINYL_HOST_ID} {
+    display: none !important;
+  }
+
+  .u42Yq3ZaAiFZXbkvIpwy {
+    padding-inline: 24px !important;
+    align-items: center !important;
+  }
+}
+
+/* Unsynced lyrics & right-panel mini preview neon bloom */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.tTJvSBNfeQLp4kyD7ULO {
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow:
+    0 0 10px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.55),
+    0 0 26px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.30);
+}
+
+.NknVk8hYvXI6ovbE8Zj0 .SOT5gG00YqnGQ4uR7PwQ {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow:
+    0 0 6px rgba(255, 255, 255, 0.75),
+    0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.85);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced .cronotofy-nl-ch,
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after,
+  .cronotofy-vinyl-disc {
+    animation: none !important;
+    filter: none !important;
+    transform: none !important;
+    transition: opacity 0.25s ease !important;
+  }
+
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+    opacity: 0;
+  }
+}
+`;
+  function ensureNeonLyricsStyle() {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById(NEON_LYRICS_STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== NEON_LYRICS_CSS) {
+        existing.textContent = NEON_LYRICS_CSS;
+      }
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = NEON_LYRICS_STYLE_ID;
+    style.textContent = NEON_LYRICS_CSS;
+    document.head.appendChild(style);
+  }
+  var NeonLyricsController = class {
+    constructor() {
+      this.observer = null;
+      this.syncRafPending = false;
+      this.initialized = false;
+      this.activeLineKeys = /* @__PURE__ */ new Set();
+      this.disintegratingKeys = /* @__PURE__ */ new Set();
+      this.disintegratedKeys = /* @__PURE__ */ new Set();
+      this.keyTimers = /* @__PURE__ */ new Map();
+      this.boundScrollTargets = /* @__PURE__ */ new WeakSet();
+      this.browseTimer = null;
+      this.vinylHost = null;
+      this.vinylImg = null;
+      this.vinylTitleEl = null;
+      this.vinylArtistEl = null;
+      this.lastVinylCover = "";
+      this.lastVinylTitle = "";
+      this.lastVinylArtist = "";
+      this.lastSongSignature = "";
+    }
+    init() {
+      if (this.initialized || typeof document === "undefined") return;
+      this.initialized = true;
+      ensureNeonLyricsStyle();
+      this.sync();
+      if (typeof window !== "undefined") {
+        window.addEventListener("keydown", (e) => {
+          if (document.documentElement.classList.contains("cronotofy-lyrics-open") && (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "PageUp" || e.key === "PageDown" || e.key === "Home" || e.key === "End")) {
+            this.triggerBrowseReveal();
+          }
+        });
+      }
+      const handlePlayerUpdate = () => {
+        this.syncVinyl(findFullLyricsContainer());
+      };
+      Spicetify?.Player?.addEventListener?.("songchange", handlePlayerUpdate);
+      Spicetify?.Player?.addEventListener?.("onplaypause", handlePlayerUpdate);
+      if (document.body && typeof MutationObserver !== "undefined") {
+        this.observer = new MutationObserver(() => {
+          if (this.syncRafPending) return;
+          this.syncRafPending = true;
+          requestAnimationFrame(() => {
+            this.syncRafPending = false;
+            this.sync();
+          });
+        });
+        this.observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class"]
+        });
+      }
+    }
+    clearKeyTimer(key) {
+      const timer = this.keyTimers.get(key);
+      if (timer !== void 0) {
+        window.clearTimeout(timer);
+        this.keyTimers.delete(key);
+      }
+    }
+    clearBrowseReveal() {
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+        this.browseTimer = null;
+      }
+      if (typeof document !== "undefined") {
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }
+    }
+    triggerBrowseReveal() {
+      if (typeof document === "undefined") return;
+      document.documentElement.classList.add("cronotofy-nl-browsing");
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+      }
+      this.browseTimer = window.setTimeout(() => {
+        this.browseTimer = null;
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }, BROWSE_TIMEOUT_MS);
+    }
+    resetSongState() {
+      for (const timer of this.keyTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      this.keyTimers.clear();
+      this.activeLineKeys.clear();
+      this.disintegratingKeys.clear();
+      this.disintegratedKeys.clear();
+    }
+    ensureScrollBindings(container) {
+      const targets = [container];
+      const wrapper = container.closest(".wYWhVPZoG93lR7ogMIug");
+      if (wrapper) targets.push(wrapper);
+      const scrollParent = findScrollParent(container);
+      if (scrollParent) targets.push(scrollParent);
+      for (const target of targets) {
+        if (this.boundScrollTargets.has(target)) continue;
+        this.boundScrollTargets.add(target);
+        const onManualInteract = () => this.triggerBrowseReveal();
+        target.addEventListener("wheel", onManualInteract, { passive: true });
+        target.addEventListener("touchmove", onManualInteract, { passive: true });
+        target.addEventListener("pointerdown", onManualInteract, { passive: true });
+      }
+    }
+    getOrCreateVinylHost() {
+      if (this.vinylHost) return this.vinylHost;
+      const host = document.createElement("div");
+      host.id = VINYL_HOST_ID;
+      host.setAttribute("aria-hidden", "true");
+      const stage = document.createElement("div");
+      stage.className = "cronotofy-vinyl-stage";
+      const disc = document.createElement("div");
+      disc.className = "cronotofy-vinyl-disc";
+      const cover = document.createElement("img");
+      cover.className = "cronotofy-vinyl-cover";
+      cover.alt = "";
+      const spindle = document.createElement("div");
+      spindle.className = "cronotofy-vinyl-spindle";
+      const sheen = document.createElement("div");
+      sheen.className = "cronotofy-vinyl-sheen";
+      disc.append(cover, spindle);
+      stage.append(disc, sheen);
+      const meta = document.createElement("div");
+      meta.className = "cronotofy-vinyl-meta";
+      const title = document.createElement("div");
+      title.className = "cronotofy-vinyl-title";
+      const artist = document.createElement("div");
+      artist.className = "cronotofy-vinyl-artist";
+      meta.append(title, artist);
+      host.append(stage, meta);
+      this.vinylHost = host;
+      this.vinylImg = cover;
+      this.vinylTitleEl = title;
+      this.vinylArtistEl = artist;
+      return host;
+    }
+    syncVinyl(container) {
+      if (!container) {
+        document.getElementById(VINYL_HOST_ID)?.remove();
+        this.vinylHost?.remove();
+        return;
+      }
+      const cinemaView = container.closest(".Root__cinema-view");
+      const mainView = container.closest(".Root__main-view");
+      const mountTarget = cinemaView || mainView || document.body;
+      if (!mountTarget) return;
+      const host = this.getOrCreateVinylHost();
+      host.classList.toggle("is-fixed", !mainView);
+      const orphan = document.getElementById(VINYL_HOST_ID);
+      if (orphan && orphan !== host) orphan.remove();
+      if (host.parentElement !== mountTarget) {
+        mountTarget.appendChild(host);
+      }
+      const item = Spicetify?.Player?.data?.item;
+      const meta = item?.metadata || {};
+      const rawImg = meta.image_xlarge_url || meta.image_large_url || meta.image_url || item?.album?.images?.[0]?.url || "";
+      const coverUrl = normalizeSpotifyImage(rawImg);
+      const title = (meta.title || item?.name || "").trim();
+      const artist = (meta.artist_name || item?.artists?.[0]?.name || "").trim();
+      if (this.vinylImg && coverUrl && this.lastVinylCover !== coverUrl) {
+        this.lastVinylCover = coverUrl;
+        this.vinylImg.src = coverUrl;
+      }
+      if (this.vinylTitleEl && this.lastVinylTitle !== title) {
+        this.lastVinylTitle = title;
+        this.vinylTitleEl.textContent = title;
+      }
+      if (this.vinylArtistEl && this.lastVinylArtist !== artist) {
+        this.lastVinylArtist = artist;
+        this.vinylArtistEl.textContent = artist;
+      }
+      const isPlaying = Spicetify?.Player?.isPlaying?.();
+      host.classList.toggle("is-paused", isPlaying === false);
+    }
+    ensureEnhancedLine(line, textNode, text) {
+      if (line.dataset.cronotofyNlText === text && line.querySelector(".cronotofy-nl-stage")) {
+        return Number(line.dataset.cronotofyNlCount || "0");
+      }
+      line.querySelectorAll(":scope > .cronotofy-nl-stage").forEach((el) => el.remove());
+      const stage = document.createElement("span");
+      stage.className = "cronotofy-nl-stage";
+      stage.setAttribute("aria-hidden", "true");
+      const tokens = text.split(/(\s+)/);
+      let charIdx = 0;
+      for (const token of tokens) {
+        if (!token) continue;
+        if (/^\s+$/.test(token)) {
+          const space = document.createElement("span");
+          space.className = "cronotofy-nl-space";
+          space.textContent = "\xA0";
+          stage.appendChild(space);
+          continue;
+        }
+        const wordEl = document.createElement("span");
+        wordEl.className = "cronotofy-nl-word";
+        for (const ch of Array.from(token)) {
+          const span = document.createElement("span");
+          span.className = "cronotofy-nl-ch";
+          const vec = computeCharDisintegration(charIdx, ch.codePointAt(0) ?? 0);
+          if (vec.spark) span.classList.add("is-spark");
+          span.style.setProperty("--i", String(charIdx));
+          span.style.setProperty("--dx", `${vec.dx}px`);
+          span.style.setProperty("--dy", `${vec.dy}px`);
+          span.style.setProperty("--rot", `${vec.rot}deg`);
+          span.textContent = ch;
+          wordEl.appendChild(span);
+          charIdx++;
+        }
+        stage.appendChild(wordEl);
+      }
+      const inStep = Math.max(16, Math.min(36, Math.round(920 / Math.max(1, charIdx))));
+      const outStep = Math.max(10, Math.min(18, Math.round(420 / Math.max(1, charIdx))));
+      stage.style.setProperty("--in-step", `${inStep}ms`);
+      stage.style.setProperty("--out-step", `${outStep}ms`);
+      textNode.insertAdjacentElement("afterend", stage);
+      line.dataset.cronotofyNlText = text;
+      line.dataset.cronotofyNlCount = String(charIdx);
+      line.dataset.cronotofyNlOutStep = String(outStep);
+      line.classList.add("cronotofy-nl-enhanced");
+      return charIdx;
+    }
+    sync() {
+      const container = findFullLyricsContainer();
+      if (!container) {
+        document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+        this.clearBrowseReveal();
+        this.syncVinyl(null);
+        return;
+      }
+      const inCinema = Boolean(container.closest(".Root__cinema-view"));
+      document.documentElement.classList.add("cronotofy-lyrics-open");
+      document.documentElement.classList.toggle("cronotofy-cinema-lyrics", inCinema);
+      this.ensureScrollBindings(container);
+      this.syncVinyl(container);
+      const lines = container.querySelectorAll(".J4_kkGYm5hjbZlztykxr");
+      const sigParts = [];
+      lines.forEach((line) => {
+        if (sigParts.length >= 3) return;
+        const t = line.querySelector(":scope > .lyrics-lyricsContent-text")?.textContent?.trim();
+        if (t) sigParts.push(t);
+      });
+      const songSig = sigParts.join("\n");
+      if (songSig && songSig !== this.lastSongSignature) {
+        this.lastSongSignature = songSig;
+        this.resetSongState();
+      }
+      lines.forEach((line, idx) => {
+        if (line.classList.contains("tTJvSBNfeQLp4kyD7ULO") || line.classList.contains("YtTJm1ld5AeUmuu75urR")) {
+          return;
+        }
+        const textNode = line.querySelector(":scope > .lyrics-lyricsContent-text");
+        const text = textNode?.textContent?.trim() || "";
+        if (!textNode || !text) return;
+        const totalChars = this.ensureEnhancedLine(line, textNode, text);
+        const outStep = Number(line.dataset.cronotofyNlOutStep || "16");
+        const key = `${idx}:${text}`;
+        if (line.classList.contains("SOT5gG00YqnGQ4uR7PwQ")) {
+          this.clearKeyTimer(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          this.activeLineKeys.add(key);
+          line.classList.remove("cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+          line.classList.add("cronotofy-nl-active");
+        } else if (line.classList.contains("l_p6nU70V4sJ7XaycCp3")) {
+          if (this.activeLineKeys.has(key)) {
+            this.activeLineKeys.delete(key);
+            this.clearKeyTimer(key);
+            this.disintegratedKeys.delete(key);
+            this.disintegratingKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+            const duration = Math.min(1800, totalChars * outStep + 960);
+            const timer = window.setTimeout(() => {
+              this.keyTimers.delete(key);
+              this.disintegratingKeys.delete(key);
+              if (!this.activeLineKeys.has(key)) {
+                this.disintegratedKeys.add(key);
+              }
+              if (line.isConnected && !line.classList.contains("cronotofy-nl-active")) {
+                line.classList.remove("cronotofy-nl-disintegrating");
+                line.classList.add("cronotofy-nl-gone");
+              }
+            }, duration);
+            this.keyTimers.set(key, timer);
+          } else if (this.disintegratingKeys.has(key)) {
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+          } else {
+            this.disintegratedKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating");
+            line.classList.add("cronotofy-nl-gone");
+          }
+        } else {
+          this.clearKeyTimer(key);
+          this.activeLineKeys.delete(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+        }
+      });
+    }
+    destroy() {
+      this.observer?.disconnect();
+      this.observer = null;
+      if (typeof document !== "undefined") {
+        document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+      }
+      this.clearBrowseReveal();
+      this.resetSongState();
+      this.syncVinyl(null);
+    }
+  };
+
   // spicetify-cronotofy/src/bootstrap.ts
   function bootstrapCronotofy(options = {}) {
     const tryStart = () => {
@@ -5561,6 +6372,7 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
           onOpen: options.onOpen,
           isOpen: options.isOpen
         });
+        const neonLyrics = new NeonLyricsController();
         let lastThemeKey = "";
         const syncThemeFromPlayer = () => {
           const live = tracker.getLiveTrack();
@@ -5643,6 +6455,7 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
         });
         void globalWall.init();
         chromeWidgets.init();
+        neonLyrics.init();
         options.onChromeReady?.(chromeWidgets);
         tracker.subscribe(syncThemeFromPlayer);
         Spicetify.Player.addEventListener?.("songchange", () => {
