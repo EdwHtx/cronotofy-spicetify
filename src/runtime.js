@@ -490,7 +490,11 @@
   }
   function readVisualPreset() {
     const preset = readStoredPreference(VISUAL_PRESET_KEY);
-    return VISUAL_PRESETS.includes(preset) ? preset : "full";
+    if (VISUAL_PRESETS.includes(preset)) return preset;
+    const hardware = typeof navigator === "undefined" ? {} : navigator;
+    const limitedMemory = hardware.deviceMemory > 0 && hardware.deviceMemory <= 4;
+    const limitedCpu = hardware.hardwareConcurrency > 0 && hardware.hardwareConcurrency <= 4;
+    return limitedMemory || limitedCpu ? "focus" : "full";
   }
   function parseSharedPreferences(text) {
     if (typeof text !== "string" || text.length > 1024) return null;
@@ -3497,7 +3501,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       };
       syncBridgeState();
       const unsub = window.__CRONOTOFY_MOD__?.subscribe(syncBridgeState);
-      const fallbackTimer = setInterval(syncBridgeState, 2e3);
+      const fallbackTimer = typeof unsub === "function" ? null : setInterval(syncBridgeState, 2e3);
       return () => {
         if (unsub) unsub();
         clearInterval(fallbackTimer);
@@ -4452,14 +4456,17 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         window.addEventListener("keydown", this.handleShortcut);
       }
       if (document.body && typeof MutationObserver !== "undefined") {
-        this.observer = new MutationObserver(() => {
+        this.observer = new MutationObserver((records) => {
+          if (records.every((record) => record.target.closest?.(
+            "#cronotofy-npb-telemetry, #cronotofy-ext-host, #cronotofy-global-wall, #cronotofy-lyrics-vinyl"
+          ))) return;
           if (this.rafPending) return;
           this.rafPending = true;
-          requestAnimationFrame(() => {
+          setTimeout(() => {
             this.rafPending = false;
             this.ensureMounted();
             this.syncActiveRoute();
-          });
+          }, 150);
         });
         this.observer.observe(document.body, { childList: true, subtree: true });
       }
@@ -4738,6 +4745,24 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   var GLOBAL_WALL_STYLE_ID = "cronotofy-global-wall-style";
   var GLOBAL_WALL_ROOT_ID = "cronotofy-global-wall";
   var GLOBAL_WALL_CSS = `
+:root[data-cronotofy-preset="focus"] body *,
+:root[data-cronotofy-preset="focus"] body *::before,
+:root[data-cronotofy-preset="focus"] body *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+:root[data-cronotofy-preset="focus"] .cronotofy-page *,
+:root[data-cronotofy-preset="focus"] #cronotofy-lyrics-vinyl * {
+  animation: none !important;
+  transition: none !important;
+  text-shadow: none !important;
+}
+:root[data-cronotofy-preset="focus"] body {
+  background: #0b0f17 !important;
+}
+:root[data-cronotofy-preset="focus"] :is(.Root__globalNav, .main-nowPlayingBar-nowPlayingBar, .cronotofy-island) {
+  background: #111722 !important;
+}
 #${GLOBAL_WALL_ROOT_ID} {
   position: fixed;
   inset: 0;
@@ -6781,9 +6806,16 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         const themeController = new DynamicThemeController();
         const globalWall = new GlobalAlbumWallController();
         ensureGlobalWallStyle();
+        let visualInitTimer;
         const setVisualPreset = (preset) => {
           document.documentElement.dataset.cronotofyPreset = preset;
-          if (preset !== "focus") void globalWall.init().catch(reportStartupError);
+          clearTimeout(visualInitTimer);
+          if (preset !== "focus") {
+            visualInitTimer = setTimeout(() => {
+              void globalWall.init().catch(reportStartupError);
+              try { neonLyrics.init(); } catch (err) { reportStartupError(err); }
+            }, 1500);
+          }
         };
         const chromeWidgets = new CronotofyChromeWidgets(tracker, {
           onOpen: options.onOpen,
@@ -6876,11 +6908,6 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           syncThemeFromPlayer();
         });
         syncThemeFromPlayer();
-        try {
-          neonLyrics.init();
-        } catch (err) {
-          reportStartupError(err);
-        }
       } catch (err) {
         reportStartupError(err);
       }

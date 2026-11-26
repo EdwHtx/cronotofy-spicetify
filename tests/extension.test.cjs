@@ -39,12 +39,24 @@ function loadExtension(globals) {
     globalThis.getTranslations = getTranslations;
     globalThis.formatRelativeTimeLocalized = formatRelativeTimeLocalized;
     globalThis.parseSharedPreferences = parseSharedPreferences;
+    globalThis.readVisualPreset = readVisualPreset;
     globalThis.refinePaletteWithGeminiVision = refinePaletteWithGeminiVision;
     globalThis.setTestTrack = (track) => { extractLiveTrackFromPlayer = () => track; };
     return;
 ${entry}`), context);
   return context;
 }
+
+test("limited hardware defaults to Focus and preserves an explicit visual preference", () => {
+  const preset = (navigator, saved = null) => loadExtension({
+    navigator, localStorage: { getItem: () => saved }
+  }).readVisualPreset();
+  assert.equal(preset({ deviceMemory: 4, hardwareConcurrency: 8 }), "focus");
+  assert.equal(preset({ hardwareConcurrency: 2 }), "focus");
+  assert.equal(preset({ deviceMemory: 8, hardwareConcurrency: 8 }), "full");
+  assert.equal(preset({}), "full");
+  assert.equal(preset({ hardwareConcurrency: 2 }, "full"), "full");
+});
 
 test("the tracker skips ticks without track metadata and resumes when it returns", () => {
   const context = loadExtension({ Spicetify: { Player: { isPlaying: () => true } } });
@@ -262,6 +274,7 @@ for (const [layout, mainSelector, navSelector] of [
     },
     localStorage: { getItem: (key) => key === "cronotofy_visual_preset" ? "focus" : null },
     setTimeout() {},
+    clearTimeout() {},
     setInterval() {},
     window,
     Spicetify: {
