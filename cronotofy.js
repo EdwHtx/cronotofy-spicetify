@@ -2,7 +2,7 @@
 (() => {
   // spicetify-cronotofy/src/config.ts
   var CRONOTOFY_MOD_CONFIG = {
-    version: "2.0.0",
+    version: "2.1.0",
     tracking: {
       storagePrefix: "cronotofy_spicetify_tracker_v1",
       minPlaySeconds: 25,
@@ -444,6 +444,129 @@
 
   // spicetify-cronotofy/src/i18n.ts
   var TRANSLATIONS = {
+    de: {
+      brandSubtitle: "Native Musik-Analyse \xB7 Echtzeit-Telemetrie",
+      tabs: {
+        overview: "\xDCbersicht",
+        artists: "K\xFCnstler",
+        tracks: "Songs",
+        albums: "Alben",
+        live: "Live-Aktivit\xE4t"
+      },
+      periods: {
+        short_term: "1 Monat",
+        medium_term: "6 Monate",
+        long_term: "Gesamt"
+      },
+      nowPlaying: "L\xE4uft gerade",
+      paused: "Pausiert",
+      currentSession: "Aktuelle Sitzung",
+      today: "Heute",
+      idleHint: "Spiele einen Song auf Spotify ab, um Live-Telemetrie zu erfassen.",
+      loadingAnalytics: "Spotify-Statistiken werden geladen...",
+      kpis: {
+        recordedTime: "Erfasste Zeit",
+        todayLabel: "Heute",
+        annualInCronotofy: (h) => `${h} j\xE4hrlich in Cronotofy`,
+        totalMod: (h) => `Gesamt: ${h}`,
+        topArtist: (period) => `Top-K\xFCnstler (${period})`,
+        artistsAnalyzed: (n) => `${n} K\xFCnstler analysiert`,
+        topTrack: (period) => `Top-Song (${period})`,
+        noData: "Keine Daten",
+        favoriteGenre: "Lieblingsgenre",
+        varied: "Gemischt",
+        affinityAndRecent: (pct, n) => `${pct}% Anteil \xB7 ${n} k\xFCrzliche Plays`,
+        tracksInRanking: (n) => `${n} Songs im Ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 K\xFCnstler",
+        top5Tracks: "Top 5 Songs",
+        top4Albums: "Top 4 Alben",
+        genreDna: "Genre-DNA",
+        mainGenresBadge: (n) => `${n} Top-Genres`,
+        viewAll: (n) => `Alle ansehen (${n}) \u2192`,
+        tracksRanking: (period) => `Song-Ranking \xB7 ${period}`,
+        tracksBadge: (n) => `${n} Songs`,
+        tracksListenedToday: "Heute geh\xF6rt",
+        accumulatedDesktop: "Desktop gesamt",
+        exactSecondBySecond: "Sekundengenaue Erfassung",
+        capturedTracks: "Erfasste Songs",
+        completedPlays: (n) => `${n} vollst\xE4ndige Plays`,
+        lastSync: "Lokaler Speicher",
+        pending: "Aktiv",
+        topRealTimeTracks: "Songs nach echter H\xF6rzeit",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Echte K\xFCnstler & Verlauf",
+        clearLocalHistory: "Lokalen Verlauf l\xF6schen",
+        recordedPlays: (n) => `${n} erfasste Plays`,
+        latestCapturedPlays: "Zuletzt erfasste Plays",
+        localDateLabel: (d) => `Lokales Datum: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Spotify-K\xFCnstler",
+        untitled: "Ohne Titel",
+        unknownArtist: "Unbekannter K\xFCnstler",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} Top-Songs`,
+        songSingular: "Song",
+        songPlural: "Songs",
+        playSingular: "Play",
+        playPlural: "Plays"
+      },
+      empty: {
+        noArtistsPeriod: "Keine K\xFCnstler f\xFCr diesen Zeitraum verf\xFCgbar.",
+        noTracksPeriod: "Keine Songs f\xFCr diesen Zeitraum verf\xFCgbar.",
+        noAlbumsPeriod: "Keine Alben vorhanden.",
+        noGenres: "Keine Genre-Daten auf Spotify verf\xFCgbar.",
+        noArtistsFound: "Keine Top-K\xFCnstler f\xFCr diesen Zeitraum gefunden.",
+        noTrackedTimeYet: "Noch keine H\xF6rzeit erfasst. Spiele einfach einen Song auf Spotify ab.",
+        noRecentPlaysYet: "Songs mit \u2265 25s H\xF6rzeit erscheinen hier chronologisch."
+      },
+      actions: {
+        play: "Abspielen",
+        pause: "Pause",
+        addToQueue: "In die Warteschlange",
+        playingNowToast: (title) => `Spielt: ${title}`,
+        playbackErrorToast: "Wiedergabe konnte nicht gestartet werden",
+        queuedToast: (title) => `Zur Warteschlange hinzugef\xFCgt: ${title}`,
+        queueErrorToast: "Konnte nicht zur Warteschlange hinzugef\xFCgt werden",
+        historyClearedToast: "Lokaler Verlauf gel\xF6scht",
+        confirmClearHistory: "Wirklich l\xF6schen?",
+        copiedTrackToast: (title) => `Kopiert: ${title}`,
+        copyErrorToast: "Song konnte nicht kopiert werden",
+        noTrackPlayingToast: "Gerade l\xE4uft kein Song"
+      },
+      search: {
+        placeholder: "Nach Song, K\xFCnstler oder Album filtern...",
+        clear: "Filter l\xF6schen",
+        noResults: "Keine passenden Treffer gefunden."
+      },
+      streak: {
+        daysBadge: (n) => `${n}T Serie`,
+        last7Days: (h) => `7T: ${h}`
+      },
+      sleepTimer: {
+        label: "Sleep-Timer",
+        offToast: "Sleep-Timer aus",
+        endOfTrackShort: "Ende",
+        endOfTrackToast: "Sleep-Timer: Pause am Titelende",
+        minutesToast: (m) => `Sleep-Timer: ${m} Min.`,
+        triggeredToast: "Sleep-Timer abgelaufen \u2014 Wiedergabe pausiert",
+        tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
+        tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
+      },
+      time: {
+        justNow: "Gerade eben",
+        secondsAgo: (s) => `Vor ${s}s`,
+        minutesAgo: (m) => `Vor ${m}m`,
+        hoursAgo: (h) => `Vor ${h}h`
+      },
+      errorBoundary: {
+        title: "Fehler in Cronotofy",
+        fallbackMsg: "Beim Anzeigen dieser Ansicht ist ein unerwarteter Fehler aufgetreten.",
+        retry: "Erneut versuchen"
+      }
+    },
     en: {
       brandSubtitle: "Native music analytics \xB7 Real-time telemetry",
       tabs: {
@@ -690,129 +813,6 @@
         retry: "Reintentar"
       }
     },
-    pt: {
-      brandSubtitle: "An\xE1lise musical nativa \xB7 Telemetria em tempo real",
-      tabs: {
-        overview: "Resumo",
-        artists: "Artistas",
-        tracks: "M\xFAsicas",
-        albums: "\xC1lbuns",
-        live: "Atividade ao Vivo"
-      },
-      periods: {
-        short_term: "1 M\xEAs",
-        medium_term: "6 Meses",
-        long_term: "Geral"
-      },
-      nowPlaying: "Tocando agora",
-      paused: "Pausado",
-      currentSession: "Sess\xE3o atual",
-      today: "Hoje",
-      idleHint: "Reproduza qualquer m\xFAsica no Spotify para iniciar a telemetria ao vivo.",
-      loadingAnalytics: "Carregando suas estat\xEDsticas do Spotify...",
-      kpis: {
-        recordedTime: "Tempo Registrado",
-        todayLabel: "Hoje",
-        annualInCronotofy: (h) => `${h} anual no Cronotofy`,
-        totalMod: (h) => `Total: ${h}`,
-        topArtist: (period) => `Top Artista (${period})`,
-        artistsAnalyzed: (n) => `${n} artistas analisados`,
-        topTrack: (period) => `Top M\xFAsica (${period})`,
-        noData: "Sem dados",
-        favoriteGenre: "G\xEAnero Favorito",
-        varied: "Variado",
-        affinityAndRecent: (pct, n) => `${pct}% afinidade \xB7 ${n} recentes`,
-        tracksInRanking: (n) => `${n} m\xFAsicas no ranking`
-      },
-      sections: {
-        top5Artists: "Top 5 Artistas",
-        top5Tracks: "Top 5 M\xFAsicas",
-        top4Albums: "Top 4 \xC1lbuns",
-        genreDna: "DNA de G\xEAneros",
-        mainGenresBadge: (n) => `${n} principais`,
-        viewAll: (n) => `Ver todos (${n}) \u2192`,
-        tracksRanking: (period) => `Ranking de M\xFAsicas \xB7 ${period}`,
-        tracksBadge: (n) => `${n} m\xFAsicas`,
-        tracksListenedToday: "Ouvido Hoje",
-        accumulatedDesktop: "Acumulado no Desktop",
-        exactSecondBySecond: "Medi\xE7\xE3o exata segundo a segundo",
-        capturedTracks: "Faixas Capturadas",
-        completedPlays: (n) => `${n} reprodu\xE7\xF5es completas`,
-        lastSync: "Armazenamento Local",
-        pending: "Ativo",
-        topRealTimeTracks: "M\xFAsicas por Tempo Real Ouvido",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Artistas Reais e Hist\xF3rico Recente",
-        clearLocalHistory: "Limpar hist\xF3rico local",
-        recordedPlays: (n) => `${n} reprodu\xE7\xF5es registradas`,
-        latestCapturedPlays: "\xDAltimas Reprodu\xE7\xF5es Capturadas",
-        localDateLabel: (d) => `Data local: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artista do Spotify",
-        untitled: "Sem t\xEDtulo",
-        unknownArtist: "Artista desconhecido",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top m\xFAsicas`,
-        songSingular: "m\xFAsica",
-        songPlural: "m\xFAsicas",
-        playSingular: "play",
-        playPlural: "plays"
-      },
-      empty: {
-        noArtistsPeriod: "Sem artistas dispon\xEDveis para este per\xEDodo.",
-        noTracksPeriod: "Sem m\xFAsicas dispon\xEDveis para este per\xEDodo.",
-        noAlbumsPeriod: "Sem \xE1lbuns para mostrar.",
-        noGenres: "Sem tags de g\xEAnero dispon\xEDveis no Spotify.",
-        noArtistsFound: "Nenhum artista principal encontrado para este per\xEDodo.",
-        noTrackedTimeYet: "Ainda n\xE3o h\xE1 tempo acumulado. D\xEA play em qualquer m\xFAsica no Spotify.",
-        noRecentPlaysYet: "M\xFAsicas tocadas \u2265 25s aparecer\xE3o nesta linha do tempo."
-      },
-      actions: {
-        play: "Reproduzir",
-        pause: "Pausar",
-        addToQueue: "Adicionar \xE0 fila",
-        playingNowToast: (title) => `Tocando: ${title}`,
-        playbackErrorToast: "N\xE3o foi poss\xEDvel iniciar a reprodu\xE7\xE3o",
-        queuedToast: (title) => `Adicionada \xE0 fila: ${title}`,
-        queueErrorToast: "N\xE3o foi poss\xEDvel adicionar \xE0 fila",
-        historyClearedToast: "Hist\xF3rico local limpo",
-        confirmClearHistory: "Confirmar limpeza?",
-        copiedTrackToast: (title) => `Copiada: ${title}`,
-        copyErrorToast: "N\xE3o foi poss\xEDvel copiar a m\xFAsica",
-        noTrackPlayingToast: "Nenhuma m\xFAsica tocando agora"
-      },
-      search: {
-        placeholder: "Filtrar por m\xFAsica, artista ou \xE1lbum...",
-        clear: "Limpar filtro",
-        noResults: "Nenhum resultado encontrado para o filtro."
-      },
-      streak: {
-        daysBadge: (n) => `${n}d sequ\xEAncia`,
-        last7Days: (h) => `7d: ${h}`
-      },
-      sleepTimer: {
-        label: "Temporizador",
-        offToast: "Temporizador desligado",
-        endOfTrackShort: "Fim",
-        endOfTrackToast: "Temporizador: pausar ao fim da faixa",
-        minutesToast: (m) => `Temporizador: ${m} min`,
-        triggeredToast: "Temporizador encerrado \u2014 reprodu\xE7\xE3o pausada",
-        tooltipIdle: "Temporizador (Alt+Shift+S)",
-        tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
-      },
-      time: {
-        justNow: "Agora mesmo",
-        secondsAgo: (s) => `H\xE1 ${s}s`,
-        minutesAgo: (m) => `H\xE1 ${m}m`,
-        hoursAgo: (h) => `H\xE1 ${h}h`
-      },
-      errorBoundary: {
-        title: "Algo deu errado no Cronotofy",
-        fallbackMsg: "Ocorreu um erro inesperado ao renderizar esta visualiza\xE7\xE3o.",
-        retry: "Tentar novamente"
-      }
-    },
     fr: {
       brandSubtitle: "Analytique musicale native \xB7 T\xE9l\xE9m\xE9trie en temps r\xE9el",
       tabs: {
@@ -936,128 +936,86 @@
         retry: "R\xE9essayer"
       }
     },
-    de: {
-      brandSubtitle: "Native Musik-Analyse \xB7 Echtzeit-Telemetrie",
-      tabs: {
-        overview: "\xDCbersicht",
-        artists: "K\xFCnstler",
-        tracks: "Songs",
-        albums: "Alben",
-        live: "Live-Aktivit\xE4t"
-      },
-      periods: {
-        short_term: "1 Monat",
-        medium_term: "6 Monate",
-        long_term: "Gesamt"
-      },
-      nowPlaying: "L\xE4uft gerade",
-      paused: "Pausiert",
-      currentSession: "Aktuelle Sitzung",
-      today: "Heute",
-      idleHint: "Spiele einen Song auf Spotify ab, um Live-Telemetrie zu erfassen.",
-      loadingAnalytics: "Spotify-Statistiken werden geladen...",
+    id: {
+      brandSubtitle: "Statistik musik · Aktivitas langsung",
+      tabs: { overview: "Ringkasan", artists: "Artis", tracks: "Lagu", albums: "Album", live: "Aktivitas langsung" },
+      periods: { short_term: "1 Bulan", medium_term: "6 Bulan", long_term: "Sepanjang Waktu" },
+      nowPlaying: "Sedang Diputar",
+      paused: "Dijeda",
+      currentSession: "Sesi saat ini",
+      today: "Hari ini",
+      idleHint: "Putar lagu di Spotify untuk mulai mencatat aktivitas.",
+      loadingAnalytics: "Memuat statistik Spotify...",
       kpis: {
-        recordedTime: "Erfasste Zeit",
-        todayLabel: "Heute",
-        annualInCronotofy: (h) => `${h} j\xE4hrlich in Cronotofy`,
-        totalMod: (h) => `Gesamt: ${h}`,
-        topArtist: (period) => `Top-K\xFCnstler (${period})`,
-        artistsAnalyzed: (n) => `${n} K\xFCnstler analysiert`,
-        topTrack: (period) => `Top-Song (${period})`,
-        noData: "Keine Daten",
-        favoriteGenre: "Lieblingsgenre",
-        varied: "Gemischt",
-        affinityAndRecent: (pct, n) => `${pct}% Anteil \xB7 ${n} k\xFCrzliche Plays`,
-        tracksInRanking: (n) => `${n} Songs im Ranking`
+        recordedTime: "Durasi Tercatat", todayLabel: "Hari ini",
+        annualInCronotofy: (h) => `${h} per tahun di Cronotofy`,
+        totalMod: (h) => `Total: ${h}`,
+        topArtist: (period) => `Artis Teratas (${period})`,
+        artistsAnalyzed: (n) => `${n} artis dianalisis`,
+        topTrack: (period) => `Lagu Teratas (${period})`,
+        noData: "Belum ada data", favoriteGenre: "Genre Favorit", varied: "Beragam",
+        affinityAndRecent: (pct, n) => `${pct}% kecocokan · ${n} pemutaran terbaru`,
+        tracksInRanking: (n) => `${n} lagu dalam peringkat`
       },
       sections: {
-        top5Artists: "Top 5 K\xFCnstler",
-        top5Tracks: "Top 5 Songs",
-        top4Albums: "Top 4 Alben",
-        genreDna: "Genre-DNA",
-        mainGenresBadge: (n) => `${n} Top-Genres`,
-        viewAll: (n) => `Alle ansehen (${n}) \u2192`,
-        tracksRanking: (period) => `Song-Ranking \xB7 ${period}`,
-        tracksBadge: (n) => `${n} Songs`,
-        tracksListenedToday: "Heute geh\xF6rt",
-        accumulatedDesktop: "Desktop gesamt",
-        exactSecondBySecond: "Sekundengenaue Erfassung",
-        capturedTracks: "Erfasste Songs",
-        completedPlays: (n) => `${n} vollst\xE4ndige Plays`,
-        lastSync: "Lokaler Speicher",
-        pending: "Aktiv",
-        topRealTimeTracks: "Songs nach echter H\xF6rzeit",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Echte K\xFCnstler & Verlauf",
-        clearLocalHistory: "Lokalen Verlauf l\xF6schen",
-        recordedPlays: (n) => `${n} erfasste Plays`,
-        latestCapturedPlays: "Zuletzt erfasste Plays",
-        localDateLabel: (d) => `Lokales Datum: ${d}`
+        top5Artists: "5 Artis Teratas", top5Tracks: "5 Lagu Teratas", top4Albums: "4 Album Teratas",
+        genreDna: "Profil Genre", mainGenresBadge: (n) => `${n} genre teratas`,
+        viewAll: (n) => `Lihat semua (${n}) →`,
+        tracksRanking: (period) => `Peringkat Lagu · ${period}`,
+        tracksBadge: (n) => `${n} lagu`,
+        tracksListenedToday: "Didengarkan Hari Ini", accumulatedDesktop: "Total di Desktop",
+        exactSecondBySecond: "Pencatatan setiap detik", capturedTracks: "Lagu Tercatat",
+        completedPlays: (n) => `${n} pemutaran tercatat`,
+        lastSync: "Penyimpanan Lokal", pending: "Aktif",
+        topRealTimeTracks: "Lagu Berdasarkan Durasi Mendengarkan",
+        topNBadge: (n) => `${n} teratas`,
+        realArtistsAndRecent: "Artis dan Riwayat Terbaru",
+        clearLocalHistory: "Hapus riwayat lokal",
+        recordedPlays: (n) => `${n} pemutaran tercatat`,
+        latestCapturedPlays: "Pemutaran Terbaru",
+        localDateLabel: (d) => `Tanggal lokal: ${d}`
       },
       entities: {
-        spotifyArtist: "Spotify-K\xFCnstler",
-        untitled: "Ohne Titel",
-        unknownArtist: "Unbekannter K\xFCnstler",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} Top-Songs`,
-        songSingular: "Song",
-        songPlural: "Songs",
-        playSingular: "Play",
-        playPlural: "Plays"
+        spotifyArtist: "Artis Spotify", untitled: "Tanpa Judul", unknownArtist: "Artis Tidak Dikenal",
+        popularityLabel: (p) => `Popularitas ${p}`,
+        topTracksCount: (n) => `${n} lagu teratas`,
+        songSingular: "lagu", songPlural: "lagu", playSingular: "pemutaran", playPlural: "pemutaran"
       },
       empty: {
-        noArtistsPeriod: "Keine K\xFCnstler f\xFCr diesen Zeitraum verf\xFCgbar.",
-        noTracksPeriod: "Keine Songs f\xFCr diesen Zeitraum verf\xFCgbar.",
-        noAlbumsPeriod: "Keine Alben vorhanden.",
-        noGenres: "Keine Genre-Daten auf Spotify verf\xFCgbar.",
-        noArtistsFound: "Keine Top-K\xFCnstler f\xFCr diesen Zeitraum gefunden.",
-        noTrackedTimeYet: "Noch keine H\xF6rzeit erfasst. Spiele einfach einen Song auf Spotify ab.",
-        noRecentPlaysYet: "Songs mit \u2265 25s H\xF6rzeit erscheinen hier chronologisch."
+        noArtistsPeriod: "Tidak ada artis untuk periode ini.",
+        noTracksPeriod: "Tidak ada lagu untuk periode ini.",
+        noAlbumsPeriod: "Tidak ada album untuk ditampilkan.",
+        noGenres: "Tidak ada tag genre di Spotify.",
+        noArtistsFound: "Tidak ada artis teratas untuk periode ini.",
+        noTrackedTimeYet: "Belum ada durasi tercatat. Putar lagu di Spotify untuk melihatnya di sini.",
+        noRecentPlaysYet: "Lagu yang diputar minimal 25 detik akan muncul di riwayat ini."
       },
       actions: {
-        play: "Abspielen",
-        pause: "Pause",
-        addToQueue: "In die Warteschlange",
-        playingNowToast: (title) => `Spielt: ${title}`,
-        playbackErrorToast: "Wiedergabe konnte nicht gestartet werden",
-        queuedToast: (title) => `Zur Warteschlange hinzugef\xFCgt: ${title}`,
-        queueErrorToast: "Konnte nicht zur Warteschlange hinzugef\xFCgt werden",
-        historyClearedToast: "Lokaler Verlauf gel\xF6scht",
-        confirmClearHistory: "Wirklich l\xF6schen?",
-        copiedTrackToast: (title) => `Kopiert: ${title}`,
-        copyErrorToast: "Song konnte nicht kopiert werden",
-        noTrackPlayingToast: "Gerade l\xE4uft kein Song"
+        play: "Putar", pause: "Jeda", addToQueue: "Tambahkan ke antrean",
+        playingNowToast: (title) => `Memutar: ${title}`,
+        playbackErrorToast: "Pemutaran tidak dapat dimulai",
+        queuedToast: (title) => `Ditambahkan ke antrean: ${title}`,
+        queueErrorToast: "Tidak dapat menambahkan ke antrean",
+        historyClearedToast: "Riwayat lokal dihapus", confirmClearHistory: "Hapus riwayat?",
+        copiedTrackToast: (title) => `Disalin: ${title}`,
+        copyErrorToast: "Tidak dapat menyalin info lagu",
+        noTrackPlayingToast: "Tidak ada lagu yang sedang diputar"
       },
-      search: {
-        placeholder: "Nach Song, K\xFCnstler oder Album filtern...",
-        clear: "Filter l\xF6schen",
-        noResults: "Keine passenden Treffer gefunden."
-      },
-      streak: {
-        daysBadge: (n) => `${n}T Serie`,
-        last7Days: (h) => `7T: ${h}`
-      },
+      search: { placeholder: "Filter berdasarkan lagu, artis, atau album...", clear: "Hapus filter", noResults: "Tidak ada hasil yang cocok." },
+      streak: { daysBadge: (n) => `${n} hari berturut-turut`, last7Days: (h) => `7 hari: ${h}` },
       sleepTimer: {
-        label: "Sleep-Timer",
-        offToast: "Sleep-Timer aus",
-        endOfTrackShort: "Ende",
-        endOfTrackToast: "Sleep-Timer: Pause am Titelende",
-        minutesToast: (m) => `Sleep-Timer: ${m} Min.`,
-        triggeredToast: "Sleep-Timer abgelaufen \u2014 Wiedergabe pausiert",
-        tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
-        tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
+        label: "Timer tidur", offToast: "Timer tidur nonaktif", endOfTrackShort: "Akhir lagu",
+        endOfTrackToast: "Timer tidur: jeda di akhir lagu",
+        minutesToast: (m) => `Timer tidur: ${m} menit`,
+        triggeredToast: "Timer tidur selesai. Pemutaran dijeda.",
+        tooltipIdle: "Timer tidur (Alt+Shift+S)",
+        tooltipActive: (detail) => `Timer tidur: ${detail} (klik kanan untuk membatalkan)`
       },
       time: {
-        justNow: "Gerade eben",
-        secondsAgo: (s) => `Vor ${s}s`,
-        minutesAgo: (m) => `Vor ${m}m`,
-        hoursAgo: (h) => `Vor ${h}h`
+        justNow: "Baru saja", secondsAgo: (s) => `${s} detik lalu`,
+        minutesAgo: (m) => `${m} menit lalu`, hoursAgo: (h) => `${h} jam lalu`
       },
-      errorBoundary: {
-        title: "Fehler in Cronotofy",
-        fallbackMsg: "Beim Anzeigen dieser Ansicht ist ein unerwarteter Fehler aufgetreten.",
-        retry: "Erneut versuchen"
-      }
+      errorBoundary: { title: "Terjadi masalah di Cronotofy", fallbackMsg: "Tampilan ini tidak dapat dimuat.", retry: "Coba lagi" }
     },
     it: {
       brandSubtitle: "Analisi musicale nativa \xB7 Telemetria in tempo reale",
@@ -1181,7 +1139,130 @@
         fallbackMsg: "Errore imprevisto durante il rendering della vista.",
         retry: "Riprova"
       }
-    }
+    },
+    pt: {
+      brandSubtitle: "An\xE1lise musical nativa \xB7 Telemetria em tempo real",
+      tabs: {
+        overview: "Resumo",
+        artists: "Artistas",
+        tracks: "M\xFAsicas",
+        albums: "\xC1lbuns",
+        live: "Atividade ao Vivo"
+      },
+      periods: {
+        short_term: "1 M\xEAs",
+        medium_term: "6 Meses",
+        long_term: "Geral"
+      },
+      nowPlaying: "Tocando agora",
+      paused: "Pausado",
+      currentSession: "Sess\xE3o atual",
+      today: "Hoje",
+      idleHint: "Reproduza qualquer m\xFAsica no Spotify para iniciar a telemetria ao vivo.",
+      loadingAnalytics: "Carregando suas estat\xEDsticas do Spotify...",
+      kpis: {
+        recordedTime: "Tempo Registrado",
+        todayLabel: "Hoje",
+        annualInCronotofy: (h) => `${h} anual no Cronotofy`,
+        totalMod: (h) => `Total: ${h}`,
+        topArtist: (period) => `Top Artista (${period})`,
+        artistsAnalyzed: (n) => `${n} artistas analisados`,
+        topTrack: (period) => `Top M\xFAsica (${period})`,
+        noData: "Sem dados",
+        favoriteGenre: "G\xEAnero Favorito",
+        varied: "Variado",
+        affinityAndRecent: (pct, n) => `${pct}% afinidade \xB7 ${n} recentes`,
+        tracksInRanking: (n) => `${n} m\xFAsicas no ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 Artistas",
+        top5Tracks: "Top 5 M\xFAsicas",
+        top4Albums: "Top 4 \xC1lbuns",
+        genreDna: "DNA de G\xEAneros",
+        mainGenresBadge: (n) => `${n} principais`,
+        viewAll: (n) => `Ver todos (${n}) \u2192`,
+        tracksRanking: (period) => `Ranking de M\xFAsicas \xB7 ${period}`,
+        tracksBadge: (n) => `${n} m\xFAsicas`,
+        tracksListenedToday: "Ouvido Hoje",
+        accumulatedDesktop: "Acumulado no Desktop",
+        exactSecondBySecond: "Medi\xE7\xE3o exata segundo a segundo",
+        capturedTracks: "Faixas Capturadas",
+        completedPlays: (n) => `${n} reprodu\xE7\xF5es completas`,
+        lastSync: "Armazenamento Local",
+        pending: "Ativo",
+        topRealTimeTracks: "M\xFAsicas por Tempo Real Ouvido",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Artistas Reais e Hist\xF3rico Recente",
+        clearLocalHistory: "Limpar hist\xF3rico local",
+        recordedPlays: (n) => `${n} reprodu\xE7\xF5es registradas`,
+        latestCapturedPlays: "\xDAltimas Reprodu\xE7\xF5es Capturadas",
+        localDateLabel: (d) => `Data local: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Artista do Spotify",
+        untitled: "Sem t\xEDtulo",
+        unknownArtist: "Artista desconhecido",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} top m\xFAsicas`,
+        songSingular: "m\xFAsica",
+        songPlural: "m\xFAsicas",
+        playSingular: "play",
+        playPlural: "plays"
+      },
+      empty: {
+        noArtistsPeriod: "Sem artistas dispon\xEDveis para este per\xEDodo.",
+        noTracksPeriod: "Sem m\xFAsicas dispon\xEDveis para este per\xEDodo.",
+        noAlbumsPeriod: "Sem \xE1lbuns para mostrar.",
+        noGenres: "Sem tags de g\xEAnero dispon\xEDveis no Spotify.",
+        noArtistsFound: "Nenhum artista principal encontrado para este per\xEDodo.",
+        noTrackedTimeYet: "Ainda n\xE3o h\xE1 tempo acumulado. D\xEA play em qualquer m\xFAsica no Spotify.",
+        noRecentPlaysYet: "M\xFAsicas tocadas \u2265 25s aparecer\xE3o nesta linha do tempo."
+      },
+      actions: {
+        play: "Reproduzir",
+        pause: "Pausar",
+        addToQueue: "Adicionar \xE0 fila",
+        playingNowToast: (title) => `Tocando: ${title}`,
+        playbackErrorToast: "N\xE3o foi poss\xEDvel iniciar a reprodu\xE7\xE3o",
+        queuedToast: (title) => `Adicionada \xE0 fila: ${title}`,
+        queueErrorToast: "N\xE3o foi poss\xEDvel adicionar \xE0 fila",
+        historyClearedToast: "Hist\xF3rico local limpo",
+        confirmClearHistory: "Confirmar limpeza?",
+        copiedTrackToast: (title) => `Copiada: ${title}`,
+        copyErrorToast: "N\xE3o foi poss\xEDvel copiar a m\xFAsica",
+        noTrackPlayingToast: "Nenhuma m\xFAsica tocando agora"
+      },
+      search: {
+        placeholder: "Filtrar por m\xFAsica, artista ou \xE1lbum...",
+        clear: "Limpar filtro",
+        noResults: "Nenhum resultado encontrado para o filtro."
+      },
+      streak: {
+        daysBadge: (n) => `${n}d sequ\xEAncia`,
+        last7Days: (h) => `7d: ${h}`
+      },
+      sleepTimer: {
+        label: "Temporizador",
+        offToast: "Temporizador desligado",
+        endOfTrackShort: "Fim",
+        endOfTrackToast: "Temporizador: pausar ao fim da faixa",
+        minutesToast: (m) => `Temporizador: ${m} min`,
+        triggeredToast: "Temporizador encerrado \u2014 reprodu\xE7\xE3o pausada",
+        tooltipIdle: "Temporizador (Alt+Shift+S)",
+        tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
+      },
+      time: {
+        justNow: "Agora mesmo",
+        secondsAgo: (s) => `H\xE1 ${s}s`,
+        minutesAgo: (m) => `H\xE1 ${m}m`,
+        hoursAgo: (h) => `H\xE1 ${h}h`
+      },
+      errorBoundary: {
+        title: "Algo deu errado no Cronotofy",
+        fallbackMsg: "Ocorreu um erro inesperado ao renderizar esta visualiza\xE7\xE3o.",
+        retry: "Tentar novamente"
+      }
+    },
   };
   function detectSpotifyLocale() {
     try {
@@ -1198,16 +1279,67 @@
     return "en";
   }
   function resolveLangCode(rawLocale) {
-    const clean = (rawLocale || "").toLowerCase().trim();
-    if (clean.startsWith("es")) return "es";
-    if (clean.startsWith("pt")) return "pt";
-    if (clean.startsWith("fr")) return "fr";
-    if (clean.startsWith("de")) return "de";
-    if (clean.startsWith("it")) return "it";
-    return "en";
+    const language = String(rawLocale || "").trim().toLowerCase().split(/[-_]/, 1)[0];
+    return Object.hasOwn(TRANSLATIONS, language) ? language : "en";
   }
-  function getTranslations() {
-    const rawLocale = detectSpotifyLocale();
+  const LANGUAGE_STORAGE_KEY = "cronotofy_language";
+  const VISUAL_PRESET_KEY = "cronotofy_visual_preset";
+  const VISUAL_PRESETS = ["full", "still", "focus"];
+  const PREFERENCE_LABELS = {
+    en: ["Preferences", "Visual preset", "Animated", "Still", "Focus", "Copy settings", "Apply settings", "Invalid settings", "Open the panel from the playback bar to see your listening time.", "Dismiss"],
+    es: ["Preferencias", "Estilo visual", "Animado", "Estático", "Enfoque", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abre el panel desde la barra de reproducción para ver tu tiempo de escucha.", "Cerrar"],
+    pt: ["Preferências", "Estilo visual", "Animado", "Estático", "Foco", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abra o painel na barra de reprodução para ver seu tempo de escuta.", "Dispensar"],
+    fr: ["Préférences", "Style visuel", "Animé", "Fixe", "Concentration", "Copier les réglages", "Appliquer les réglages", "Réglages invalides", "Ouvrez le panneau depuis la barre de lecture pour voir votre temps d’écoute.", "Fermer"],
+    de: ["Einstellungen", "Darstellung", "Animiert", "Statisch", "Fokus", "Einstellungen kopieren", "Einstellungen anwenden", "Ungültige Einstellungen", "Öffne das Panel über die Wiedergabeleiste, um deine Hörzeit zu sehen.", "Schließen"],
+    it: ["Preferenze", "Stile visivo", "Animato", "Statico", "Concentrazione", "Copia impostazioni", "Applica impostazioni", "Impostazioni non valide", "Apri il pannello dalla barra di riproduzione per vedere il tuo tempo di ascolto.", "Chiudi"],
+    id: ["Preferensi", "Tampilan", "Animasi", "Statis", "Fokus", "Salin pengaturan", "Terapkan pengaturan", "Pengaturan tidak valid", "Buka panel dari bilah pemutaran untuk melihat durasi mendengarkan.", "Tutup"]
+  };
+  function readStoredPreference(key) {
+    try {
+      return localStorage.getItem(key) || "";
+    } catch {
+      return "";
+    }
+  }
+  function saveStoredPreference(key, value) {
+    try {
+      if (value) localStorage.setItem(key, value);
+      else localStorage.removeItem(key);
+    } catch {
+    }
+  }
+  function readVisualPreset() {
+    const preset = readStoredPreference(VISUAL_PRESET_KEY);
+    return VISUAL_PRESETS.includes(preset) ? preset : "full";
+  }
+  function parseSharedPreferences(text) {
+    if (typeof text !== "string" || text.length > 1024) return null;
+    try {
+      const settings = JSON.parse(text);
+      if (!settings || Object.keys(settings).length !== 3 || settings.version !== 1 ||
+          !VISUAL_PRESETS.includes(settings.preset) ||
+          typeof settings.language !== "string" ||
+          !(settings.language === "" || Object.hasOwn(LANGUAGE_OPTIONS, settings.language))) return null;
+      return { language: settings.language, preset: settings.preset };
+    } catch {
+      return null;
+    }
+  }
+  const LANGUAGE_OPTIONS = {
+    en: ["English", "Language", "Spotify language"],
+    es: ["Español", "Idioma", "Idioma de Spotify"],
+    pt: ["Português", "Idioma", "Idioma do Spotify"],
+    fr: ["Français", "Langue", "Langue de Spotify"],
+    de: ["Deutsch", "Sprache", "Spotify-Sprache"],
+    it: ["Italiano", "Lingua", "Lingua di Spotify"],
+    id: ["Bahasa Indonesia", "Bahasa", "Bahasa Spotify"]
+  };
+  function readLanguagePreference() {
+    const language = readStoredPreference(LANGUAGE_STORAGE_KEY);
+    return Object.hasOwn(LANGUAGE_OPTIONS, language) ? language : "";
+  }
+  function getTranslations(language = readLanguagePreference()) {
+    const rawLocale = language || detectSpotifyLocale();
     const lang = resolveLangCode(rawLocale);
     return {
       lang,
@@ -1225,10 +1357,13 @@
     if (diffMin < 60) return t.time.minutesAgo(diffMin);
     const diffHrs = Math.floor(diffMin / 60);
     if (diffHrs < 24) return t.time.hoursAgo(diffHrs);
-    return new Date(ts).toLocaleDateString(rawLocale || "en", {
-      day: "2-digit",
-      month: "short"
-    });
+    let locale = resolveLangCode(rawLocale);
+    try {
+      const canonical = Intl.getCanonicalLocales(String(rawLocale || "").replaceAll("_", "-"))[0];
+      if (canonical && Object.hasOwn(TRANSLATIONS, canonical.split("-", 1)[0])) locale = canonical;
+    } catch {
+    }
+    return new Date(ts).toLocaleDateString(locale, { day: "2-digit", month: "short" });
   }
 
   // spicetify-cronotofy/src/tracker.ts
@@ -1443,18 +1578,22 @@ ${track.externalUrl}`;
     };
   }
   function storageKeyFor(userId) {
-    return userId ? `${STORAGE_PREFIX}_${userId}` : STORAGE_PREFIX;
+    return userId ? `${STORAGE_PREFIX}_${userId}` : `${STORAGE_PREFIX}:anonymous`;
   }
   function loadStore(userId) {
     try {
       const key = storageKeyFor(userId);
-      const raw = localStorage.getItem(key) || (userId ? localStorage.getItem(STORAGE_PREFIX) : null);
+      const profileData = localStorage.getItem(key);
+      const raw = profileData || localStorage.getItem(STORAGE_PREFIX);
       if (!raw) return createEmptyStore(userId);
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.version === 1) {
+        const storedOwner = typeof parsed.userId === "string" ? parsed.userId : "";
+        if ((storedOwner && storedOwner !== userId) ||
+            (!profileData && storedOwner !== userId)) return createEmptyStore(userId);
         return {
           version: 1,
-          userId: userId || String(parsed.userId || ""),
+          userId,
           totalSeconds: Number(parsed.totalSeconds) || 0,
           dailySeconds: parsed.dailySeconds && typeof parsed.dailySeconds === "object" ? parsed.dailySeconds : {},
           tracks: parsed.tracks && typeof parsed.tracks === "object" ? parsed.tracks : {},
@@ -1576,7 +1715,7 @@ ${track.externalUrl}`;
         this.lastProgressMs = live.progressMs;
       }
       const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
-      if (!isPlaying || !this.currentTrack) {
+      if (!isPlaying || !live) {
         return;
       }
       const today = getTodayKey();
@@ -1627,7 +1766,9 @@ ${track.externalUrl}`;
     }
     onPlayPause() {
       const live = extractLiveTrackFromPlayer();
-      if (live) {
+      if (live && this.currentTrack?.id !== live.id) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live) {
         this.currentTrack = live;
         this.lastProgressMs = live.progressMs;
       }
@@ -1642,18 +1783,23 @@ ${track.externalUrl}`;
     getLiveTrack() {
       return extractLiveTrackFromPlayer();
     }
-    getSnapshot() {
+    getCounters() {
       const today = getTodayKey();
-      const tracks = Object.values(this.store.tracks).sort((a, b) => b.totalSeconds - a.totalSeconds);
       const { streakDays, last7DaysSeconds } = computeListeningStreak(this.store.dailySeconds, today);
       return {
-        userId: this.userId,
         totalSeconds: this.store.totalSeconds,
         todaySeconds: this.store.dailySeconds[today] || 0,
         todayDate: today,
         currentTrackSeconds: this.currentSessionSeconds,
         streakDays,
-        last7DaysSeconds,
+        last7DaysSeconds
+      };
+    }
+    getSnapshot() {
+      const tracks = Object.values(this.store.tracks).sort((a, b) => b.totalSeconds - a.totalSeconds);
+      return {
+        ...this.getCounters(),
+        userId: this.userId,
         tracks,
         recentPlays: this.store.recentPlays,
         lastSyncedAt: this.store.lastSyncedAt
@@ -2385,12 +2531,12 @@ ${track.externalUrl}`;
     const apiKey = getConfiguredGeminiApiKey();
     if (!apiKey || !jpegBase64) return null;
     try {
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
       const trackContext = trackMeta.title ? `Track: "${trackMeta.title}"${trackMeta.artist ? ` by ${trackMeta.artist}` : ""}.` : "";
       const prompt = `You are a music app art director extracting an Apple Liquid Glass UI color palette from this album cover. ${trackContext} Choose 3 exact #RRGGBB hex colors based on the dominant visual area and overall mood (NEVER let a tiny bright accent spot covering under 15% of the artwork hijack accentHex or ambientHex): 1) accentHex: the dominant iconic color representing the main mood/surface of the cover (balanced for dark glass; preserve cool slate/steel blues or monochrome silver when dominant). 2) accent2Hex: a harmonious secondary color clearly present in the artwork. 3) ambientHex: the deep atmospheric background mood color for frosted glass tinting. Respond ONLY with valid JSON: {"accentHex":"#......","accent2Hex":"#......","ambientHex":"#......"}.`;
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify({
           contents: [
             {
@@ -3132,6 +3278,19 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 18px;
+}
+
+.cronotofy-preferences textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 8px 0;
+  color: var(--spice-text, #fff);
+  background: var(--spice-main, #121212);
+}
+
+.cronotofy-preferences summary {
+  cursor: pointer;
 }
 
 .cronotofy-search-wrap {
@@ -3972,7 +4131,74 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     ensureCronotofyStyles();
     ensureDynamicThemeStyle();
     const { useState, useEffect, useMemo, useCallback, useRef } = Spicetify.React;
-    const { t, rawLocale } = useMemo(() => getTranslations(), []);
+    const [language, setLanguage] = useState(readLanguagePreference);
+    const { t, rawLocale, lang } = useMemo(() => getTranslations(language), [language]);
+    const [, languageLabel, automaticLabel] = LANGUAGE_OPTIONS[lang];
+    const [preset, setPreset] = useState(readVisualPreset);
+    const [sharedSettings, setSharedSettings] = useState("");
+    const [settingsError, setSettingsError] = useState(false);
+    const onboardingKey = "cronotofy_intro_dismissed";
+    const [showIntro, setShowIntro] = useState(() => !readStoredPreference(onboardingKey));
+    const [preferencesLabel, presetLabel, animatedLabel, stillLabel, focusLabel, copyLabel, applyLabel, invalidLabel, intro, dismissLabel] = PREFERENCE_LABELS[lang];
+    const el = Spicetify.React.createElement;
+    const applyPreset = (next) => {
+      saveStoredPreference(VISUAL_PRESET_KEY, next);
+      window.__CRONOTOFY_MOD__?.setVisualPreset?.(next);
+      setPreset(next);
+    };
+    const applyLanguage = (next) => {
+      saveStoredPreference(LANGUAGE_STORAGE_KEY, next);
+      setLanguage(next);
+    };
+    const languageControl = Spicetify.React.createElement("select", {
+      "aria-label": languageLabel,
+      title: languageLabel,
+      className: "cronotofy-tab",
+      value: language,
+      onChange: (event) => applyLanguage(event.currentTarget.value)
+    }, Spicetify.React.createElement("option", { value: "" }, automaticLabel),
+    ...Object.entries(LANGUAGE_OPTIONS).map(([code, [name]]) =>
+      Spicetify.React.createElement("option", { key: code, value: code, lang: code }, name)
+    ));
+    const preferences = el("details", { className: "cronotofy-preferences" },
+      el("summary", null, preferencesLabel),
+      el("label", null, presetLabel, el("select", {
+        className: "cronotofy-tab",
+        value: preset,
+        onChange: (event) => applyPreset(event.currentTarget.value)
+      }, ...[animatedLabel, stillLabel, focusLabel].map((label, index) =>
+        el("option", { key: VISUAL_PRESETS[index], value: VISUAL_PRESETS[index] }, label)
+      ))),
+      el("textarea", {
+        "aria-label": preferencesLabel, rows: 2, maxLength: 1024, value: sharedSettings,
+        onChange: (event) => {
+          setSettingsError(false);
+          setSharedSettings(event.currentTarget.value);
+        }
+      }),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        const settings = JSON.stringify({ version: 1, language, preset });
+        setSharedSettings(settings);
+        setSettingsError(false);
+        void navigator.clipboard?.writeText(settings).catch(() => {});
+      } }, copyLabel),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        const settings = parseSharedPreferences(sharedSettings);
+        setSettingsError(!settings);
+        if (settings) {
+          applyLanguage(settings.language);
+          applyPreset(settings.preset);
+        }
+      } }, applyLabel),
+      settingsError && el("p", { role: "alert" }, invalidLabel)
+    );
+    const onboarding = showIntro && el("div", { className: "cronotofy-controls-row" },
+      el("span", null, intro),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        saveStoredPreference(onboardingKey, "1");
+        setShowIntro(false);
+      } }, dismissLabel)
+    );
     const [activeTab, setActiveTab] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTab);
     const [timeRange, setTimeRange] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTimeRange);
     const [searchQuery, setSearchQuery] = useState("");
@@ -4249,7 +4475,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
             }
           });
         }
-        if (CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) {
+        if (CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall && document.documentElement.dataset.cronotofyPreset !== "focus") {
           const seedCovers = [];
           for (const tr of mappedTracks) {
             if (tr.albumImageUrl) {
@@ -4512,7 +4738,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
       },
       tab.label
-    )))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-row" }, activeTab !== "overview" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-search-wrap" }, /* @__PURE__ */ Spicetify.React.createElement(
+    )))), onboarding, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-row" }, languageControl, preferences, activeTab !== "overview" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-search-wrap" }, /* @__PURE__ */ Spicetify.React.createElement(
       "svg",
       {
         className: "cronotofy-search-icon",
@@ -4940,6 +5166,10 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
   // spicetify-cronotofy/src/chromeWidgets.ts
   var NAV_BTN_ID = "cronotofy-nav-btn";
+  function findCronotofyMainView() {
+    return document.querySelector(".Root__main-view") ||
+      document.querySelector('#main-view, [data-testid="main-view"], main[role="main"]');
+  }
   var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
   var VOLUME_PCT_ID = "cronotofy-volume-pct";
   var SLEEP_BTN_ID = "cronotofy-sleep-btn";
@@ -5196,7 +5426,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       }
     }
     ensureMounted() {
-      const searchContainer = document.querySelector(".main-globalNav-searchContainer");
+      const searchContainer = document.querySelector(".main-globalNav-searchContainer") ||
+        document.querySelector('#global-nav-bar, [data-testid="global-nav-bar"], .Root__globalNav');
       if (searchContainer) {
         const btn = this.getOrCreateNavButton();
         const orphan = document.getElementById(NAV_BTN_ID);
@@ -5205,7 +5436,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           searchContainer.appendChild(btn);
         }
       }
-      const leftBar = document.querySelector(".main-nowPlayingBar-left");
+      const leftBar = document.querySelector(".main-nowPlayingBar-left") ||
+        document.querySelector('[data-testid="now-playing-bar"] [data-testid="now-playing-widget"]')?.parentElement;
       if (leftBar) {
         const telemetry = this.getOrCreateTelemetry();
         const orphan = document.getElementById(NPB_TELEMETRY_ID);
@@ -5214,8 +5446,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           leftBar.appendChild(telemetry);
         }
       }
-      const extraControls = document.querySelector(".main-nowPlayingBar-extraControls");
       const volumeBar = document.querySelector('[data-testid="volume-bar"]');
+      const extraControls = document.querySelector(".main-nowPlayingBar-extraControls") || volumeBar?.parentElement;
       if (extraControls) {
         const sleepBtn = this.getOrCreateSleepButton();
         const orphanSleep = document.getElementById(SLEEP_BTN_ID);
@@ -5285,7 +5517,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     updateTelemetry() {
       this.getOrCreateTelemetry();
       const { t } = getTranslations();
-      const snapshot = this.tracker.getSnapshot();
+      const snapshot = this.tracker.getCounters();
       const sessionText = `${t.currentSession}: ${formatSecondsHuman(snapshot.currentTrackSeconds)}`;
       const todayText = `${t.today}: ${formatSecondsHuman(snapshot.todaySeconds)}`;
       if (this.sessionPill && this.lastSessionText !== sessionText) {
@@ -5356,6 +5588,14 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
 .cronotofy-gwall-row.left {
   animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 118s) linear infinite;
+}
+
+:root[data-cronotofy-preset="still"] .cronotofy-gwall-row {
+  animation: none;
+}
+
+:root[data-cronotofy-preset="focus"] #cronotofy-global-wall {
+  display: none !important;
 }
 
 .cronotofy-gwall-row.right {
@@ -6274,8 +6514,12 @@ html.cronotofy-route-active .main-topBar-overlay {
   background: transparent;
 }
 
-html.cronotofy-ext-open .Root__main-view .main-view-container__scroll-node,
-html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
+.cronotofy-panel-anchor {
+  position: relative;
+}
+
+.cronotofy-panel-anchor .main-view-container__scroll-node,
+.cronotofy-panel-anchor [data-overlayscrollbars-viewport] {
   visibility: hidden !important;
   pointer-events: none !important;
 }
@@ -6305,7 +6549,6 @@ html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
     async init() {
       if (this.initialized) return;
       this.initialized = true;
-      ensureGlobalWallStyle();
       this.ensureMounted();
       const user = await resolveCurrentSpotifyUser();
       this.userId = user?.id || "default";
@@ -7337,9 +7580,11 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
 
   // spicetify-cronotofy/src/bootstrap.ts
   function bootstrapCronotofy(options = {}) {
+    let remainingAttempts = 200;
+    const reportStartupError = (err) => console.warn("[Cronotofy] startup error:", err);
     const tryStart = () => {
-      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform) {
-        setTimeout(tryStart, 300);
+      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform || !document.body) {
+        if (--remainingAttempts > 0) setTimeout(tryStart, 300);
         return;
       }
       if (window.__CRONOTOFY_MOD__) {
@@ -7349,6 +7594,11 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         const tracker = new ListeningTracker();
         const themeController = new DynamicThemeController();
         const globalWall = new GlobalAlbumWallController();
+        ensureGlobalWallStyle();
+        const setVisualPreset = (preset) => {
+          document.documentElement.dataset.cronotofyPreset = preset;
+          if (preset !== "focus") void globalWall.init().catch(reportStartupError);
+        };
         const chromeWidgets = new CronotofyChromeWidgets(tracker, {
           onOpen: options.onOpen,
           isOpen: options.isOpen
@@ -7400,6 +7650,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           },
           clearLocalHistory: () => tracker.clearLocalHistory(),
           getDynamicPalette: () => themeController.getPalette(),
+          setVisualPreset,
           isDynamicThemeEnabled: () => themeController.isEnabled(),
           setDynamicThemeEnabled: (enabled) => {
             themeController.setEnabled(enabled);
@@ -7422,13 +7673,12 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
             }
           }
         };
-        void tracker.init().then(() => {
+        void tracker.init().then(async () => {
           syncThemeFromPlayer();
-          void seedThemeIfNeeded();
-        });
-        void globalWall.init();
+          await seedThemeIfNeeded();
+        }).catch(reportStartupError);
+        setVisualPreset(readVisualPreset());
         chromeWidgets.init();
-        neonLyrics.init();
         options.onChromeReady?.(chromeWidgets);
         tracker.subscribe(syncThemeFromPlayer);
         Spicetify.Player.addEventListener?.("songchange", () => {
@@ -7440,8 +7690,13 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           syncThemeFromPlayer();
         });
         syncThemeFromPlayer();
+        try {
+          neonLyrics.init();
+        } catch (err) {
+          reportStartupError(err);
+        }
       } catch (err) {
-        console.warn("[Cronotofy] startup error:", err);
+        reportStartupError(err);
       }
     };
     tryStart();
@@ -7471,34 +7726,47 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       } catch {
       }
       reactRoot = null;
+      hostEl?.parentElement?.classList.remove("cronotofy-panel-anchor");
       hostEl?.remove();
       hostEl = null;
       widgetsRef?.syncActiveRoute();
     };
     const mountView = () => {
-      const mainView = document.querySelector(".Root__main-view");
+      const mainView = findCronotofyMainView();
       if (!mainView) return;
+      const createRoot = Spicetify?.ReactDOM?.createRoot || Spicetify?.ReactDOMClient?.createRoot;
+      const legacyRender = Spicetify?.ReactDOM?.render;
+      if (!Spicetify?.React || (typeof createRoot !== "function" && typeof legacyRender !== "function")) {
+        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
+        return;
+      }
+      if (hostEl && !mainView.contains(hostEl)) closeView();
       if (!hostEl || !mainView.contains(hostEl)) {
         document.getElementById(EXT_HOST_ID)?.remove();
         hostEl = document.createElement("div");
         hostEl.id = EXT_HOST_ID;
         mainView.appendChild(hostEl);
       }
-      setOpenClasses(true);
-      const appElement = render();
-      const createRoot = Spicetify?.ReactDOM?.createRoot || Spicetify?.ReactDOMClient?.createRoot;
-      if (typeof createRoot === "function") {
-        if (!reactRoot) {
-          reactRoot = createRoot(hostEl);
+      try {
+        const appElement = render();
+        if (typeof createRoot === "function") {
+          reactRoot ??= createRoot(hostEl);
+          reactRoot.render(appElement);
+        } else {
+          Spicetify.ReactDOM.render(appElement, hostEl);
         }
-        reactRoot.render(appElement);
-      } else {
-        Spicetify?.ReactDOM?.render?.(appElement, hostEl);
+        isOpen = true;
+        mainView.classList.add("cronotofy-panel-anchor");
+        setOpenClasses(true);
+        widgetsRef?.syncActiveRoute();
+      } catch (err) {
+        closeView();
+        console.warn("[Cronotofy] panel error:", err);
+        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
       }
-      isOpen = true;
-      widgetsRef?.syncActiveRoute();
     };
     const handleOpenOrToggle = () => {
+      if (isOpen && !hostEl?.isConnected) closeView();
       if (isOpen) {
         if (hostEl && hostEl.scrollTop > 12) {
           hostEl.scrollTo({ top: 0, behavior: "smooth" });
