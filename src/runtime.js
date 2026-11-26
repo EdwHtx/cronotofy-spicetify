@@ -4348,7 +4348,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   var NAV_BTN_ID = "cronotofy-nav-btn";
   function findCronotofyMainView() {
     return document.querySelector(".Root__main-view") ||
-      document.querySelector('#main-view, [data-testid="main-view"], main[role="main"]');
+      document.querySelector('#main-view, [data-testid="main-view"], main[role="main"]') ||
+      document.querySelector("main");
   }
   var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
   var VOLUME_PCT_ID = "cronotofy-volume-pct";
@@ -4617,7 +4618,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
       }
       const leftBar = document.querySelector(".main-nowPlayingBar-left") ||
-        document.querySelector('[data-testid="now-playing-bar"] [data-testid="now-playing-widget"]')?.parentElement;
+        document.querySelector('[data-testid="now-playing-widget"]')?.parentElement;
       if (leftBar) {
         const telemetry = this.getOrCreateTelemetry();
         const orphan = document.getElementById(NPB_TELEMETRY_ID);
@@ -4864,7 +4865,7 @@ body,
   z-index: 1;
 }
 
-.Root__top-container {
+.Root__top-container:has(.Root__now-playing-bar .main-nowPlayingBar-nowPlayingBar) {
   grid-template-areas:
     "top-banner top-banner top-banner"
     "global-nav global-nav global-nav"
@@ -5052,7 +5053,7 @@ body,
 }
 
 /* Bottom Player Bar \u2014 Floating Smoked Liquid Glass Capsule */
-.Root__now-playing-bar {
+.Root__now-playing-bar:has(.main-nowPlayingBar-nowPlayingBar) {
   position: fixed !important;
   left: 50% !important;
   bottom: 10px !important;
@@ -5074,9 +5075,7 @@ body,
   pointer-events: none !important;
 }
 
-.Root__now-playing-bar footer,
-[data-testid="now-playing-bar"],
-.main-nowPlayingBar-container {
+.Root__now-playing-bar :is(footer, [data-testid="now-playing-bar"], .main-nowPlayingBar-container):has(.main-nowPlayingBar-nowPlayingBar) {
   background: transparent !important;
   background-color: transparent !important;
   width: 100% !important;
@@ -5084,6 +5083,13 @@ body,
   margin: 0 auto !important;
   overflow: visible !important;
   pointer-events: none !important;
+}
+
+/* Keep Spotify's native layout and hit targets when the player classes are unavailable. */
+[data-testid="now-playing-bar"]:not(.main-nowPlayingBar-nowPlayingBar):not(:has(.main-nowPlayingBar-nowPlayingBar)):not(.main-nowPlayingBar-nowPlayingBar *) {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.78) !important;
+  border-radius: 18px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
 }
 
 .RgDSkGVKeiIGEZLtWcYj {
@@ -6763,7 +6769,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
     let remainingAttempts = 200;
     const reportStartupError = (err) => console.warn("[Cronotofy] startup error:", err);
     const tryStart = () => {
-      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform || !document.body) {
+      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.Platform || !document.body) {
         if (--remainingAttempts > 0) setTimeout(tryStart, 300);
         return;
       }

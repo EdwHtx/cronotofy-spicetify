@@ -266,7 +266,7 @@ for (const [layout, mainSelector, navSelector] of [
     window,
     Spicetify: {
       Player: {},
-      CosmosAsync: {},
+      ...(layout === "mapped classes" ? { CosmosAsync: {} } : {}),
       Platform: {},
       React: { Component: class {}, createElement },
       ReactDOM: {
