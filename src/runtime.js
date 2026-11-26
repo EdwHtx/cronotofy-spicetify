@@ -1,0 +1,6980 @@
+"use strict";
+(() => {
+  // spicetify-cronotofy/src/config.ts
+  var CRONOTOFY_MOD_CONFIG = {
+    version: "2.0.0",
+    tracking: {
+      storagePrefix: "cronotofy_spicetify_tracker_v1",
+      minPlaySeconds: 25,
+      saveIntervalSeconds: 10,
+      maxRecentPlays: 150
+    },
+    albumWall: {
+      cachePrefix: "cronotofy_wall_covers_v2",
+      cacheTtlMs: 6 * 60 * 60 * 1e3,
+      maxArtistsToFetch: 16,
+      maxCoversPerArtist: 16
+    },
+    ui: {
+      defaultTab: "overview",
+      defaultTimeRange: "medium_term",
+      enableTopbarButton: false,
+      enableDynamicTheme: true,
+      enableAlbumWall: true
+    }
+  };
+
+  // spicetify-cronotofy/src/spotifyData.ts
+  var USER_TOP_CONTENT_HASH = "61b7353d3625780022dbc63d459eb64cd609e7e5e2a820f9160d65030efe2e15";
+  var ARTIST_DISCOGRAPHY_HASH = "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599";
+  var ARTIST_OVERVIEW_HASH = "eafb1620d783ece118e72fbfede2b0064483e029d3c1aafafa1c2de0e25a89e7";
+  var GQL_RANGE = {
+    short_term: "SHORT_TERM",
+    medium_term: "MID_TERM",
+    long_term: "LONG_TERM"
+  };
+  var artistOverviewCache = /* @__PURE__ */ new Map();
+  function idFromUri(uri) {
+    return String(uri || "").split(":").pop() || "";
+  }
+  function normalizeArtistKey(name) {
+    return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+  function firstSourceUrl(sources) {
+    if (!Array.isArray(sources) || sources.length === 0) return "";
+    const best = sources[sources.length - 1] || sources[0];
+    return best?.url ? String(best.url) : sources[0]?.url ? String(sources[0].url) : "";
+  }
+  function buildDefinition(gql, opName, sha256Hash) {
+    const defs = gql?.Definitions || {};
+    if (defs[opName]) return defs[opName];
+    const sample = Object.values(defs).find((d) => d && typeof d === "object");
+    if (!sample) {
+      return { name: opName, operation: "query", sha256Hash, value: null };
+    }
+    const clone = Object.assign(Object.create(Object.getPrototypeOf(sample)), sample);
+    const sampleName = Object.keys(defs).find((k) => defs[k] === sample);
+    for (const key of Object.keys(clone)) {
+      const val = clone[key];
+      if (typeof val !== "string") continue;
+      if (/^[a-f0-9]{64}$/.test(val)) clone[key] = sha256Hash;
+      else if (val === sampleName) clone[key] = opName;
+    }
+    return clone;
+  }
+  async function requestDesktopGraphQL(opName, sha256Hash, variables) {
+    const gql = Spicetify?.GraphQL;
+    try {
+      const def = buildDefinition(gql, opName, sha256Hash);
+      if (def && typeof gql?.Request === "function") {
+        const res = await gql.Request(def, variables);
+        if (res?.data) return res.data;
+      }
+    } catch {
+    }
+    try {
+      const token = Spicetify?.Platform?.Session?.accessToken || Spicetify?.Platform?.AuthorizationAPI?.getState?.()?.token?.accessToken;
+      if (!token) return null;
+      const res = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operationName: opName,
+          variables,
+          extensions: { persistedQuery: { version: 1, sha256Hash } }
+        })
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      return json?.data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function mapTopContentResponse(data) {
+    const profile = data?.me?.profile;
+    const tracks = (profile?.topTracks?.items || []).map((it) => it?.data).filter((t) => t?.__typename === "Track" && t.uri).map((t) => ({
+      id: idFromUri(t.uri),
+      uri: t.uri,
+      name: t.name,
+      duration_ms: Number(t.duration?.totalMilliseconds || 0),
+      popularity: 0,
+      artists: (t.artists?.items || []).map((a) => ({
+        id: idFromUri(a?.uri),
+        name: a?.profile?.name || ""
+      })),
+      album: {
+        id: idFromUri(t.albumOfTrack?.uri),
+        name: t.albumOfTrack?.name || "",
+        images: [{ url: firstSourceUrl(t.albumOfTrack?.coverArt?.sources) }]
+      }
+    }));
+    const artists = (profile?.topArtists?.items || []).map((it) => it?.data).filter((a) => a?.__typename === "Artist" && a.uri).map((a) => ({
+      id: idFromUri(a.uri),
+      uri: a.uri,
+      name: a.profile?.name || "",
+      images: [{ url: firstSourceUrl(a.visuals?.avatarImage?.sources) }],
+      genres: [],
+      popularity: 0,
+      followers: { total: 0 }
+    }));
+    return { tracks, artists };
+  }
+  async function fetchTopContentFromDesktop(range, limit = 50) {
+    const runRange = async (gqlRange) => {
+      const input = { offset: 0, limit, sortBy: "AFFINITY", timeRange: gqlRange };
+      const data = await requestDesktopGraphQL("userTopContent", USER_TOP_CONTENT_HASH, {
+        includeTopArtists: true,
+        topArtistsInput: input,
+        includeTopTracks: true,
+        topTracksInput: input
+      });
+      return mapTopContentResponse(data);
+    };
+    let result = await runRange(GQL_RANGE[range]);
+    if (result.tracks.length === 0 && result.artists.length === 0 && range !== "short_term") {
+      result = await runRange("SHORT_TERM");
+    }
+    return result;
+  }
+  async function fetchLibraryTracksFromDesktop(limit = 50) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi || typeof libApi.getTracks !== "function") return [];
+      const res = await libApi.getTracks({ offset: 0, limit });
+      const items = Array.isArray(res?.items) ? res.items : [];
+      return items.filter((tr) => tr && (tr.uri || tr.id)).map((tr) => {
+        const uri = String(tr.uri || `spotify:track:${tr.id}`);
+        const id = tr.id ? String(tr.id) : idFromUri(uri);
+        const imgUrl = tr.album?.images?.[0]?.url || firstSourceUrl(tr.album?.coverArt?.sources) || tr.images?.[0]?.url || "";
+        return {
+          id,
+          uri,
+          name: String(tr.name || ""),
+          duration_ms: Number(tr.duration?.milliseconds ?? tr.duration_ms ?? tr.duration ?? 0),
+          popularity: 0,
+          artists: Array.isArray(tr.artists) ? tr.artists.map((a) => ({
+            id: a?.id ? String(a.id) : idFromUri(a?.uri),
+            name: String(a?.name || "")
+          })) : [],
+          album: {
+            id: tr.album?.id ? String(tr.album.id) : idFromUri(tr.album?.uri),
+            name: String(tr.album?.name || ""),
+            images: imgUrl ? [{ url: String(imgUrl) }] : []
+          }
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchLibraryArtistsFromDesktop(limit = 100) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi) return [];
+      let items = [];
+      if (typeof libApi.getArtists === "function") {
+        const res = await libApi.getArtists({ offset: 0, limit });
+        items = Array.isArray(res?.items) ? res.items : [];
+      } else if (typeof libApi.getContents === "function") {
+        const res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
+        items = Array.isArray(res?.items) ? res.items : [];
+      }
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "artist" || uri.startsWith("spotify:artist:");
+      }).slice(0, limit).map((a) => {
+        const uri = String(a.uri || `spotify:artist:${a.id}`);
+        const id = a.id ? String(a.id) : idFromUri(uri);
+        const imgUrl = a.images?.[0]?.url || firstSourceUrl(a.visuals?.avatarImage?.sources) || "";
+        return {
+          id,
+          uri,
+          name: String(a.name),
+          images: imgUrl ? [{ url: String(imgUrl) }] : [],
+          genres: [],
+          popularity: 0,
+          followers: { total: 0 }
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchLibraryAlbumsFromDesktop(limit = 100) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi || typeof libApi.getContents !== "function") return [];
+      let res = await libApi.getContents({ filters: ["0"], offset: 0, limit });
+      let items = Array.isArray(res?.items) ? res.items : [];
+      if (items.length === 0) {
+        res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
+        items = Array.isArray(res?.items) ? res.items : [];
+      }
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "album" || uri.startsWith("spotify:album:");
+      }).slice(0, limit).map((a) => {
+        const uri = String(a.uri || `spotify:album:${a.id}`);
+        const id = a.id ? String(a.id) : idFromUri(uri);
+        const imageUrl = String(
+          a.images?.[0]?.url || firstSourceUrl(a.coverArt?.sources) || ""
+        );
+        const artistName = Array.isArray(a.artists) ? a.artists.map((art) => art?.name).filter(Boolean).join(", ") : String(a.artist?.name || "");
+        return {
+          id,
+          uri,
+          name: String(a.name),
+          artistName,
+          imageUrl
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchArtistAvatarFromDesktop(artistId) {
+    if (!artistId || artistId.startsWith("local:")) return null;
+    if (artistOverviewCache.has(artistId)) {
+      return artistOverviewCache.get(artistId) ?? null;
+    }
+    try {
+      const data = await requestDesktopGraphQL("queryArtistOverview", ARTIST_OVERVIEW_HASH, {
+        uri: `spotify:artist:${artistId}`,
+        locale: ""
+      });
+      const union = data?.artistUnion;
+      const imageUrl = firstSourceUrl(union?.visuals?.avatarImage?.sources) || firstSourceUrl(union?.visuals?.headerImage?.sources) || "";
+      const monthlyListeners = Number(union?.stats?.monthlyListeners || 0);
+      const result = imageUrl || monthlyListeners > 0 ? { imageUrl, monthlyListeners } : null;
+      artistOverviewCache.set(artistId, result);
+      return result;
+    } catch {
+      artistOverviewCache.set(artistId, null);
+      return null;
+    }
+  }
+  function reconcileTopArtists(params) {
+    const {
+      rawTopArtists,
+      periodTracks,
+      likedTracks = [],
+      savedAlbums = [],
+      followedArtists = [],
+      trackedTracks = [],
+      minTargetCount = 15,
+      getGenresForName
+    } = params;
+    const byKey = /* @__PURE__ */ new Map();
+    const idToKey = /* @__PURE__ */ new Map();
+    const nameToKey = /* @__PURE__ */ new Map();
+    const ensureEvidence = (id, name) => {
+      const cleanName = (name || "").trim();
+      const norm = normalizeArtistKey(cleanName);
+      const cleanId = id && !id.startsWith("local:") ? id.trim() : void 0;
+      if (!cleanName && !cleanId) return null;
+      let key = (cleanId ? idToKey.get(cleanId) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      if (!key) {
+        key = cleanId || `name:${norm}`;
+        byKey.set(key, {
+          key,
+          id: cleanId,
+          name: cleanName || cleanId || "",
+          periodTrackCount: 0,
+          periodTrackScore: 0,
+          likedCount: 0,
+          savedAlbumCount: 0,
+          isFollowed: false,
+          trackedSeconds: 0,
+          fallbackImageUrl: ""
+        });
+      }
+      const ev = byKey.get(key);
+      if (cleanId && !ev.id) ev.id = cleanId;
+      if (cleanName && (!ev.name || ev.name === ev.id)) ev.name = cleanName;
+      if (cleanId) idToKey.set(cleanId, key);
+      if (norm) nameToKey.set(norm, key);
+      return ev;
+    };
+    const lookupEvidence = (id, name) => {
+      const norm = normalizeArtistKey(name);
+      const key = (id ? idToKey.get(id) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      return key ? byKey.get(key) : void 0;
+    };
+    periodTracks.forEach((tr, idx) => {
+      const baseWeight = Math.max(1, periodTracks.length - idx);
+      const artists = tr.artistNamesList && tr.artistNamesList.length > 0 ? tr.artistNamesList : tr.artistName.split(",").map((s, artIdx) => ({ id: artIdx === 0 ? tr.artistId : void 0, name: s.trim() })).filter((x) => Boolean(x.name));
+      artists.forEach((art, artIdx) => {
+        const ev = ensureEvidence(art.id, art.name);
+        if (!ev) return;
+        ev.periodTrackCount += 1;
+        ev.periodTrackScore += artIdx === 0 ? baseWeight : Math.max(1, Math.round(baseWeight * 0.45));
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) {
+          ev.fallbackImageUrl = tr.albumImageUrl;
+        }
+      });
+    });
+    for (const tr of likedTracks) {
+      const artists = Array.isArray(tr?.artists) ? tr.artists : [];
+      const img = String(tr?.album?.images?.[0]?.url || "");
+      for (const a of artists) {
+        if (!a?.name) continue;
+        const ev = ensureEvidence(a.id ? String(a.id) : void 0, String(a.name));
+        if (!ev) continue;
+        ev.likedCount += 1;
+        if (!ev.fallbackImageUrl && img) ev.fallbackImageUrl = img;
+      }
+    }
+    for (const alb of savedAlbums) {
+      if (!alb?.artistName) continue;
+      for (const part of alb.artistName.split(",")) {
+        const ev = ensureEvidence(void 0, part);
+        if (!ev) continue;
+        ev.savedAlbumCount += 1;
+        if (!ev.fallbackImageUrl && alb.imageUrl) ev.fallbackImageUrl = alb.imageUrl;
+      }
+    }
+    for (const fa of followedArtists) {
+      if (!fa?.name) continue;
+      const ev = ensureEvidence(fa.id ? String(fa.id) : void 0, String(fa.name));
+      if (!ev) continue;
+      ev.isFollowed = true;
+      const img = String(fa.images?.[0]?.url || "");
+      if (img) ev.fallbackImageUrl = img;
+    }
+    for (const tr of trackedTracks) {
+      if (!tr?.artistName || !(tr.totalSeconds > 0)) continue;
+      const parts = tr.artistName.split(",").map((s) => s.trim()).filter(Boolean);
+      parts.forEach((namePart, idx) => {
+        const ev = ensureEvidence(idx === 0 ? tr.artistId : void 0, namePart);
+        if (!ev) return;
+        ev.trackedSeconds += idx === 0 ? tr.totalSeconds : Math.round(tr.totalSeconds * 0.5);
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) ev.fallbackImageUrl = tr.albumImageUrl;
+      });
+    }
+    const hasUserEvidence = periodTracks.length > 0 || likedTracks.length > 0 || savedAlbums.length > 0 || trackedTracks.length > 0;
+    const isVerified = (ev) => Boolean(
+      ev && (ev.periodTrackCount > 0 || ev.likedCount > 0 || ev.savedAlbumCount > 0 || ev.isFollowed || ev.trackedSeconds > 0)
+    );
+    const verifiedRaw = hasUserEvidence ? rawTopArtists.filter((raw) => isVerified(lookupEvidence(raw.id, raw.name))) : rawTopArtists;
+    const baseRaw = verifiedRaw.length > 0 ? verifiedRaw : rawTopArtists;
+    const combined = [];
+    const usedEvidenceKeys = /* @__PURE__ */ new Set();
+    baseRaw.forEach((raw, idx) => {
+      const ev = lookupEvidence(raw.id, raw.name);
+      if (ev) usedEvidenceKeys.add(ev.key);
+      const rankBoost = Math.max(24, 100 - idx * 3);
+      const evidenceBoost = ev ? ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120) : 0;
+      combined.push({
+        artist: raw,
+        ev,
+        rawScore: rankBoost * 3 + evidenceBoost
+      });
+    });
+    if (combined.length < minTargetCount) {
+      const candidates = Array.from(byKey.values()).filter(
+        (ev) => !usedEvidenceKeys.has(ev.key) && (ev.periodTrackCount > 0 || periodTracks.length === 0 && (ev.trackedSeconds >= 60 || ev.likedCount > 0))
+      ).sort((a, b) => {
+        const scoreA = a.periodTrackScore * 10 + Math.min(25, a.likedCount * 3) + Math.min(20, a.savedAlbumCount * 5) + Math.min(30, a.trackedSeconds / 90);
+        const scoreB = b.periodTrackScore * 10 + Math.min(25, b.likedCount * 3) + Math.min(20, b.savedAlbumCount * 5) + Math.min(30, b.trackedSeconds / 90);
+        return scoreB - scoreA;
+      });
+      for (const ev of candidates) {
+        if (combined.length >= minTargetCount) break;
+        usedEvidenceKeys.add(ev.key);
+        const id = ev.id || `local:${normalizeArtistKey(ev.name)}`;
+        const score = ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120);
+        combined.push({
+          artist: {
+            id,
+            uri: ev.id ? `spotify:artist:${ev.id}` : "",
+            name: ev.name,
+            imageUrl: ev.fallbackImageUrl,
+            genres: getGenresForName ? getGenresForName(ev.name) : [],
+            popularity: 0,
+            followers: 0
+          },
+          ev,
+          rawScore: score
+        });
+      }
+    }
+    const maxScore = combined.reduce((m, c) => Math.max(m, c.rawScore), 1);
+    return combined.map((entry, idx) => {
+      const fallbackScore = Math.max(24, Math.round(98 - idx * 3.2));
+      const scaled = maxScore > 0 ? Math.round(entry.rawScore / maxScore * 98) : fallbackScore;
+      const affinityScore = Math.min(99, Math.max(24, scaled));
+      return {
+        ...entry.artist,
+        affinityScore,
+        periodTrackCount: entry.ev?.periodTrackCount ?? 0,
+        trackedSeconds: entry.ev?.trackedSeconds ?? 0
+      };
+    });
+  }
+  async function fetchArtistDiscographyFromDesktop(artistId, limit = 12) {
+    if (!artistId) return [];
+    const data = await requestDesktopGraphQL("queryArtistDiscographyAll", ARTIST_DISCOGRAPHY_HASH, {
+      uri: `spotify:artist:${artistId}`,
+      offset: 0,
+      limit,
+      order: "DATE_DESC"
+    });
+    const groups = data?.artistUnion?.discography?.all?.items;
+    if (!Array.isArray(groups)) return [];
+    const out = [];
+    for (const group of groups) {
+      const releases = group?.releases?.items;
+      if (!Array.isArray(releases)) continue;
+      for (const rel of releases) {
+        const url = firstSourceUrl(rel?.coverArt?.sources);
+        if (!url) continue;
+        out.push({
+          id: String(rel.id || idFromUri(rel.uri) || rel.name || url),
+          name: String(rel.name || ""),
+          imageUrl: url,
+          releaseType: String(rel.type || "album").toLowerCase()
+        });
+      }
+    }
+    return out;
+  }
+
+  // spicetify-cronotofy/src/i18n.ts
+  // @cronotofy-catalogs
+  function detectSpotifyLocale() {
+    try {
+      const spicetifyLoc = typeof Spicetify !== "undefined" ? Spicetify.Locale?.getLocale?.() : "";
+      if (spicetifyLoc && typeof spicetifyLoc === "string") return spicetifyLoc;
+    } catch {
+    }
+    if (typeof document !== "undefined" && document.documentElement?.lang) {
+      return document.documentElement.lang;
+    }
+    if (typeof navigator !== "undefined" && navigator.language) {
+      return navigator.language;
+    }
+    return "en";
+  }
+  function resolveLangCode(rawLocale) {
+    const language = String(rawLocale || "").trim().toLowerCase().split(/[-_]/, 1)[0];
+    return Object.hasOwn(TRANSLATIONS, language) ? language : "en";
+  }
+  const LANGUAGE_STORAGE_KEY = "cronotofy_language";
+  const VISUAL_PRESET_KEY = "cronotofy_visual_preset";
+  const VISUAL_PRESETS = ["full", "still", "focus"];
+  const PREFERENCE_LABELS = {
+    en: ["Preferences", "Visual preset", "Animated", "Still", "Focus", "Copy settings", "Apply settings", "Invalid settings", "Open the panel from the playback bar to see your listening time.", "Dismiss"],
+    es: ["Preferencias", "Estilo visual", "Animado", "Estático", "Enfoque", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abre el panel desde la barra de reproducción para ver tu tiempo de escucha.", "Cerrar"],
+    pt: ["Preferências", "Estilo visual", "Animado", "Estático", "Foco", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abra o painel na barra de reprodução para ver seu tempo de escuta.", "Dispensar"],
+    fr: ["Préférences", "Style visuel", "Animé", "Fixe", "Concentration", "Copier les réglages", "Appliquer les réglages", "Réglages invalides", "Ouvrez le panneau depuis la barre de lecture pour voir votre temps d’écoute.", "Fermer"],
+    de: ["Einstellungen", "Darstellung", "Animiert", "Statisch", "Fokus", "Einstellungen kopieren", "Einstellungen anwenden", "Ungültige Einstellungen", "Öffne das Panel über die Wiedergabeleiste, um deine Hörzeit zu sehen.", "Schließen"],
+    it: ["Preferenze", "Stile visivo", "Animato", "Statico", "Concentrazione", "Copia impostazioni", "Applica impostazioni", "Impostazioni non valide", "Apri il pannello dalla barra di riproduzione per vedere il tuo tempo di ascolto.", "Chiudi"],
+    id: ["Preferensi", "Tampilan", "Animasi", "Statis", "Fokus", "Salin pengaturan", "Terapkan pengaturan", "Pengaturan tidak valid", "Buka panel dari bilah pemutaran untuk melihat durasi mendengarkan.", "Tutup"]
+  };
+  function readStoredPreference(key) {
+    try {
+      return localStorage.getItem(key) || "";
+    } catch {
+      return "";
+    }
+  }
+  function saveStoredPreference(key, value) {
+    try {
+      if (value) localStorage.setItem(key, value);
+      else localStorage.removeItem(key);
+    } catch {
+    }
+  }
+  function readVisualPreset() {
+    const preset = readStoredPreference(VISUAL_PRESET_KEY);
+    return VISUAL_PRESETS.includes(preset) ? preset : "full";
+  }
+  function parseSharedPreferences(text) {
+    if (typeof text !== "string" || text.length > 1024) return null;
+    try {
+      const settings = JSON.parse(text);
+      if (!settings || Object.keys(settings).length !== 3 || settings.version !== 1 ||
+          !VISUAL_PRESETS.includes(settings.preset) ||
+          typeof settings.language !== "string" ||
+          !(settings.language === "" || Object.hasOwn(LANGUAGE_OPTIONS, settings.language))) return null;
+      return { language: settings.language, preset: settings.preset };
+    } catch {
+      return null;
+    }
+  }
+  const LANGUAGE_OPTIONS = {
+    en: ["English", "Language", "Spotify language"],
+    es: ["Español", "Idioma", "Idioma de Spotify"],
+    pt: ["Português", "Idioma", "Idioma do Spotify"],
+    fr: ["Français", "Langue", "Langue de Spotify"],
+    de: ["Deutsch", "Sprache", "Spotify-Sprache"],
+    it: ["Italiano", "Lingua", "Lingua di Spotify"],
+    id: ["Bahasa Indonesia", "Bahasa", "Bahasa Spotify"]
+  };
+  function readLanguagePreference() {
+    const language = readStoredPreference(LANGUAGE_STORAGE_KEY);
+    return Object.hasOwn(LANGUAGE_OPTIONS, language) ? language : "";
+  }
+  function getTranslations(language = readLanguagePreference()) {
+    const rawLocale = language || detectSpotifyLocale();
+    const lang = resolveLangCode(rawLocale);
+    return {
+      lang,
+      rawLocale,
+      t: TRANSLATIONS[lang]
+    };
+  }
+  function formatRelativeTimeLocalized(iso, t, rawLocale) {
+    if (!iso) return t.time.justNow;
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) return t.time.justNow;
+    const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1e3));
+    if (diffSec < 60) return t.time.secondsAgo(diffSec);
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return t.time.minutesAgo(diffMin);
+    const diffHrs = Math.floor(diffMin / 60);
+    if (diffHrs < 24) return t.time.hoursAgo(diffHrs);
+    let locale = resolveLangCode(rawLocale);
+    try {
+      const canonical = Intl.getCanonicalLocales(String(rawLocale || "").replaceAll("_", "-"))[0];
+      if (canonical && Object.hasOwn(TRANSLATIONS, canonical.split("-", 1)[0])) locale = canonical;
+    } catch {
+    }
+    return new Date(ts).toLocaleDateString(locale, { day: "2-digit", month: "short" });
+  }
+
+  // spicetify-cronotofy/src/tracker.ts
+  var STORAGE_PREFIX = CRONOTOFY_MOD_CONFIG.tracking.storagePrefix;
+  var MAX_RECENT_PLAYS = CRONOTOFY_MOD_CONFIG.tracking.maxRecentPlays;
+  var MIN_PLAY_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.minPlaySeconds;
+  var SAVE_INTERVAL_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.saveIntervalSeconds;
+  function normalizeSpotifyImage(url) {
+    if (!url || typeof url !== "string") return "";
+    const clean = url.trim();
+    if (!clean) return "";
+    if (clean.startsWith("spotify:image:")) {
+      const hash = clean.slice("spotify:image:".length);
+      return hash ? `https://i.scdn.co/image/${hash}` : "";
+    }
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+      return clean;
+    }
+    return "";
+  }
+  function formatSecondsHuman(totalSec) {
+    const sec = Math.max(0, Math.floor(totalSec || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor(sec % 3600 / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+  function getTodayKey() {
+    const d = /* @__PURE__ */ new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+  function computeListeningStreak(dailySeconds, todayKey = getTodayKey()) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(todayKey);
+    const baseDate = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : /* @__PURE__ */ new Date();
+    const baseYear = baseDate.getFullYear();
+    const baseMonth = baseDate.getMonth();
+    const baseDay = baseDate.getDate();
+    const keyAt = (offsetDays) => {
+      const d = new Date(baseYear, baseMonth, baseDay - offsetDays);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+    let last7DaysSeconds = 0;
+    for (let i = 0; i < 7; i++) {
+      const val = Number(dailySeconds[keyAt(i)] || 0);
+      if (Number.isFinite(val) && val > 0) {
+        last7DaysSeconds += Math.floor(val);
+      }
+    }
+    const todaySec = Number(dailySeconds[keyAt(0)] || 0);
+    let offset = Number.isFinite(todaySec) && todaySec > 0 ? 0 : 1;
+    let streakDays = 0;
+    for (let guard = 0; guard < 3650; guard++) {
+      const sec = Number(dailySeconds[keyAt(offset)] || 0);
+      if (!Number.isFinite(sec) || sec <= 0) break;
+      streakDays += 1;
+      offset += 1;
+    }
+    return { streakDays, last7DaysSeconds };
+  }
+  async function copyLiveTrackToClipboard(track) {
+    if (!track) return "empty";
+    const text = `${track.name} \u2014 ${track.artistName}
+${track.externalUrl}`;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return "copied";
+      }
+      if (typeof document !== "undefined" && document.body) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand?.("copy");
+        ta.remove();
+        return ok ? "copied" : "error";
+      }
+      return "error";
+    } catch {
+      return "error";
+    }
+  }
+  function extractLiveTrackFromPlayer() {
+    try {
+      const item = Spicetify?.Player?.data?.item || Spicetify?.Player?.data?.track;
+      if (!item || typeof item !== "object") return null;
+      const uri = String(item.uri || "");
+      if (!uri.startsWith("spotify:track:")) return null;
+      const id = uri.replace("spotify:track:", "");
+      if (!id) return null;
+      const { t } = getTranslations();
+      const metadata = item.metadata || {};
+      const name = item.name || metadata.title || t.entities.untitled;
+      let artistName = t.entities.unknownArtist;
+      let artistId;
+      if (Array.isArray(item.artists) && item.artists.length > 0) {
+        artistName = item.artists.map((a) => a?.name).filter(Boolean).join(", ") || artistName;
+        const firstArtistUri = String(item.artists[0]?.uri || "");
+        if (firstArtistUri.startsWith("spotify:artist:")) {
+          artistId = firstArtistUri.replace("spotify:artist:", "");
+        }
+      } else if (metadata.artist_name) {
+        artistName = String(metadata.artist_name);
+      }
+      const albumObj = item.album || {};
+      const albumName = albumObj.name || metadata.album_title || "";
+      const albumUri = albumObj.uri || metadata.album_uri || void 0;
+      let rawImageUrl = "";
+      if (Array.isArray(albumObj.images) && albumObj.images.length > 0) {
+        rawImageUrl = albumObj.images[0]?.url || "";
+      } else if (metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url) {
+        rawImageUrl = metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url;
+      }
+      const albumImageUrl = normalizeSpotifyImage(rawImageUrl);
+      const durationMs = Number(
+        item.duration?.milliseconds ?? item.duration_ms ?? Spicetify?.Player?.getDuration?.() ?? 0
+      );
+      const progressMs = Number(Spicetify?.Player?.getProgress?.() ?? 0);
+      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
+      return {
+        id,
+        uri,
+        name,
+        artistName,
+        artistId,
+        albumName,
+        albumUri,
+        albumImageUrl,
+        durationMs: Number.isFinite(durationMs) ? durationMs : 0,
+        progressMs: Number.isFinite(progressMs) ? progressMs : 0,
+        isPlaying,
+        externalUrl: `https://open.spotify.com/track/${id}`,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+    } catch {
+      return null;
+    }
+  }
+  var cachedUser = null;
+  var resolvingUserPromise = null;
+  async function resolveCurrentSpotifyUser(forceRefresh = false) {
+    if (cachedUser && !forceRefresh) return cachedUser;
+    if (resolvingUserPromise && !forceRefresh) return resolvingUserPromise;
+    resolvingUserPromise = (async () => {
+      try {
+        const apiUser = await Spicetify?.Platform?.UserAPI?.getUser?.();
+        if (apiUser) {
+          const rawUri = String(apiUser.uri || "");
+          const id = String(
+            apiUser.username || (rawUri.startsWith("spotify:user:") ? rawUri.replace("spotify:user:", "") : "")
+          ).trim();
+          if (id) {
+            const avatarUrl = normalizeSpotifyImage(apiUser.images?.[0]?.url || apiUser.avatar);
+            const user = {
+              id,
+              displayName: String(apiUser.displayName || apiUser.name || id),
+              avatarUrl: avatarUrl || void 0,
+              profileUrl: `https://open.spotify.com/user/${encodeURIComponent(id)}`
+            };
+            cachedUser = user;
+            return user;
+          }
+        }
+      } catch {
+      }
+      try {
+        if (Spicetify?.CosmosAsync?.get) {
+          const me = await Spicetify.CosmosAsync.get("https://api.spotify.com/v1/me");
+          if (me && me.id) {
+            const avatarUrl = normalizeSpotifyImage(me.images?.[0]?.url);
+            const user = {
+              id: String(me.id),
+              displayName: String(me.display_name || me.id),
+              email: me.email ? String(me.email) : void 0,
+              country: me.country ? String(me.country) : void 0,
+              avatarUrl: avatarUrl || void 0,
+              profileUrl: me.external_urls?.spotify || `https://open.spotify.com/user/${encodeURIComponent(me.id)}`
+            };
+            cachedUser = user;
+            return user;
+          }
+        }
+      } catch {
+      }
+      return cachedUser;
+    })();
+    try {
+      return await resolvingUserPromise;
+    } finally {
+      resolvingUserPromise = null;
+    }
+  }
+  function createEmptyStore(userId) {
+    return {
+      version: 1,
+      userId,
+      totalSeconds: 0,
+      dailySeconds: {},
+      tracks: {},
+      recentPlays: []
+    };
+  }
+  function storageKeyFor(userId) {
+    return userId ? `${STORAGE_PREFIX}_${userId}` : `${STORAGE_PREFIX}:anonymous`;
+  }
+  function loadStore(userId) {
+    try {
+      const key = storageKeyFor(userId);
+      const profileData = localStorage.getItem(key);
+      const raw = profileData || localStorage.getItem(STORAGE_PREFIX);
+      if (!raw) return createEmptyStore(userId);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.version === 1) {
+        const storedOwner = typeof parsed.userId === "string" ? parsed.userId : "";
+        if ((storedOwner && storedOwner !== userId) ||
+            (!profileData && storedOwner !== userId)) return createEmptyStore(userId);
+        return {
+          version: 1,
+          userId,
+          totalSeconds: Number(parsed.totalSeconds) || 0,
+          dailySeconds: parsed.dailySeconds && typeof parsed.dailySeconds === "object" ? parsed.dailySeconds : {},
+          tracks: parsed.tracks && typeof parsed.tracks === "object" ? parsed.tracks : {},
+          recentPlays: Array.isArray(parsed.recentPlays) ? parsed.recentPlays.slice(0, MAX_RECENT_PLAYS) : [],
+          lastSyncedAt: parsed.lastSyncedAt
+        };
+      }
+    } catch {
+    }
+    return createEmptyStore(userId);
+  }
+  function saveStore(store) {
+    try {
+      store.lastSyncedAt = (/* @__PURE__ */ new Date()).toISOString();
+      localStorage.setItem(storageKeyFor(store.userId), JSON.stringify(store));
+    } catch {
+    }
+  }
+  var ListeningTracker = class {
+    constructor() {
+      this.userId = "";
+      this.store = createEmptyStore("");
+      this.currentTrack = null;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      this.lastProgressMs = 0;
+      this.tickCounter = 0;
+      this.tickTimer = null;
+      this.listeners = /* @__PURE__ */ new Set();
+      this.initialized = false;
+      this.handleBeforeUnload = () => {
+        saveStore(this.store);
+      };
+    }
+    async init() {
+      if (this.initialized) return;
+      this.initialized = true;
+      const user = await resolveCurrentSpotifyUser();
+      this.userId = user?.id || "";
+      this.store = loadStore(this.userId);
+      this.currentTrack = extractLiveTrackFromPlayer();
+      this.lastProgressMs = this.currentTrack?.progressMs ?? 0;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      if (typeof window !== "undefined") {
+        window.addEventListener("beforeunload", this.handleBeforeUnload);
+      }
+      this.tickTimer = setInterval(() => this.onSecondTick(), 1e3);
+      this.notify();
+    }
+    notify() {
+      for (const fn of this.listeners) {
+        try {
+          fn();
+        } catch {
+        }
+      }
+    }
+    subscribe(fn) {
+      this.listeners.add(fn);
+      return () => {
+        this.listeners.delete(fn);
+      };
+    }
+    finalizeCurrentTrackSession(nextTrack) {
+      if (this.currentTrack && this.currentSessionSeconds >= MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
+        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
+      }
+      this.currentTrack = nextTrack;
+      this.lastProgressMs = nextTrack?.progressMs ?? 0;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+    }
+    recordPlay(track, listenedSeconds) {
+      const existing = this.store.tracks[track.id];
+      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (existing) {
+        existing.playCount += 1;
+        existing.lastPlayedAt = nowIso;
+      } else {
+        this.store.tracks[track.id] = {
+          id: track.id,
+          uri: track.uri,
+          name: track.name,
+          artistName: track.artistName,
+          artistId: track.artistId,
+          albumName: track.albumName,
+          albumUri: track.albumUri,
+          albumImageUrl: track.albumImageUrl,
+          durationMs: track.durationMs,
+          totalSeconds: listenedSeconds,
+          playCount: 1,
+          lastPlayedAt: nowIso
+        };
+      }
+      const playEvent = {
+        id: track.id,
+        uri: track.uri,
+        name: track.name,
+        artistName: track.artistName,
+        albumName: track.albumName,
+        albumImageUrl: track.albumImageUrl,
+        listenedSeconds,
+        playedAt: nowIso
+      };
+      this.store.recentPlays = [playEvent, ...this.store.recentPlays].slice(0, MAX_RECENT_PLAYS);
+      this.currentPlayRecorded = true;
+    }
+    onSecondTick() {
+      const live = extractLiveTrackFromPlayer();
+      if (live && this.currentTrack && live.id !== this.currentTrack.id) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live && this.currentTrack && live.id === this.currentTrack.id && this.currentPlayRecorded && this.lastProgressMs > 15e3 && live.progressMs < 5e3) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live) {
+        this.currentTrack = live;
+      }
+      if (live) {
+        this.lastProgressMs = live.progressMs;
+      }
+      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
+      if (!isPlaying || !live) {
+        return;
+      }
+      const today = getTodayKey();
+      this.store.totalSeconds += 1;
+      this.store.dailySeconds[today] = (this.store.dailySeconds[today] || 0) + 1;
+      this.currentSessionSeconds += 1;
+      const existing = this.store.tracks[this.currentTrack.id];
+      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (existing) {
+        existing.totalSeconds += 1;
+        existing.lastPlayedAt = nowIso;
+        if (this.currentTrack.albumImageUrl && !existing.albumImageUrl) {
+          existing.albumImageUrl = this.currentTrack.albumImageUrl;
+        }
+      } else {
+        this.store.tracks[this.currentTrack.id] = {
+          id: this.currentTrack.id,
+          uri: this.currentTrack.uri,
+          name: this.currentTrack.name,
+          artistName: this.currentTrack.artistName,
+          artistId: this.currentTrack.artistId,
+          albumName: this.currentTrack.albumName,
+          albumUri: this.currentTrack.albumUri,
+          albumImageUrl: this.currentTrack.albumImageUrl,
+          durationMs: this.currentTrack.durationMs,
+          totalSeconds: 1,
+          playCount: 0,
+          lastPlayedAt: nowIso
+        };
+      }
+      if (this.currentSessionSeconds === MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
+        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
+      } else if (this.currentPlayRecorded && this.store.recentPlays[0]?.id === this.currentTrack.id) {
+        this.store.recentPlays[0].listenedSeconds = this.currentSessionSeconds;
+      }
+      this.tickCounter += 1;
+      if (this.tickCounter >= SAVE_INTERVAL_SECONDS) {
+        this.tickCounter = 0;
+        saveStore(this.store);
+      }
+      this.notify();
+    }
+    onSongChange() {
+      const next = extractLiveTrackFromPlayer();
+      this.finalizeCurrentTrackSession(next);
+      saveStore(this.store);
+      this.notify();
+    }
+    onPlayPause() {
+      const live = extractLiveTrackFromPlayer();
+      if (live && this.currentTrack?.id !== live.id) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live) {
+        this.currentTrack = live;
+        this.lastProgressMs = live.progressMs;
+      }
+      saveStore(this.store);
+      this.notify();
+    }
+    async syncNow() {
+      saveStore(this.store);
+      this.notify();
+      return true;
+    }
+    getLiveTrack() {
+      return extractLiveTrackFromPlayer();
+    }
+    getCounters() {
+      const today = getTodayKey();
+      const { streakDays, last7DaysSeconds } = computeListeningStreak(this.store.dailySeconds, today);
+      return {
+        totalSeconds: this.store.totalSeconds,
+        todaySeconds: this.store.dailySeconds[today] || 0,
+        todayDate: today,
+        currentTrackSeconds: this.currentSessionSeconds,
+        streakDays,
+        last7DaysSeconds
+      };
+    }
+    getSnapshot() {
+      const tracks = Object.values(this.store.tracks).sort((a, b) => b.totalSeconds - a.totalSeconds);
+      return {
+        ...this.getCounters(),
+        userId: this.userId,
+        tracks,
+        recentPlays: this.store.recentPlays,
+        lastSyncedAt: this.store.lastSyncedAt
+      };
+    }
+    clearLocalHistory() {
+      this.store = createEmptyStore(this.userId);
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      this.lastProgressMs = 0;
+      saveStore(this.store);
+      this.notify();
+    }
+  };
+
+  // spicetify-cronotofy/src/albumWall.ts
+  function normalizeImageKey(url) {
+    const clean = (url || "").trim().split("?")[0];
+    const scdnMatch = clean.match(/i\.scdn\.co\/image\/([a-zA-Z0-9]+)/);
+    if (scdnMatch) return scdnMatch[1];
+    return clean;
+  }
+  function normalizeAlbumTitleKey(title, artistName) {
+    let cleanTitle = (title || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (!cleanTitle) return "";
+    cleanTitle = cleanTitle.replace(
+      /\s*[\(\[]\s*(?:instrumental|deluxe|super deluxe|explicit|clean|bonus|expanded|remaster(?:ed)?|remix(?:es)?|live|acoustic|acustico|version|edition|edicion|from\s+[^)\]]*|anniversary|mono|stereo)[^)\]]*[\)\]]/gi,
+      ""
+    ).replace(/\s*-\s*(?:single|ep|deluxe|instrumental|explicit|clean|remastered).*$/i, "").replace(/[^a-z0-9]+/g, " ").trim();
+    if (!cleanTitle) return "";
+    const primaryArtist = (artistName || "").split(",")[0].toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+    return primaryArtist ? `${cleanTitle}::${primaryArtist}` : cleanTitle;
+  }
+  function deduplicateWallCovers(covers) {
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
+    const unique = [];
+    for (const cover of covers) {
+      if (!cover) continue;
+      const url = normalizeSpotifyImage(cover.imageUrl);
+      if (!url) continue;
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) continue;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) continue;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
+      unique.push({ ...cover, imageUrl: url });
+    }
+    return unique;
+  }
+  function deterministicShuffle(items, seedStr) {
+    const arr = [...items];
+    let s = seedStr.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 9876);
+    const rand = () => {
+      s = (s * 9301 + 49297) % 233280;
+      return s / 233280;
+    };
+    let m = arr.length;
+    while (m > 0) {
+      const i = Math.floor(rand() * m--);
+      const tmp = arr[m];
+      arr[m] = arr[i];
+      arr[i] = tmp;
+    }
+    return arr;
+  }
+  function readWallCache(userId) {
+    try {
+      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.savedAt === "number" && Array.isArray(parsed.covers) && Date.now() - parsed.savedAt < CRONOTOFY_MOD_CONFIG.albumWall.cacheTtlMs && parsed.covers.length > 0) {
+        return parsed.covers;
+      }
+    } catch {
+    }
+    return null;
+  }
+  function writeWallCache(userId, covers) {
+    try {
+      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
+      const payload = { savedAt: Date.now(), covers };
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch {
+    }
+  }
+  async function collectFavoriteArtistCovers(params) {
+    const { userId, artistCandidates, seedTrackCovers } = params;
+    const collected = [];
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
+    const addCover = (cover) => {
+      const url = normalizeSpotifyImage(cover.imageUrl);
+      if (!url) return;
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) return;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) return;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
+      collected.push({ ...cover, imageUrl: url });
+    };
+    for (const c of seedTrackCovers) {
+      addCover(c);
+    }
+    const cached = readWallCache(userId);
+    if (cached) {
+      for (const c of cached) {
+        addCover(c);
+      }
+      if (collected.length >= 130) {
+        return collected;
+      }
+    }
+    const artistsWithId = [];
+    const seenArtistIds = /* @__PURE__ */ new Set();
+    for (const a of artistCandidates) {
+      if (a.id && !a.id.startsWith("local:") && !seenArtistIds.has(a.id)) {
+        seenArtistIds.add(a.id);
+        artistsWithId.push({ id: a.id, name: a.name });
+        if (artistsWithId.length >= CRONOTOFY_MOD_CONFIG.albumWall.maxArtistsToFetch) break;
+      }
+    }
+    const maxPerArtist = CRONOTOFY_MOD_CONFIG.albumWall.maxCoversPerArtist;
+    const batchSize = 4;
+    for (let i = 0; i < artistsWithId.length; i += batchSize) {
+      const batch = artistsWithId.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (artist) => {
+          try {
+            const gqlAlbums = await fetchArtistDiscographyFromDesktop(artist.id, maxPerArtist);
+            for (const alb of gqlAlbums) {
+              addCover({
+                id: alb.id,
+                title: alb.name,
+                artistName: artist.name,
+                imageUrl: alb.imageUrl,
+                releaseType: alb.releaseType
+              });
+            }
+          } catch {
+          }
+        })
+      );
+    }
+    if (collected.length > 0) {
+      writeWallCache(userId, collected);
+    }
+    return collected;
+  }
+  function buildAlbumWallLanes(covers, seedKey, laneCount, minPerLane) {
+    const unique = deduplicateWallCovers(covers);
+    if (unique.length === 0 || laneCount <= 0) return [];
+    const shuffled = deterministicShuffle(unique, seedKey || "cronotofy");
+    const lanes = Array.from({ length: laneCount }, () => []);
+    shuffled.forEach((cover, idx) => {
+      lanes[idx % laneCount].push(cover);
+    });
+    if (minPerLane <= 0) return lanes;
+    const target = Math.min(minPerLane, shuffled.length);
+    return lanes.map((lane, lIdx) => {
+      if (lane.length >= target) return lane;
+      const filled = [...lane];
+      const usedInLane = new Set(filled.map((c) => normalizeImageKey(c.imageUrl)));
+      const nearby = /* @__PURE__ */ new Set();
+      for (const offset of [-2, -1, 1, 2]) {
+        const neighbor = lanes[lIdx + offset];
+        if (!neighbor) continue;
+        for (const c of neighbor) nearby.add(normalizeImageKey(c.imageUrl));
+      }
+      const startOffset = (lIdx * 7 + Math.floor(shuffled.length / 2)) % shuffled.length;
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        if (nearby.has(key) && shuffled.length > filled.length + nearby.size) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
+      }
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
+      }
+      return filled;
+    });
+  }
+
+  // spicetify-cronotofy/src/aiColorEngine.ts
+  var AI_PALETTE_CACHE_KEY = "cronotofy_ai_palettes_v4";
+  var GEMINI_KEY_STORAGE_KEY = "cronotofy_gemini_api_key";
+  var MAX_CACHE_ENTRIES = 120;
+  function clamp(v, min, max) {
+    return Math.min(max, Math.max(min, v));
+  }
+  function rgbToHex(r, g, b) {
+    const h = (n) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0");
+    return `#${h(r)}${h(g)}${h(b)}`;
+  }
+  function rgbToStr(r, g, b) {
+    return `${clamp(Math.round(r), 0, 255)}, ${clamp(Math.round(g), 0, 255)}, ${clamp(Math.round(b), 0, 255)}`;
+  }
+  function hexToRgb(hex) {
+    const clean = (hex || "").trim().replace(/^#/, "");
+    if (/^[0-9a-fA-F]{3}$/.test(clean)) {
+      return [
+        parseInt(clean[0] + clean[0], 16),
+        parseInt(clean[1] + clean[1], 16),
+        parseInt(clean[2] + clean[2], 16)
+      ];
+    }
+    if (/^[0-9a-fA-F]{6}$/.test(clean)) {
+      return [
+        parseInt(clean.slice(0, 2), 16),
+        parseInt(clean.slice(2, 4), 16),
+        parseInt(clean.slice(4, 6), 16)
+      ];
+    }
+    return null;
+  }
+  function srgbToLinear(c) {
+    const s = clamp(c, 0, 1);
+    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  }
+  function linearToSrgb(c) {
+    const lin = clamp(c, 0, 1);
+    return lin <= 31308e-7 ? 12.92 * lin : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+  }
+  function rgbToOklab(r, g, b) {
+    const lr = srgbToLinear(r / 255);
+    const lg = srgbToLinear(g / 255);
+    const lb = srgbToLinear(b / 255);
+    const l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb;
+    const m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb;
+    const s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb;
+    const l_ = Math.cbrt(l);
+    const m_ = Math.cbrt(m);
+    const s_ = Math.cbrt(s);
+    return {
+      L: 0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_,
+      a: 1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_,
+      b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_
+    };
+  }
+  function oklabToLinearSrgb(L, a, b) {
+    const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+    const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+    const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+    const l = l_ * l_ * l_;
+    const m = m_ * m_ * m_;
+    const s = s_ * s_ * s_;
+    return [
+      4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+      -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s
+    ];
+  }
+  function oklabToOklch(c) {
+    const C = Math.hypot(c.a, c.b);
+    const H = (Math.atan2(c.b, c.a) * 180 / Math.PI + 360) % 360;
+    return { L: c.L, C, H };
+  }
+  function inLinearGamut(lr, lg, lb) {
+    const eps = 1e-4;
+    return lr >= -eps && lr <= 1 + eps && lg >= -eps && lg <= 1 + eps && lb >= -eps && lb <= 1 + eps;
+  }
+  function oklchToSrgbSafe(L, C, H) {
+    const cleanL = clamp(L, 0, 1);
+    const cleanC = Math.max(0, C);
+    const rad = H * Math.PI / 180;
+    const cosH = Math.cos(rad);
+    const sinH = Math.sin(rad);
+    let [lr, lg, lb] = oklabToLinearSrgb(cleanL, cleanC * cosH, cleanC * sinH);
+    if (!inLinearGamut(lr, lg, lb) && cleanC > 0) {
+      let low = 0;
+      let high = cleanC;
+      for (let i = 0; i < 16; i++) {
+        const mid = (low + high) * 0.5;
+        const candidate = oklabToLinearSrgb(cleanL, mid * cosH, mid * sinH);
+        if (inLinearGamut(candidate[0], candidate[1], candidate[2])) {
+          low = mid;
+          lr = candidate[0];
+          lg = candidate[1];
+          lb = candidate[2];
+        } else {
+          high = mid;
+        }
+      }
+      [lr, lg, lb] = oklabToLinearSrgb(cleanL, low * cosH, low * sinH);
+    }
+    return [
+      Math.round(linearToSrgb(lr) * 255),
+      Math.round(linearToSrgb(lg) * 255),
+      Math.round(linearToSrgb(lb) * 255)
+    ];
+  }
+  function relativeLuminance(r, g, b) {
+    return 0.2126 * srgbToLinear(r / 255) + 0.7152 * srgbToLinear(g / 255) + 0.0722 * srgbToLinear(b / 255);
+  }
+  function circularHueDistance(h1, h2) {
+    const diff = Math.abs(h1 - h2) % 360;
+    return diff > 180 ? 360 - diff : diff;
+  }
+  function buildPaletteFromOklchSeeds(accentSeed, accent2Seed, ambientSeed, sourceImageUrl) {
+    const isMono = accentSeed.C < 0.032 && ambientSeed.C < 0.032;
+    const accentTuple = isMono ? [226, 232, 240] : oklchToSrgbSafe(
+      clamp(accentSeed.L, 0.68, 0.79),
+      clamp(accentSeed.C, 0.095, 0.245),
+      accentSeed.H
+    );
+    const accent2Tuple = isMono ? [203, 213, 225] : oklchToSrgbSafe(
+      clamp(accent2Seed.L, 0.64, 0.76),
+      clamp(accent2Seed.C, 0.09, 0.225),
+      accent2Seed.H
+    );
+    const accentSoftTuple = isMono ? [241, 245, 249] : oklchToSrgbSafe(
+      0.85,
+      clamp(accentSeed.C * 0.62, 0.065, 0.155),
+      accentSeed.H
+    );
+    const ambC = isMono ? 8e-3 : clamp(ambientSeed.C * 0.68, 0.032, 0.092);
+    const ambH = isMono ? 225 : ambientSeed.H;
+    const bgMainTuple = oklchToSrgbSafe(0.165, ambC, ambH);
+    const bgSidebarTuple = oklchToSrgbSafe(0.14, ambC * 0.9, ambH);
+    const bgPlayerTuple = oklchToSrgbSafe(0.15, ambC * 0.94, ambH);
+    const bgCardTuple = oklchToSrgbSafe(0.195, clamp(ambC * 1.06, 8e-3, 0.105), ambH);
+    const bgElevatedTuple = oklchToSrgbSafe(0.23, clamp(ambC * 1.1, 8e-3, 0.112), ambH);
+    const bgHighlightTuple = oklchToSrgbSafe(0.275, clamp(ambC * 1.15, 8e-3, 0.12), ambH);
+    const lum = relativeLuminance(...accentTuple);
+    return {
+      sourceImageUrl,
+      isDynamic: true,
+      accent: rgbToHex(...accentTuple),
+      accentRgb: rgbToStr(...accentTuple),
+      accent2: rgbToHex(...accent2Tuple),
+      accent2Rgb: rgbToStr(...accent2Tuple),
+      accentSoft: rgbToHex(...accentSoftTuple),
+      accentContrast: lum > 0.34 ? "#060910" : "#ffffff",
+      bgMain: rgbToHex(...bgMainTuple),
+      bgMainRgb: rgbToStr(...bgMainTuple),
+      bgElevated: rgbToHex(...bgElevatedTuple),
+      bgHighlight: rgbToHex(...bgHighlightTuple),
+      bgSidebar: rgbToHex(...bgSidebarTuple),
+      bgSidebarRgb: rgbToStr(...bgSidebarTuple),
+      bgPlayer: rgbToHex(...bgPlayerTuple),
+      bgCard: rgbToHex(...bgCardTuple),
+      bgCardRgb: rgbToStr(...bgCardTuple)
+    };
+  }
+  function buildPaletteFromSeedColors(accentHex, accent2Hex, ambientHex, sourceImageUrl) {
+    const rgb1 = hexToRgb(accentHex);
+    const rgb2 = hexToRgb(accent2Hex) || rgb1;
+    const rgb3 = hexToRgb(ambientHex) || rgb1;
+    if (!rgb1 || !rgb2 || !rgb3) return null;
+    const lch1 = oklabToOklch(rgbToOklab(...rgb1));
+    const lch2 = oklabToOklch(rgbToOklab(...rgb2));
+    const lch3 = oklabToOklch(rgbToOklab(...rgb3));
+    const accentSeed = {
+      L: lch1.C < 0.032 ? 0.9 : clamp(lch1.L * 0.35 + 0.49, 0.68, 0.79),
+      C: lch1.C < 0.032 ? lch1.C : lch1.C < 0.09 ? clamp(lch1.C * 1.45, 0.095, 0.175) : clamp(lch1.C * 1.16, 0.155, 0.245),
+      H: lch1.H
+    };
+    const accent2Seed = {
+      L: lch2.C < 0.032 ? 0.85 : clamp(lch2.L * 0.35 + 0.47, 0.64, 0.76),
+      C: lch2.C < 0.032 ? lch2.C : lch2.C < 0.09 ? clamp(lch2.C * 1.35, 0.09, 0.165) : clamp(lch2.C * 1.12, 0.14, 0.225),
+      H: lch2.H
+    };
+    return buildPaletteFromOklchSeeds(accentSeed, accent2Seed, lch3, sourceImageUrl);
+  }
+  function quantizePixelsOklab(rgba, width, height, sourceImageUrl) {
+    const totalPixels = width * height;
+    if (totalPixels === 0 || rgba.length < totalPixels * 4) return null;
+    const samples = [];
+    let totalAreaWeight = 0;
+    let totalChromaticArea = 0;
+    for (let y = 0; y < height; y++) {
+      const ny = (y + 0.5) / height - 0.5;
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        const alpha = rgba[idx + 3];
+        if (alpha < 180) continue;
+        const r = rgba[idx];
+        const g = rgba[idx + 1];
+        const b = rgba[idx + 2];
+        const lab = rgbToOklab(r, g, b);
+        if (lab.L < 0.055 || lab.L > 0.965) continue;
+        const C = Math.hypot(lab.a, lab.b);
+        const nx = (x + 0.5) / width - 0.5;
+        const focus = Math.exp(-1.8 * (nx * nx + ny * ny));
+        const areaW = 0.72 + 0.28 * focus;
+        totalAreaWeight += areaW;
+        if (C >= 0.03) {
+          totalChromaticArea += areaW;
+        }
+        samples.push({ L: lab.L, a: lab.a, b: lab.b, C, areaW });
+      }
+    }
+    if (samples.length === 0) return null;
+    const chromaticCoverage = totalChromaticArea / Math.max(1, totalAreaWeight);
+    if (chromaticCoverage < 0.08) {
+      const monoSeed = { L: 0.9, C: 5e-3, H: 225 };
+      return buildPaletteFromOklchSeeds(monoSeed, monoSeed, { L: 0.22, C: 5e-3, H: 225 }, sourceImageUrl);
+    }
+    const k = Math.min(8, samples.length);
+    const centroids = [];
+    let firstIdx = 0;
+    let firstBestScore = -1;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const score = s.areaW * (0.65 + 0.35 * Math.min(1, s.C / 0.16));
+      if (score > firstBestScore) {
+        firstBestScore = score;
+        firstIdx = i;
+      }
+    }
+    centroids.push({ L: samples[firstIdx].L, a: samples[firstIdx].a, b: samples[firstIdx].b });
+    const minDistSq = new Float64Array(samples.length).fill(Infinity);
+    for (let c = 1; c < k; c++) {
+      const prev = centroids[c - 1];
+      let bestIdx = 0;
+      let bestWeightedDist = -1;
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        const dL = s.L - prev.L;
+        const da = s.a - prev.a;
+        const db = s.b - prev.b;
+        const d2 = dL * dL + da * da + db * db;
+        if (d2 < minDistSq[i]) minDistSq[i] = d2;
+        const wd = minDistSq[i] * s.areaW * (0.65 + 0.35 * Math.min(1, s.C / 0.16));
+        if (wd > bestWeightedDist) {
+          bestWeightedDist = wd;
+          bestIdx = i;
+        }
+      }
+      centroids.push({ L: samples[bestIdx].L, a: samples[bestIdx].a, b: samples[bestIdx].b });
+    }
+    const sumArea = new Float64Array(k);
+    const sumL = new Float64Array(k);
+    const sumA = new Float64Array(k);
+    const sumB = new Float64Array(k);
+    for (let iter = 0; iter < 12; iter++) {
+      sumArea.fill(0);
+      sumL.fill(0);
+      sumA.fill(0);
+      sumB.fill(0);
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        let bestC = 0;
+        let bestD = Infinity;
+        for (let c = 0; c < k; c++) {
+          const ctr = centroids[c];
+          const dL = s.L - ctr.L;
+          const da = s.a - ctr.a;
+          const db = s.b - ctr.b;
+          const d = dL * dL + da * da + db * db;
+          if (d < bestD) {
+            bestD = d;
+            bestC = c;
+          }
+        }
+        sumArea[bestC] += s.areaW;
+        sumL[bestC] += s.L * s.areaW;
+        sumA[bestC] += s.a * s.areaW;
+        sumB[bestC] += s.b * s.areaW;
+      }
+      for (let c = 0; c < k; c++) {
+        if (sumArea[c] > 0) {
+          centroids[c] = {
+            L: sumL[c] / sumArea[c],
+            a: sumA[c] / sumArea[c],
+            b: sumB[c] / sumArea[c]
+          };
+        }
+      }
+    }
+    const clusters = [];
+    for (let c = 0; c < k; c++) {
+      if (sumArea[c] <= 0) continue;
+      const ctr = centroids[c];
+      const lch = oklabToOklch(ctr);
+      clusters.push({
+        L: ctr.L,
+        a: ctr.a,
+        b: ctr.b,
+        C: lch.C,
+        H: lch.H,
+        areaShare: sumArea[c] / Math.max(1, totalAreaWeight),
+        familyArea: sumArea[c] / Math.max(1, totalAreaWeight)
+      });
+    }
+    if (clusters.length === 0) return null;
+    for (const cl of clusters) {
+      if (cl.C < 0.025) continue;
+      let fam = 0;
+      for (const other of clusters) {
+        if (other.C >= 0.025 && circularHueDistance(cl.H, other.H) <= 32) {
+          fam += other.areaShare;
+        }
+      }
+      cl.familyArea = fam;
+    }
+    const significant = clusters.filter((cl) => cl.areaShare >= 0.015);
+    const evalPool = significant.length > 0 ? significant : clusters;
+    const maxSignificantChroma = Math.max(...evalPool.map((cl) => cl.C));
+    if (maxSignificantChroma < 0.028) {
+      const monoSeed = { L: 0.9, C: 5e-3, H: 225 };
+      return buildPaletteFromOklchSeeds(monoSeed, monoSeed, { L: 0.22, C: 5e-3, H: 225 }, sourceImageUrl);
+    }
+    const hasDominantFamily = evalPool.some(
+      (cl) => cl.C >= 0.03 && cl.L >= 0.14 && cl.L <= 0.9 && cl.familyArea >= 0.14
+    );
+    const accentCandidates = evalPool.filter((cl) => cl.C >= 0.03 && cl.L >= 0.14 && cl.L <= 0.9);
+    const accentPool = accentCandidates.length > 0 ? accentCandidates : evalPool;
+    let primary = accentPool[0];
+    let bestAccentScore = -1;
+    for (const cl of accentPool) {
+      const antiSpeck = hasDominantFamily && cl.familyArea < 0.13 ? Math.pow(cl.familyArea / 0.13, 2.4) : 1;
+      const areaFactor = Math.pow(Math.max(0.01, cl.familyArea), 0.85) * Math.pow(Math.max(0.01, cl.areaShare), 0.3);
+      const chromaFactor = Math.pow(Math.min(cl.C, 0.22), 0.65);
+      const lightnessBalance = clamp(1 - 0.5 * Math.abs(cl.L - 0.54), 0.42, 1);
+      const score = areaFactor * chromaFactor * lightnessBalance * antiSpeck;
+      if (score > bestAccentScore) {
+        bestAccentScore = score;
+        primary = cl;
+      }
+    }
+    let secondary = null;
+    let bestSecondaryScore = -1;
+    for (const cl of evalPool) {
+      if (cl.C < 0.045 || cl.familyArea < 0.06) continue;
+      const dist = circularHueDistance(primary.H, cl.H);
+      if (dist < 26) continue;
+      const score = Math.pow(cl.familyArea, 0.65) * Math.pow(Math.min(cl.C, 0.22), 0.75) * (0.7 + 0.3 * Math.min(1, dist / 90));
+      if (score > bestSecondaryScore) {
+        bestSecondaryScore = score;
+        secondary = cl;
+      }
+    }
+    let ambientCluster = evalPool[0];
+    let bestAmbientScore = -1;
+    for (const cl of evalPool) {
+      const moodWeight = cl.L <= 0.72 ? 1 : 0.45;
+      const chromaHint = 0.75 + Math.min(0.45, cl.C * 2.5);
+      const score = (cl.familyArea * 0.6 + cl.areaShare * 0.4) * moodWeight * chromaHint * (1 - Math.abs(cl.L - 0.32) * 0.35);
+      if (score > bestAmbientScore) {
+        bestAmbientScore = score;
+        ambientCluster = cl;
+      }
+    }
+    const primaryBlend = primary.familyArea >= 0.18 ? 0.14 : 0;
+    const ambientBlendLab = {
+      L: ambientCluster.L * (1 - primaryBlend) + primary.L * primaryBlend,
+      a: ambientCluster.a * (1 - primaryBlend) + primary.a * primaryBlend,
+      b: ambientCluster.b * (1 - primaryBlend) + primary.b * primaryBlend
+    };
+    const ambientLch = oklabToOklch(ambientBlendLab);
+    const primarySeed = {
+      L: clamp(primary.L * 0.35 + 0.49, 0.68, 0.79),
+      C: primary.C < 0.09 ? clamp(primary.C * 1.45, 0.095, 0.175) : clamp(primary.C * 1.16, 0.155, 0.245),
+      H: primary.H
+    };
+    const secondarySeed = secondary ? {
+      L: clamp(secondary.L * 0.35 + 0.47, 0.64, 0.76),
+      C: secondary.C < 0.09 ? clamp(secondary.C * 1.35, 0.09, 0.165) : clamp(secondary.C * 1.12, 0.14, 0.225),
+      H: secondary.H
+    } : {
+      L: clamp(primarySeed.L - 0.03, 0.64, 0.76),
+      C: clamp(primarySeed.C * 0.88, 0.09, 0.22),
+      H: (primarySeed.H + 24) % 360
+    };
+    return buildPaletteFromOklchSeeds(primarySeed, secondarySeed, ambientLch, sourceImageUrl);
+  }
+  function extractCoverVisualData(imageUrl) {
+    return new Promise((resolve) => {
+      if (typeof document === "undefined" || typeof Image === "undefined") {
+        resolve(null);
+        return;
+      }
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      }, 3500);
+      img.onload = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try {
+          const size = 64;
+          const canvas = document.createElement("canvas");
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext("2d", { willReadFrequently: true });
+          if (!ctx) {
+            resolve(null);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, size, size);
+          const { data } = ctx.getImageData(0, 0, size, size);
+          let jpegBase64 = "";
+          if (getConfiguredGeminiApiKey()) {
+            const aiSize = 128;
+            const aiCanvas = document.createElement("canvas");
+            aiCanvas.width = aiSize;
+            aiCanvas.height = aiSize;
+            const aiCtx = aiCanvas.getContext("2d");
+            if (aiCtx) {
+              aiCtx.drawImage(img, 0, 0, aiSize, aiSize);
+              const dataUrl = aiCanvas.toDataURL("image/jpeg", 0.78);
+              const commaIdx = dataUrl.indexOf(",");
+              jpegBase64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : "";
+            }
+          }
+          resolve({ rgba: data, width: size, height: size, jpegBase64 });
+        } catch {
+          resolve(null);
+        }
+      };
+      img.onerror = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(null);
+      };
+      img.src = imageUrl;
+    });
+  }
+  function readAiCacheMap() {
+    try {
+      const raw = localStorage.getItem(AI_PALETTE_CACHE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  function writeAiCacheMap(map) {
+    try {
+      const entries = Object.entries(map);
+      if (entries.length > MAX_CACHE_ENTRIES) {
+        entries.sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0));
+        const trimmed = {};
+        for (const [k, v] of entries.slice(0, MAX_CACHE_ENTRIES)) {
+          trimmed[k] = v;
+        }
+        localStorage.setItem(AI_PALETTE_CACHE_KEY, JSON.stringify(trimmed));
+        return;
+      }
+      localStorage.setItem(AI_PALETTE_CACHE_KEY, JSON.stringify(map));
+    } catch {
+    }
+  }
+  function getCachedAiPalette(imageUrl) {
+    const clean = (imageUrl || "").trim();
+    if (!clean) return null;
+    const map = readAiCacheMap();
+    const entry = map[clean];
+    if (!entry || !entry.palette || !entry.palette.isDynamic) return null;
+    const now = Date.now();
+    if (now - (entry.updatedAt || 0) > 10 * 60 * 1e3) {
+      entry.updatedAt = now;
+      writeAiCacheMap(map);
+    }
+    return { palette: entry.palette, source: entry.source };
+  }
+  function saveCachedAiPalette(imageUrl, palette, source) {
+    const clean = (imageUrl || "").trim();
+    if (!clean || !palette.isDynamic) return;
+    const map = readAiCacheMap();
+    map[clean] = { palette, source, updatedAt: Date.now() };
+    writeAiCacheMap(map);
+  }
+  function isValidGeminiKey(val) {
+    const clean = (val || "").trim();
+    if (!clean || clean === "MY_GEMINI_API_KEY" || clean.length < 16) return "";
+    return clean;
+  }
+  function getConfiguredGeminiApiKey() {
+    try {
+      const stored = isValidGeminiKey(localStorage.getItem(GEMINI_KEY_STORAGE_KEY));
+      if (stored) return stored;
+    } catch {
+    }
+    const bundled = true ? "" : "";
+    return isValidGeminiKey(bundled);
+  }
+  function setGeminiApiKey(apiKey) {
+    const clean = (apiKey || "").trim();
+    try {
+      if (!clean) {
+        localStorage.removeItem(GEMINI_KEY_STORAGE_KEY);
+      } else {
+        localStorage.setItem(GEMINI_KEY_STORAGE_KEY, clean);
+      }
+    } catch {
+    }
+  }
+  function parseGeminiPaletteResponse(rawText) {
+    if (!rawText || typeof rawText !== "string") return null;
+    let cleaned = rawText.trim();
+    const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) cleaned = fenced[1].trim();
+    const braceMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (braceMatch) cleaned = braceMatch[0];
+    try {
+      const parsed = JSON.parse(cleaned);
+      const hexRe = /^#[0-9a-fA-F]{6}$/;
+      const accentHex = typeof parsed.accentHex === "string" ? parsed.accentHex.trim() : "";
+      const accent2Hex = typeof parsed.accent2Hex === "string" ? parsed.accent2Hex.trim() : "";
+      const ambientHex = typeof parsed.ambientHex === "string" ? parsed.ambientHex.trim() : "";
+      if (!hexRe.test(accentHex) || !hexRe.test(accent2Hex) || !hexRe.test(ambientHex)) {
+        return null;
+      }
+      return { accentHex, accent2Hex, ambientHex };
+    } catch {
+      return null;
+    }
+  }
+  async function refinePaletteWithGeminiVision(jpegBase64, trackMeta, sourceImageUrl) {
+    const apiKey = getConfiguredGeminiApiKey();
+    if (!apiKey || !jpegBase64) return null;
+    try {
+      const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+      const trackContext = trackMeta.title ? `Track: "${trackMeta.title}"${trackMeta.artist ? ` by ${trackMeta.artist}` : ""}.` : "";
+      const prompt = `You are a music app art director extracting an Apple Liquid Glass UI color palette from this album cover. ${trackContext} Choose 3 exact #RRGGBB hex colors based on the dominant visual area and overall mood (NEVER let a tiny bright accent spot covering under 15% of the artwork hijack accentHex or ambientHex): 1) accentHex: the dominant iconic color representing the main mood/surface of the cover (balanced for dark glass; preserve cool slate/steel blues or monochrome silver when dominant). 2) accent2Hex: a harmonious secondary color clearly present in the artwork. 3) ambientHex: the deep atmospheric background mood color for frosted glass tinting. Respond ONLY with valid JSON: {"accentHex":"#......","accent2Hex":"#......","ambientHex":"#......"}.`;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: "image/jpeg",
+                    data: jpegBase64
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.2,
+            maxOutputTokens: 160
+          }
+        })
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      const text = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+      const seed = parseGeminiPaletteResponse(text);
+      if (!seed) return null;
+      const palette = buildPaletteFromSeedColors(
+        seed.accentHex,
+        seed.accent2Hex,
+        seed.ambientHex,
+        sourceImageUrl
+      );
+      if (!palette) return null;
+      saveCachedAiPalette(sourceImageUrl, palette, "gemini-vision");
+      return palette;
+    } catch {
+      return null;
+    }
+  }
+
+  // spicetify-cronotofy/src/dynamicTheme.ts
+  var DYNAMIC_THEME_STYLE_ID = "cronotofy-dynamic-theme-style";
+  var LAST_PALETTE_STORAGE_KEY = "cronotofy_last_song_palette_v4";
+  var THEME_ENABLED_STORAGE_KEY = "cronotofy_dynamic_theme_enabled_v1";
+  function loadThemeEnabled() {
+    try {
+      return localStorage.getItem(THEME_ENABLED_STORAGE_KEY) !== "false";
+    } catch {
+      return true;
+    }
+  }
+  function saveThemeEnabled(enabled) {
+    try {
+      localStorage.setItem(THEME_ENABLED_STORAGE_KEY, enabled ? "true" : "false");
+    } catch {
+    }
+  }
+  var DEFAULT_PALETTE = {
+    sourceImageUrl: "",
+    isDynamic: false,
+    accent: "#e2e8f0",
+    accentRgb: "226, 232, 240",
+    accent2: "#94a3b8",
+    accent2Rgb: "148, 163, 184",
+    accentSoft: "#f1f5f9",
+    accentContrast: "#060910",
+    bgMain: "#0b0f17",
+    bgMainRgb: "11, 15, 23",
+    bgElevated: "#131924",
+    bgHighlight: "#1c2433",
+    bgSidebar: "#080b12",
+    bgSidebarRgb: "8, 11, 18",
+    bgPlayer: "#090d16",
+    bgCard: "#111722",
+    bgCardRgb: "17, 23, 34"
+  };
+  function loadPersistedPalette() {
+    try {
+      const raw = localStorage.getItem(LAST_PALETTE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.isDynamic === true && typeof parsed.accent === "string" && typeof parsed.accentRgb === "string" && typeof parsed.bgMainRgb === "string" && typeof parsed.bgCardRgb === "string") {
+        return { ...DEFAULT_PALETTE, ...parsed, isDynamic: true };
+      }
+    } catch {
+    }
+    return null;
+  }
+  function savePersistedPalette(palette) {
+    if (!palette.isDynamic) return;
+    try {
+      localStorage.setItem(LAST_PALETTE_STORAGE_KEY, JSON.stringify(palette));
+    } catch {
+    }
+  }
+  async function extractViaSpicetifyFallback(imageUrl, trackUri) {
+    try {
+      if (trackUri && typeof Spicetify !== "undefined" && Spicetify.colorExtractor) {
+        const colors = await Spicetify.colorExtractor(trackUri);
+        const rawAccent = colors?.VIBRANT || colors?.LIGHT_VIBRANT || colors?.PROMINENT || colors?.DARK_VIBRANT || "";
+        if (hexToRgb(rawAccent)) {
+          const rawAccent2 = colors?.LIGHT_VIBRANT || colors?.DARK_VIBRANT || rawAccent;
+          const rawAmbient = colors?.DARK_VIBRANT || colors?.DESATURATED || rawAccent;
+          return buildPaletteFromSeedColors(rawAccent, rawAccent2, rawAmbient, imageUrl);
+        }
+      }
+    } catch {
+    }
+    return null;
+  }
+  var DYNAMIC_STYLE_CSS = `
+:root {
+  --cronotofy-accent: #e2e8f0;
+  --cronotofy-accent-rgb: 226, 232, 240;
+  --cronotofy-accent-2: #94a3b8;
+  --cronotofy-accent-2-rgb: 148, 163, 184;
+  --cronotofy-accent-soft: #f1f5f9;
+  --cronotofy-accent-contrast: #060910;
+  --cronotofy-bg-main: #0b0f17;
+  --cronotofy-bg-main-rgb: 11, 15, 23;
+  --cronotofy-bg-elevated: #131924;
+  --cronotofy-bg-highlight: #1c2433;
+  --cronotofy-bg-sidebar: #080b12;
+  --cronotofy-bg-sidebar-rgb: 8, 11, 18;
+  --cronotofy-bg-player: #090d16;
+  --cronotofy-bg-card: #111722;
+  --cronotofy-bg-card-rgb: 17, 23, 34;
+}
+
+.Root__main-view,
+.Root__nav-bar,
+.Root__now-playing-bar,
+.main-nowPlayingBar-nowPlayingBar,
+.main-nowPlayingBar-left,
+.Root__right-sidebar,
+#main {
+  transition: background-color 0.7s ease, border-color 0.5s ease;
+}
+
+html.cronotofy-playing-theme {
+  --spice-main: var(--cronotofy-bg-main) !important;
+  --spice-rgb-main: var(--cronotofy-bg-main-rgb) !important;
+  --spice-main-elevated: var(--cronotofy-bg-elevated) !important;
+  --spice-rgb-main-elevated: var(--cronotofy-bg-card-rgb) !important;
+  --spice-sidebar: var(--cronotofy-bg-sidebar) !important;
+  --spice-rgb-sidebar: var(--cronotofy-bg-sidebar-rgb) !important;
+  --spice-player: var(--cronotofy-bg-player) !important;
+  --spice-rgb-player: var(--cronotofy-bg-sidebar-rgb) !important;
+  --spice-card: var(--cronotofy-bg-card) !important;
+  --spice-rgb-card: var(--cronotofy-bg-card-rgb) !important;
+  --spice-highlight: var(--cronotofy-bg-highlight) !important;
+  --spice-rgb-highlight: var(--cronotofy-bg-card-rgb) !important;
+  --spice-highlight-elevated: var(--cronotofy-bg-highlight) !important;
+  --spice-tab-active: var(--cronotofy-bg-highlight) !important;
+  --spice-button: var(--cronotofy-accent) !important;
+  --spice-rgb-button: var(--cronotofy-accent-rgb) !important;
+  --spice-button-active: var(--cronotofy-accent-2) !important;
+  --spice-rgb-button-active: var(--cronotofy-accent-2-rgb) !important;
+}
+
+html.cronotofy-playing-theme .encore-dark-theme,
+html.cronotofy-playing-theme .encore-dark-theme .encore-base-set {
+  --background-base: rgba(var(--cronotofy-bg-main-rgb), 0.18) !important;
+  --background-elevated-base: rgba(var(--cronotofy-bg-card-rgb), 0.24) !important;
+  --background-elevated-highlight: rgba(var(--cronotofy-bg-card-rgb), 0.36) !important;
+  --background-highlight: rgba(255, 255, 255, 0.08) !important;
+  --background-tinted-base: rgba(var(--cronotofy-accent-rgb), 0.12) !important;
+  --section-background-base: rgba(var(--cronotofy-bg-card-rgb), 0.22) !important;
+  --text-bright-accent: var(--cronotofy-accent) !important;
+  --essential-bright-accent: var(--cronotofy-accent) !important;
+}
+
+html.cronotofy-playing-theme .encore-dark-theme .encore-bright-accent-set {
+  --background-base: var(--cronotofy-accent) !important;
+  --background-highlight: var(--cronotofy-accent-2) !important;
+  --text-bright-accent: var(--cronotofy-accent-contrast) !important;
+  --essential-base: var(--cronotofy-accent-contrast) !important;
+}
+
+html.cronotofy-playing-theme .Root__main-view {
+  background-color: rgba(var(--cronotofy-bg-main-rgb), 0.12) !important;
+  background-image:
+    radial-gradient(ellipse at 25% 0%, rgba(var(--cronotofy-accent-rgb), 0.14) 0%, transparent 58%),
+    radial-gradient(ellipse at 85% 95%, rgba(var(--cronotofy-accent-2-rgb), 0.10) 0%, transparent 52%) !important;
+}
+
+html.cronotofy-playing-theme.cronotofy-route-active .Root__main-view {
+  background-color: rgba(var(--cronotofy-bg-main-rgb), 0.04) !important;
+}
+
+html.cronotofy-playing-theme .Root__nav-bar,
+html.cronotofy-playing-theme .Root__right-sidebar,
+html.cronotofy-playing-theme .Root__right-sidebar-peek,
+html.cronotofy-playing-theme .Root__globalNav::before {
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb), 0.26) !important;
+}
+
+html.cronotofy-playing-theme .Root__now-playing-bar {
+  background: transparent !important;
+  background-color: transparent !important;
+  border-top: none !important;
+}
+
+html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar {
+  background: linear-gradient(
+    180deg,
+    rgba(var(--cronotofy-bg-card-rgb), 0.56) 0%,
+    rgba(var(--cronotofy-bg-sidebar-rgb), 0.66) 100%
+  ) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb), 0.22) !important;
+  box-shadow:
+    0 14px 36px -6px rgba(0, 0, 0, 0.64),
+    0 0 24px -10px rgba(var(--cronotofy-accent-rgb), 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+  background: rgba(var(--cronotofy-bg-main-rgb), 0.46) !important;
+  border-color: rgba(var(--cronotofy-accent-rgb), 0.16) !important;
+}
+
+html.cronotofy-playing-theme [data-testid="progress-bar"] [data-testid="progress-bar-background"] > div,
+html.cronotofy-playing-theme .epWhU7hBBosSHKQcommv,
+html.cronotofy-playing-theme .x-progressBar-fillColor {
+  background-color: var(--cronotofy-accent) !important;
+  background: linear-gradient(90deg, var(--cronotofy-accent), var(--cronotofy-accent-2)) !important;
+  box-shadow: none !important;
+}
+`;
+  function ensureDynamicThemeStyle() {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById(DYNAMIC_THEME_STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== DYNAMIC_STYLE_CSS) {
+        existing.textContent = DYNAMIC_STYLE_CSS;
+      }
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = DYNAMIC_THEME_STYLE_ID;
+    style.textContent = DYNAMIC_STYLE_CSS;
+    document.head.appendChild(style);
+  }
+  function applyCssVariables(palette) {
+    if (typeof document === "undefined") return;
+    const rootStyle = document.documentElement.style;
+    rootStyle.setProperty("--cronotofy-accent", palette.accent);
+    rootStyle.setProperty("--cronotofy-accent-rgb", palette.accentRgb);
+    rootStyle.setProperty("--cronotofy-accent-2", palette.accent2);
+    rootStyle.setProperty("--cronotofy-accent-2-rgb", palette.accent2Rgb);
+    rootStyle.setProperty("--cronotofy-accent-soft", palette.accentSoft);
+    rootStyle.setProperty("--cronotofy-accent-contrast", palette.accentContrast);
+    rootStyle.setProperty("--cronotofy-bg-main", palette.bgMain);
+    rootStyle.setProperty("--cronotofy-bg-main-rgb", palette.bgMainRgb);
+    rootStyle.setProperty("--cronotofy-bg-elevated", palette.bgElevated);
+    rootStyle.setProperty("--cronotofy-bg-highlight", palette.bgHighlight);
+    rootStyle.setProperty("--cronotofy-bg-sidebar", palette.bgSidebar);
+    rootStyle.setProperty("--cronotofy-bg-sidebar-rgb", palette.bgSidebarRgb);
+    rootStyle.setProperty("--cronotofy-bg-player", palette.bgPlayer);
+    rootStyle.setProperty("--cronotofy-bg-card", palette.bgCard);
+    rootStyle.setProperty("--cronotofy-bg-card-rgb", palette.bgCardRgb);
+  }
+  var DynamicThemeController = class {
+    constructor() {
+      this.currentPalette = DEFAULT_PALETTE;
+      this.lastTrackSnapshot = null;
+      this.requestSeq = 0;
+      this.enabled = loadThemeEnabled();
+      this.listeners = /* @__PURE__ */ new Set();
+      ensureDynamicThemeStyle();
+      const persisted = this.enabled ? loadPersistedPalette() : null;
+      if (persisted) {
+        this.currentPalette = persisted;
+        applyCssVariables(persisted);
+        if (typeof document !== "undefined") {
+          document.documentElement.classList.add("cronotofy-playing-theme");
+        }
+      } else {
+        applyCssVariables(DEFAULT_PALETTE);
+        if (typeof document !== "undefined") {
+          document.documentElement.classList.remove("cronotofy-playing-theme");
+        }
+      }
+    }
+    notify() {
+      for (const fn of this.listeners) {
+        try {
+          fn();
+        } catch {
+        }
+      }
+    }
+    subscribe(fn) {
+      this.listeners.add(fn);
+      return () => {
+        this.listeners.delete(fn);
+      };
+    }
+    isEnabled() {
+      return this.enabled;
+    }
+    getPalette() {
+      return this.currentPalette;
+    }
+    setEnabled(enabled) {
+      this.enabled = Boolean(enabled);
+      saveThemeEnabled(this.enabled);
+      if (!this.enabled) {
+        ++this.requestSeq;
+        this.currentPalette = DEFAULT_PALETTE;
+        applyCssVariables(DEFAULT_PALETTE);
+        if (typeof document !== "undefined") {
+          document.documentElement.classList.remove("cronotofy-playing-theme");
+        }
+        this.notify();
+        return;
+      }
+      if (this.lastTrackSnapshot) {
+        void this.updateFromLiveTrack(this.lastTrackSnapshot);
+      } else {
+        const persisted = loadPersistedPalette();
+        if (persisted) {
+          this.currentPalette = persisted;
+          applyCssVariables(persisted);
+          if (typeof document !== "undefined") {
+            document.documentElement.classList.add("cronotofy-playing-theme");
+          }
+        }
+        this.notify();
+      }
+    }
+    applyDynamicPalette(palette) {
+      if (!this.enabled) return;
+      this.currentPalette = palette;
+      savePersistedPalette(palette);
+      applyCssVariables(palette);
+      if (typeof document !== "undefined") {
+        document.documentElement.classList.add("cronotofy-playing-theme");
+      }
+      this.notify();
+    }
+    async runCoverAnalysis(imageUrl, trackUri, meta, reqId) {
+      if (!this.enabled) return;
+      const cleanUrl = (imageUrl || "").trim();
+      if (!cleanUrl) return;
+      const hasGemini = Boolean(getConfiguredGeminiApiKey());
+      const cached = getCachedAiPalette(cleanUrl);
+      if (cached) {
+        this.applyDynamicPalette(cached.palette);
+        if (cached.source === "gemini-vision" || !hasGemini) {
+          return;
+        }
+      }
+      const visual = await extractCoverVisualData(cleanUrl);
+      if (reqId !== this.requestSeq || !this.enabled) return;
+      if (!cached) {
+        let localPalette = null;
+        if (visual) {
+          localPalette = quantizePixelsOklab(visual.rgba, visual.width, visual.height, cleanUrl);
+        }
+        if (!localPalette) {
+          localPalette = await extractViaSpicetifyFallback(cleanUrl, trackUri);
+          if (reqId !== this.requestSeq || !this.enabled) return;
+        }
+        if (localPalette && localPalette.isDynamic) {
+          saveCachedAiPalette(cleanUrl, localPalette, "oklab-kmeans");
+          this.applyDynamicPalette(localPalette);
+        }
+      }
+      if (hasGemini && visual?.jpegBase64) {
+        void refinePaletteWithGeminiVision(visual.jpegBase64, meta, cleanUrl).then((refined) => {
+          if (reqId !== this.requestSeq || !this.enabled || !refined) return;
+          this.applyDynamicPalette(refined);
+        });
+      }
+    }
+    async seedFromCoverIfNeeded(imageUrl, trackUri) {
+      if (!this.enabled || this.currentPalette.isDynamic || !imageUrl) return;
+      const reqId = ++this.requestSeq;
+      await this.runCoverAnalysis(imageUrl, trackUri, {}, reqId);
+    }
+    async updateFromLiveTrack(track) {
+      this.lastTrackSnapshot = track;
+      ensureDynamicThemeStyle();
+      if (!this.enabled || !track || !track.albumImageUrl) {
+        return;
+      }
+      const cached = getCachedAiPalette(track.albumImageUrl);
+      const hasGemini = Boolean(getConfiguredGeminiApiKey());
+      if (this.currentPalette.isDynamic && this.currentPalette.sourceImageUrl === track.albumImageUrl && (cached?.source === "gemini-vision" || !hasGemini)) {
+        if (typeof document !== "undefined") {
+          document.documentElement.classList.add("cronotofy-playing-theme");
+        }
+        return;
+      }
+      const reqId = ++this.requestSeq;
+      await this.runCoverAnalysis(
+        track.albumImageUrl,
+        track.uri,
+        { title: track.name, artist: track.artistName },
+        reqId
+      );
+    }
+  };
+
+  // spicetify-cronotofy/src/styles.ts
+  var STYLE_ID = "cronotofy-spicetify-styles";
+  var CSS_TEXT = `
+.cronotofy-page {
+  position: relative;
+  min-height: 100%;
+  overflow-x: clip;
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+}
+
+.cronotofy-page button,
+.cronotofy-page input {
+  font-family: inherit;
+}
+
+.cronotofy-island-anchor {
+  position: sticky;
+  top: 10px;
+  z-index: 60;
+  height: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.cronotofy-island-wrap {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  padding: 0 12px;
+  pointer-events: none;
+  container-type: inline-size;
+  container-name: cronotofy-nav;
+}
+
+.cronotofy-island {
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transform: translate3d(0, -18px, 0) scale(0.92);
+  transform-origin: top center;
+  will-change: transform, opacity;
+  backface-visibility: hidden;
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: 9999px;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.34);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 14px 36px -10px rgba(0, 0, 0, 0.56),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  transition:
+    transform 0.24s cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 0.18s ease-out,
+    visibility 0s linear 0.24s;
+}
+
+.cronotofy-page.is-island-open .cronotofy-island {
+  pointer-events: auto;
+  visibility: visible;
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+  transition:
+    transform 0.44s cubic-bezier(0.22, 1.12, 0.36, 1),
+    opacity 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+    visibility 0s linear 0s;
+}
+
+.cronotofy-island-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  padding: 0 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.cronotofy-island-svg {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  transition: transform 0.16s ease;
+}
+
+.cronotofy-island-brand:hover .cronotofy-island-svg {
+  transform: scale(1.06);
+}
+
+.cronotofy-island-title {
+  font-family: var(--encore-title-font-stack, var(--encore-body-font-stack, SpotifyMixUITitle, SpotifyMixUI, sans-serif));
+  font-size: 15.5px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  line-height: 1.1;
+  background: linear-gradient(135deg, #ffffff 10%, var(--cronotofy-accent-soft, #e2e8f0) 55%, var(--cronotofy-accent-2, #94a3b8) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.cronotofy-root-shell {
+  width: 100%;
+  container-type: inline-size;
+  container-name: cronotofy;
+}
+
+.cronotofy-root {
+  position: relative;
+  z-index: 1;
+  color: #f8fafc;
+  padding: 0 28px 48px;
+  max-width: 1320px;
+  margin: 0 auto;
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+}
+
+.cronotofy-header-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 0 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  transition: opacity 0.22s ease, transform 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.cronotofy-page.is-island-open .cronotofy-header-inline {
+  opacity: 0;
+  transform: translate3d(0, -6px, 0);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cronotofy-island {
+    transform: none;
+    transition: opacity 0.15s ease, visibility 0s linear 0.15s;
+  }
+
+  .cronotofy-page.is-island-open .cronotofy-island {
+    transform: none;
+    transition: opacity 0.15s ease, visibility 0s linear 0s;
+  }
+
+  .cronotofy-header-inline,
+  .cronotofy-page.is-island-open .cronotofy-header-inline {
+    transform: none;
+    transition: opacity 0.15s ease;
+  }
+}
+
+.cronotofy-brand-title,
+.cronotofy-kpi-value,
+.cronotofy-section-title {
+  font-family: var(--encore-title-font-stack, var(--encore-body-font-stack, SpotifyMixUITitle, SpotifyMixUI, sans-serif));
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.45);
+}
+
+.cronotofy-island,
+.cronotofy-island *,
+.cronotofy-root * {
+  box-sizing: border-box;
+}
+
+.cronotofy-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.cronotofy-brand-text {
+  min-width: 0;
+}
+
+.cronotofy-brand-svg {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  transition: transform 0.16s ease;
+}
+
+.cronotofy-brand:hover .cronotofy-brand-svg {
+  transform: scale(1.06);
+}
+
+.cronotofy-brand-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.cronotofy-brand-title {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #ffffff 10%, var(--cronotofy-accent-soft, #e2e8f0) 55%, var(--cronotofy-accent-2, #94a3b8) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  margin: 0;
+  line-height: 1.1;
+}
+
+.cronotofy-brand-credit {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow:
+    0 0 6px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.92),
+    0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.58);
+}
+
+.cronotofy-brand-sub {
+  font-size: 11.5px;
+  color: #cbd5e1;
+  opacity: 0.82;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  max-width: 100%;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 9999px;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 10px 24px -8px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+}
+
+.cronotofy-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.cronotofy-island-tabs {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(0, 0, 0, 0.16);
+  border-color: rgba(255, 255, 255, 0.10);
+  box-shadow: none;
+  min-width: 0;
+}
+
+.cronotofy-tab {
+  padding: 6px 13px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.cronotofy-tab:hover {
+  color: #ffffff;
+}
+
+.cronotofy-tab.active {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.26);
+  color: #ffffff;
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.44);
+  box-shadow: none;
+}
+
+.cronotofy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  box-shadow:
+    0 8px 20px -6px rgba(0, 0, 0, 0.40),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26);
+  color: #f8fafc;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.cronotofy-btn:hover {
+  border-color: rgba(255, 255, 255, 0.28);
+  transform: translateY(-1px);
+}
+
+.cronotofy-btn-primary {
+  background: var(--cronotofy-accent, #e2e8f0);
+  color: var(--cronotofy-accent-contrast, #060910);
+  border: none;
+  font-weight: 700;
+}
+
+.cronotofy-controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.cronotofy-preferences textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 8px 0;
+  color: var(--spice-text, #fff);
+  background: var(--spice-main, #121212);
+}
+
+.cronotofy-preferences summary {
+  cursor: pointer;
+}
+
+.cronotofy-search-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 240px;
+  max-width: 340px;
+  min-width: 180px;
+}
+
+.cronotofy-search-icon {
+  position: absolute;
+  left: 12px;
+  color: rgba(255, 255, 255, 0.52);
+  pointer-events: none;
+}
+
+.cronotofy-search-input {
+  width: 100%;
+  height: 34px;
+  padding: 0 32px 0 34px;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.34);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  color: #f8fafc;
+  font-size: 12px;
+  font-weight: 500;
+  outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.cronotofy-search-input::placeholder {
+  color: rgba(203, 213, 225, 0.62);
+}
+
+.cronotofy-search-input:focus {
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.55);
+  box-shadow: 0 0 0 2px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.18);
+}
+
+.cronotofy-search-clear {
+  position: absolute;
+  right: 8px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+  font-size: 13px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.cronotofy-search-clear:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.cronotofy-periods {
+  display: inline-flex;
+  margin-left: auto;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 14px;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  box-shadow:
+    0 8px 22px -6px rgba(0, 0, 0, 0.40),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26);
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+}
+
+.cronotofy-kpi-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.cronotofy-kpi-head .cronotofy-kpi-label {
+  margin-bottom: 0;
+}
+
+.cronotofy-period-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.cronotofy-period-btn.active {
+  background: linear-gradient(135deg, var(--cronotofy-accent, #e2e8f0), var(--cronotofy-accent-2, #94a3b8));
+  color: var(--cronotofy-accent-contrast, #0b0f17);
+}
+
+.cronotofy-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.cronotofy-card {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 20px;
+  padding: 16px;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  box-shadow:
+    0 12px 32px -10px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.cronotofy-card:hover {
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow:
+    0 14px 36px -10px rgba(0, 0, 0, 0.54),
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.cronotofy-kpi-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #cbd5e1;
+  opacity: 0.8;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.cronotofy-kpi-value {
+  font-size: 24px;
+  font-weight: 800;
+  color: #ffffff;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-kpi-sub {
+  font-size: 12px;
+  color: var(--cronotofy-accent-soft, #e2e8f0);
+  margin-top: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-kpi-sub-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.cronotofy-kpi-sub-row > span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cronotofy-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.cronotofy-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.cronotofy-section-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #ffffff;
+  margin: 0;
+  min-width: 0;
+}
+
+.cronotofy-link-btn {
+  background: transparent;
+  border: none;
+  color: var(--cronotofy-accent-soft, #e2e8f0);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.cronotofy-link-btn:hover {
+  text-decoration: underline;
+}
+
+.cronotofy-link-btn.danger {
+  color: #fca5a5;
+}
+
+.cronotofy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cronotofy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: none;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.cronotofy-row:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.12);
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.26);
+}
+
+.cronotofy-row-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.cronotofy-rank {
+  width: 24px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cronotofy-accent-soft, #e2e8f0);
+  flex-shrink: 0;
+}
+
+.cronotofy-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: rgba(30, 41, 59, 0.8);
+  flex-shrink: 0;
+}
+
+.cronotofy-thumb.circle {
+  border-radius: 9999px;
+}
+
+.cronotofy-row-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.cronotofy-row-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f8fafc;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-row-sub {
+  font-size: 11.5px;
+  color: #cbd5e1;
+  opacity: 0.78;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.cronotofy-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.cronotofy-track-duration {
+  font-size: 11.5px;
+  color: #cbd5e1;
+  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* Authentic Spotify Desktop Playback Buttons */
+.cronotofy-sp-play-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--cronotofy-accent, #e2e8f0);
+  color: var(--cronotofy-accent-contrast, #0b0f17);
+  cursor: pointer;
+  flex-shrink: 0;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.42);
+  transition: transform 0.14s ease, background-color 0.15s ease, filter 0.15s ease;
+}
+
+.cronotofy-sp-play-btn:hover {
+  transform: scale(1.07);
+  filter: brightness(1.08);
+}
+
+.cronotofy-sp-play-btn:active {
+  transform: scale(0.98);
+}
+
+.cronotofy-sp-play-btn.lg {
+  width: 44px;
+  height: 44px;
+}
+
+.cronotofy-sp-icon-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: #cbd5e1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, color 0.15s ease, transform 0.14s ease;
+}
+
+.cronotofy-sp-icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  transform: scale(1.06);
+}
+
+.cronotofy-card-cover-wrap {
+  position: relative;
+}
+
+.cronotofy-card-play-overlay {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.cronotofy-entity-card:hover .cronotofy-card-play-overlay {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.cronotofy-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
+  gap: 14px;
+}
+
+.cronotofy-entity-card {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 20px;
+  padding: 14px;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  box-shadow:
+    0 12px 32px -10px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cronotofy-entity-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.24);
+  box-shadow:
+    0 14px 36px -10px rgba(0, 0, 0, 0.54),
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.cronotofy-entity-cover {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 12px;
+  object-fit: cover;
+  display: block;
+  background: rgba(30, 41, 59, 0.8);
+}
+
+.cronotofy-entity-cover.circle {
+  border-radius: 9999px;
+}
+
+.cronotofy-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.18);
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.34);
+  box-shadow: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.cronotofy-entity-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cronotofy-entity-stat {
+  font-size: 11px;
+  color: #cbd5e1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-genre-bar-bg {
+  width: 100%;
+  height: 7px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.cronotofy-genre-bar-fill {
+  height: 100%;
+  border-radius: 9999px;
+  background: linear-gradient(90deg, var(--cronotofy-accent, #e2e8f0), var(--cronotofy-accent-2, #94a3b8));
+}
+
+.cronotofy-empty {
+  text-align: center;
+  padding: 36px 20px;
+  color: #cbd5e1;
+  opacity: 0.78;
+  font-size: 13px;
+}
+
+/* Container-aware responsive rules for lower Spotify window resolutions */
+@container cronotofy-nav (max-width: 740px) {
+  .cronotofy-island-title {
+    display: none;
+  }
+
+  .cronotofy-island {
+    gap: 8px;
+    padding: 5px 10px;
+  }
+}
+
+@container cronotofy-nav (max-width: 560px) {
+  .cronotofy-island .cronotofy-tab {
+    padding: 5px 9px;
+    font-size: 11px;
+  }
+
+  .cronotofy-island-svg {
+    width: 22px;
+    height: 22px;
+  }
+}
+
+@container cronotofy-nav (max-width: 440px) {
+  .cronotofy-island {
+    gap: 6px;
+    padding: 4px 8px;
+  }
+
+  .cronotofy-island-tabs {
+    flex: 1 1 auto;
+  }
+}
+
+@container cronotofy (max-width: 900px) {
+  .cronotofy-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cronotofy-header-inline {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+}
+
+@container cronotofy (max-width: 780px) {
+  .cronotofy-two-col {
+    grid-template-columns: 1fr;
+  }
+
+  .cronotofy-root {
+    padding: 0 18px 36px;
+  }
+}
+
+@container cronotofy (max-width: 620px) {
+  .cronotofy-root {
+    padding: 0 14px 32px;
+  }
+
+  .cronotofy-card {
+    padding: 13px;
+    border-radius: 16px;
+  }
+
+  .cronotofy-kpi-value {
+    font-size: 20px;
+  }
+
+  .cronotofy-brand-title {
+    font-size: 19px;
+  }
+
+  .cronotofy-brand-credit {
+    font-size: 8.5px;
+  }
+
+  .cronotofy-brand-svg {
+    width: 30px;
+    height: 30px;
+  }
+
+  .cronotofy-brand-sub {
+    display: none;
+  }
+
+  .cronotofy-tab {
+    padding: 5px 10px;
+    font-size: 11.5px;
+  }
+
+  .cronotofy-controls-row {
+    justify-content: flex-start;
+    margin-bottom: 14px;
+  }
+
+  .cronotofy-search-wrap {
+    flex: 1 1 100%;
+    max-width: 100%;
+  }
+
+  .cronotofy-cards-grid {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px;
+  }
+
+  .cronotofy-entity-card {
+    padding: 10px;
+    border-radius: 16px;
+    gap: 8px;
+  }
+
+  .cronotofy-row {
+    gap: 8px;
+    padding: 7px 8px;
+  }
+
+  .cronotofy-row-left {
+    gap: 8px;
+  }
+
+  .cronotofy-rank {
+    width: 20px;
+    font-size: 11px;
+  }
+
+  .cronotofy-thumb {
+    width: 36px;
+    height: 36px;
+  }
+
+  .cronotofy-sp-play-btn {
+    width: 30px;
+    height: 30px;
+  }
+
+  .cronotofy-sp-icon-btn {
+    width: 28px;
+    height: 28px;
+  }
+}
+
+@container cronotofy (max-width: 480px) {
+  .cronotofy-root {
+    padding: 0 10px 26px;
+  }
+
+  .cronotofy-kpi-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .cronotofy-periods {
+    width: 100%;
+  }
+
+  .cronotofy-period-btn {
+    flex: 1;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    white-space: nowrap;
+  }
+
+  .cronotofy-track-duration {
+    display: none;
+  }
+
+  .cronotofy-cards-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .cronotofy-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+  }
+}
+`;
+  function ensureCronotofyStyles() {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById(STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== CSS_TEXT) {
+        existing.textContent = CSS_TEXT;
+      }
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = CSS_TEXT;
+    document.head.appendChild(style);
+  }
+
+  // spicetify-cronotofy/src/app.tsx
+  var FALLBACK_ARTIST_GENRES = {
+    "rauw alejandro": ["reggaeton", "synth-pop", "urbano latino"],
+    "bad bunny": ["reggaeton", "trap latino", "urbano latino"],
+    tainy: ["reggaeton", "electronica latina", "urbano latino"],
+    jhayco: ["reggaeton", "urbano latino", "trap latino"],
+    "jhay cortez": ["reggaeton", "urbano latino", "trap latino"],
+    "milo j": ["rap argentino", "indie urbano", "trap argentino"],
+    "myke towers": ["reggaeton", "trap latino", "urbano latino"],
+    "omar courtz": ["urbano latino", "reggaeton", "trap latino"],
+    feid: ["reggaeton", "pop urbano", "urbano latino"],
+    "karol g": ["reggaeton", "pop latino", "urbano latino"],
+    "eladio carrion": ["trap latino", "hip hop latino", "urbano latino"],
+    "anuel aa": ["reggaeton", "trap latino", "urbano latino"],
+    "young miko": ["urbano latino", "trap latino"],
+    "dei v": ["urbano latino", "reggaeton"],
+    mora: ["reggaeton", "urbano latino"],
+    quevedo: ["pop urbano", "reggaeton"],
+    "alvaro diaz": ["urbano latino", "trap latino", "alt-latin"],
+    "kendrick lamar": ["hip hop", "conscious rap", "west coast rap"],
+    "the weeknd": ["synth-pop", "r&b", "pop"],
+    "travis scott": ["trap", "hip hop", "psychedelic rap"],
+    drake: ["hip hop", "rap", "r&b"],
+    "daft punk": ["electronic", "french house", "synth-pop"],
+    "dua lipa": ["pop", "dance pop", "disco"],
+    "billie eilish": ["alt-pop", "indie pop"],
+    "taylor swift": ["pop", "synth-pop"],
+    "j balvin": ["reggaeton", "urbano latino"],
+    yandel: ["reggaeton", "urbano latino"],
+    arcangel: ["reggaeton", "trap latino"],
+    "jay wheeler": ["reggaeton", "pop urbano", "urbano latino"],
+    clarent: ["urbano latino", "trap latino"],
+    "cris mj": ["reggaeton", "urbano chileno"],
+    "playboi carti": ["trap", "rage", "hip hop"],
+    "kanye west": ["hip hop", "rap"],
+    "juice wrld": ["emo rap", "melodic rap"],
+    future: ["trap", "hip hop"],
+    "metro boomin": ["trap", "hip hop"],
+    bizarrap: ["urbano latino", "electronic"],
+    "wisin & yandel": ["reggaeton", "urbano latino"],
+    "the marias": ["indie pop", "psychedelic soul"]
+  };
+  function normalizeLookupName(name) {
+    return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+  function getFallbackGenresForArtist(name) {
+    const norm = normalizeLookupName(name);
+    if (!norm) return [];
+    if (FALLBACK_ARTIST_GENRES[norm]) return FALLBACK_ARTIST_GENRES[norm];
+    if (norm.length >= 4) {
+      for (const [key, genres] of Object.entries(FALLBACK_ARTIST_GENRES)) {
+        if (key.length >= 4 && (norm.includes(key) || key.includes(norm))) return genres;
+      }
+    }
+    return [];
+  }
+  function formatDurationMs(ms) {
+    const totalSec = Math.max(0, Math.floor((ms || 0) / 1e3));
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}:${s < 10 ? "0" : ""}${s}`;
+  }
+  function CronotofyBrandSvg({
+    accent,
+    accent2,
+    gradId = "crono-app-grad",
+    className = "cronotofy-brand-svg"
+  }) {
+    return /* @__PURE__ */ Spicetify.React.createElement(
+      "svg",
+      {
+        className,
+        viewBox: "0 0 128 128",
+        fill: "none",
+        "aria-label": "Cronotofy Logo"
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("defs", null, /* @__PURE__ */ Spicetify.React.createElement("linearGradient", { id: gradId, x1: "4", y1: "64", x2: "124", y2: "64", gradientUnits: "userSpaceOnUse" }, /* @__PURE__ */ Spicetify.React.createElement("stop", { offset: "0%", stopColor: accent }), /* @__PURE__ */ Spicetify.React.createElement("stop", { offset: "100%", stopColor: accent2 }))),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "66", y: "54", width: "6", height: "20", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "76", y: "46", width: "6", height: "36", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "86", y: "36", width: "6", height: "56", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "96", y: "20", width: "6", height: "88", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "106", y: "34", width: "6", height: "60", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement("rect", { x: "116", y: "50", width: "6", height: "28", rx: "3", fill: `url(#${gradId})` }),
+      /* @__PURE__ */ Spicetify.React.createElement(
+        "path",
+        {
+          d: "M 92.28 112.98 A 56.56 56.56 0 1 1 92.28 15.02 L 87.88 22.64 A 47.76 47.76 0 1 0 87.88 105.36 Z",
+          fill: `url(#${gradId})`
+        }
+      ),
+      /* @__PURE__ */ Spicetify.React.createElement(
+        "path",
+        {
+          d: "M 84.30 99.16 A 40.60 40.60 0 1 1 84.30 28.84 L 79.90 36.46 A 31.80 31.80 0 1 0 79.90 91.54 Z",
+          fill: `url(#${gradId})`
+        }
+      )
+    );
+  }
+  function SpotifyPlayButton({
+    isPlayingThis,
+    size = "sm",
+    playLabel,
+    pauseLabel,
+    onPress
+  }) {
+    const iconSize = size === "lg" ? 18 : 15;
+    return /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: `cronotofy-sp-play-btn ${size === "lg" ? "lg" : ""}`,
+        onClick: (e) => {
+          e.stopPropagation();
+          onPress();
+        },
+        title: isPlayingThis ? pauseLabel : playLabel,
+        "aria-label": isPlayingThis ? pauseLabel : playLabel
+      },
+      isPlayingThis ? /* @__PURE__ */ Spicetify.React.createElement("svg", { width: iconSize, height: iconSize, viewBox: "0 0 24 24", fill: "currentColor", "aria-hidden": "true" }, /* @__PURE__ */ Spicetify.React.createElement("path", { d: "M5.7 3a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7H5.7zm10 0a.7.7 0 0 0-.7.7v16.6a.7.7 0 0 0 .7.7h2.6a.7.7 0 0 0 .7-.7V3.7a.7.7 0 0 0-.7-.7h-2.6z" })) : /* @__PURE__ */ Spicetify.React.createElement("svg", { width: iconSize, height: iconSize, viewBox: "0 0 24 24", fill: "currentColor", "aria-hidden": "true" }, /* @__PURE__ */ Spicetify.React.createElement("path", { d: "M7.05 3.606l13.49 7.788a.7.7 0 0 1 0 1.212L7.05 20.394A.7.7 0 0 1 6 19.788V4.212a.7.7 0 0 1 1.05-.606z" }))
+    );
+  }
+  function SpotifyQueueButton({
+    tooltip,
+    onQueue
+  }) {
+    return /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-sp-icon-btn",
+        onClick: (e) => {
+          e.stopPropagation();
+          onQueue();
+        },
+        title: tooltip,
+        "aria-label": tooltip
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("svg", { width: "16", height: "16", viewBox: "0 0 16 16", fill: "currentColor", "aria-hidden": "true" }, /* @__PURE__ */ Spicetify.React.createElement("path", { d: "M16 15H2v-1.5h14V15zm0-4.5H2V9h14v1.5zm-8.034-6A5.484 5.484 0 0 1 7.187 6H13.5a2.5 2.5 0 0 0 0-5H7.966c.159.474.255.978.278 1.5H13.5a1 1 0 1 1 0 2H7.966zM2 2V0h1.5v2h2v1.5h-2v2H2v-2H0V2h2z" }))
+    );
+  }
+  var EMPTY_SNAPSHOT = {
+    userId: "",
+    totalSeconds: 0,
+    todaySeconds: 0,
+    todayDate: "",
+    currentTrackSeconds: 0,
+    streakDays: 0,
+    last7DaysSeconds: 0,
+    tracks: [],
+    recentPlays: []
+  };
+  function CronotofyApp() {
+    ensureCronotofyStyles();
+    ensureDynamicThemeStyle();
+    const { useState, useEffect, useMemo, useCallback, useRef } = Spicetify.React;
+    const [language, setLanguage] = useState(readLanguagePreference);
+    const { t, rawLocale, lang } = useMemo(() => getTranslations(language), [language]);
+    const [, languageLabel, automaticLabel] = LANGUAGE_OPTIONS[lang];
+    const [preset, setPreset] = useState(readVisualPreset);
+    const [sharedSettings, setSharedSettings] = useState("");
+    const [settingsError, setSettingsError] = useState(false);
+    const onboardingKey = "cronotofy_intro_dismissed";
+    const [showIntro, setShowIntro] = useState(() => !readStoredPreference(onboardingKey));
+    const [preferencesLabel, presetLabel, animatedLabel, stillLabel, focusLabel, copyLabel, applyLabel, invalidLabel, intro, dismissLabel] = PREFERENCE_LABELS[lang];
+    const el = Spicetify.React.createElement;
+    const applyPreset = (next) => {
+      saveStoredPreference(VISUAL_PRESET_KEY, next);
+      window.__CRONOTOFY_MOD__?.setVisualPreset?.(next);
+      setPreset(next);
+    };
+    const applyLanguage = (next) => {
+      saveStoredPreference(LANGUAGE_STORAGE_KEY, next);
+      setLanguage(next);
+    };
+    const languageControl = Spicetify.React.createElement("select", {
+      "aria-label": languageLabel,
+      title: languageLabel,
+      className: "cronotofy-tab",
+      value: language,
+      onChange: (event) => applyLanguage(event.currentTarget.value)
+    }, Spicetify.React.createElement("option", { value: "" }, automaticLabel),
+    ...Object.entries(LANGUAGE_OPTIONS).map(([code, [name]]) =>
+      Spicetify.React.createElement("option", { key: code, value: code, lang: code }, name)
+    ));
+    const preferences = el("details", { className: "cronotofy-preferences" },
+      el("summary", null, preferencesLabel),
+      el("label", null, presetLabel, el("select", {
+        className: "cronotofy-tab",
+        value: preset,
+        onChange: (event) => applyPreset(event.currentTarget.value)
+      }, ...[animatedLabel, stillLabel, focusLabel].map((label, index) =>
+        el("option", { key: VISUAL_PRESETS[index], value: VISUAL_PRESETS[index] }, label)
+      ))),
+      el("textarea", {
+        "aria-label": preferencesLabel, rows: 2, maxLength: 1024, value: sharedSettings,
+        onChange: (event) => {
+          setSettingsError(false);
+          setSharedSettings(event.currentTarget.value);
+        }
+      }),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        const settings = JSON.stringify({ version: 1, language, preset });
+        setSharedSettings(settings);
+        setSettingsError(false);
+        void navigator.clipboard?.writeText(settings).catch(() => {});
+      } }, copyLabel),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        const settings = parseSharedPreferences(sharedSettings);
+        setSettingsError(!settings);
+        if (settings) {
+          applyLanguage(settings.language);
+          applyPreset(settings.preset);
+        }
+      } }, applyLabel),
+      settingsError && el("p", { role: "alert" }, invalidLabel)
+    );
+    const onboarding = showIntro && el("div", { className: "cronotofy-controls-row" },
+      el("span", null, intro),
+      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
+        saveStoredPreference(onboardingKey, "1");
+        setShowIntro(false);
+      } }, dismissLabel)
+    );
+    const [activeTab, setActiveTab] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTab);
+    const [timeRange, setTimeRange] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTimeRange);
+    const [searchQuery, setSearchQuery] = useState("");
+    const [confirmClear, setConfirmClear] = useState(false);
+    const [user, setUser] = useState(null);
+    const [topTracks, setTopTracks] = useState([]);
+    const [topArtists, setTopArtists] = useState([]);
+    const [recentApiCount, setRecentApiCount] = useState(0);
+    const [loading, setLoading] = useState(true);
+    const [liveTrack, setLiveTrack] = useState(
+      () => window.__CRONOTOFY_MOD__?.getLiveTrack() ?? extractLiveTrackFromPlayer()
+    );
+    const [snapshot, setSnapshot] = useState(
+      () => window.__CRONOTOFY_MOD__?.getTrackerSnapshot() ?? EMPTY_SNAPSHOT
+    );
+    const [palette, setPalette] = useState(
+      () => window.__CRONOTOFY_MOD__?.getDynamicPalette?.() ?? DEFAULT_PALETTE
+    );
+    const pageRef = useRef(null);
+    const headerRef = useRef(null);
+    const islandRef = useRef(null);
+    const syncIslandRef = useRef(null);
+    const loadSeqRef = useRef(0);
+    useEffect(() => {
+      document.documentElement.classList.add("cronotofy-route-active");
+      return () => {
+        document.documentElement.classList.remove("cronotofy-route-active");
+      };
+    }, []);
+    useEffect(() => {
+      const pageEl = pageRef.current;
+      if (!pageEl) return;
+      const findScrollParent2 = (el) => {
+        let cur = el?.parentElement || null;
+        while (cur) {
+          const style = window.getComputedStyle(cur);
+          if (style.overflowY === "auto" || style.overflowY === "scroll" || cur.hasAttribute("data-overlayscrollbars-viewport") || cur.classList.contains("os-viewport")) {
+            return cur;
+          }
+          cur = cur.parentElement;
+        }
+        return document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".main-view-container__scroll-node") || document.querySelector("[data-overlayscrollbars-viewport]");
+      };
+      const scrollContainer = findScrollParent2(pageEl);
+      let openThreshold = 60;
+      let closeThreshold = 28;
+      const measureThresholds = () => {
+        openThreshold = Math.max(56, Math.round((headerRef.current?.offsetHeight || 72) - 12));
+        closeThreshold = Math.max(20, openThreshold - 32);
+      };
+      let rafId = 0;
+      const syncNow = () => {
+        const top = scrollContainer ? scrollContainer.scrollTop : window.scrollY;
+        const isOpen = pageEl.classList.contains("is-island-open");
+        const nextOpen = isOpen ? top > closeThreshold : top >= openThreshold;
+        if (nextOpen !== isOpen) {
+          pageEl.classList.toggle("is-island-open", nextOpen);
+          islandRef.current?.setAttribute("aria-hidden", nextOpen ? "false" : "true");
+        }
+      };
+      syncIslandRef.current = syncNow;
+      const scheduleSync = () => {
+        if (rafId) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = 0;
+          syncNow();
+        });
+      };
+      const onResize = () => {
+        measureThresholds();
+        scheduleSync();
+      };
+      measureThresholds();
+      syncNow();
+      if (scrollContainer) {
+        scrollContainer.addEventListener("scroll", scheduleSync, { passive: true });
+      }
+      window.addEventListener("scroll", scheduleSync, { passive: true });
+      window.addEventListener("resize", onResize, { passive: true });
+      return () => {
+        if (rafId) cancelAnimationFrame(rafId);
+        syncIslandRef.current = null;
+        if (scrollContainer) {
+          scrollContainer.removeEventListener("scroll", scheduleSync);
+        }
+        window.removeEventListener("scroll", scheduleSync);
+        window.removeEventListener("resize", onResize);
+      };
+    }, []);
+    useEffect(() => {
+      const id = requestAnimationFrame(() => {
+        syncIslandRef.current?.();
+      });
+      return () => cancelAnimationFrame(id);
+    }, [activeTab]);
+    const scrollToTop = useCallback(() => {
+      const viewport = pageRef.current?.closest("#cronotofy-ext-host") || pageRef.current?.closest("[data-overlayscrollbars-viewport]") || document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".main-view-container__scroll-node") || document.querySelector("[data-overlayscrollbars-viewport]");
+      if (viewport && typeof viewport.scrollTo === "function") {
+        viewport.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+    }, []);
+    useEffect(() => {
+      const syncBridgeState = () => {
+        const bridge = window.__CRONOTOFY_MOD__;
+        if (bridge) {
+          setLiveTrack(bridge.getLiveTrack());
+          setSnapshot(bridge.getTrackerSnapshot());
+          if (bridge.getDynamicPalette) {
+            setPalette(bridge.getDynamicPalette());
+          }
+        } else {
+          setLiveTrack(extractLiveTrackFromPlayer());
+        }
+      };
+      syncBridgeState();
+      const unsub = window.__CRONOTOFY_MOD__?.subscribe(syncBridgeState);
+      const fallbackTimer = setInterval(syncBridgeState, 2e3);
+      return () => {
+        if (unsub) unsub();
+        clearInterval(fallbackTimer);
+      };
+    }, []);
+    useEffect(() => {
+      setSearchQuery("");
+      setConfirmClear(false);
+    }, [activeTab]);
+    useEffect(() => {
+      if (!confirmClear) return;
+      const timer = setTimeout(() => setConfirmClear(false), 4e3);
+      return () => clearTimeout(timer);
+    }, [confirmClear]);
+    const loadAnalyticsData = useCallback(async (range) => {
+      const seq = ++loadSeqRef.current;
+      setLoading(true);
+      try {
+        const bridgeUser = window.__CRONOTOFY_MOD__ ? await window.__CRONOTOFY_MOD__.getUser() : await resolveCurrentSpotifyUser();
+        if (seq !== loadSeqRef.current) return;
+        if (bridgeUser) {
+          setUser(bridgeUser);
+        }
+        const [desktopTop, libTracks, libAlbums, libArtists] = await Promise.all([
+          fetchTopContentFromDesktop(range, 50).catch(() => ({ tracks: [], artists: [] })),
+          fetchLibraryTracksFromDesktop(150).catch(() => []),
+          fetchLibraryAlbumsFromDesktop(100).catch(() => []),
+          fetchLibraryArtistsFromDesktop(50).catch(() => [])
+        ]);
+        if (seq !== loadSeqRef.current) return;
+        let tracksRes = null;
+        let artistsRes = null;
+        if (desktopTop.tracks.length === 0 && desktopTop.artists.length === 0 && Spicetify?.CosmosAsync?.get) {
+          [tracksRes, artistsRes] = await Promise.all([
+            Spicetify.CosmosAsync.get(
+              `https://api.spotify.com/v1/me/top/tracks?time_range=${range}&limit=50`
+            ).catch(() => null),
+            Spicetify.CosmosAsync.get(
+              `https://api.spotify.com/v1/me/top/artists?time_range=${range}&limit=50`
+            ).catch(() => null)
+          ]);
+          if (seq !== loadSeqRef.current) return;
+        }
+        const localSnap = window.__CRONOTOFY_MOD__?.getTrackerSnapshot?.() ?? EMPTY_SNAPSHOT;
+        setRecentApiCount(localSnap.recentPlays.length);
+        const mappedTracks = [];
+        const seenTrackIds = /* @__PURE__ */ new Set();
+        const pushApiTrack = (tr) => {
+          if (!tr || !tr.id) return;
+          const id = String(tr.id);
+          if (seenTrackIds.has(id)) return;
+          seenTrackIds.add(id);
+          const artistsArr = Array.isArray(tr.artists) ? tr.artists.filter((a) => a?.name).map((a) => ({
+            id: a?.id ? String(a.id) : void 0,
+            name: String(a.name)
+          })) : [];
+          mappedTracks.push({
+            id,
+            uri: String(tr.uri || `spotify:track:${id}`),
+            name: String(tr.name || t.entities.untitled),
+            artistName: artistsArr.map((a) => a.name).join(", ") || t.entities.unknownArtist,
+            artistId: artistsArr[0]?.id,
+            artistNamesList: artistsArr,
+            albumId: tr.album?.id ? String(tr.album.id) : void 0,
+            albumName: String(tr.album?.name || ""),
+            albumImageUrl: normalizeSpotifyImage(tr.album?.images?.[0]?.url),
+            durationMs: Number(tr.duration_ms || 0),
+            popularity: Number(tr.popularity || 0)
+          });
+        };
+        if (desktopTop.tracks.length > 0) {
+          for (const tr of desktopTop.tracks) pushApiTrack(tr);
+        }
+        if (mappedTracks.length === 0 && tracksRes && Array.isArray(tracksRes.items)) {
+          for (const tr of tracksRes.items) pushApiTrack(tr);
+        }
+        if (mappedTracks.length === 0 && libTracks.length > 0) {
+          for (const tr of libTracks) {
+            pushApiTrack(tr);
+            if (mappedTracks.length >= 50) break;
+          }
+        }
+        if (mappedTracks.length === 0 && localSnap.tracks.length > 0) {
+          for (const tr of localSnap.tracks.slice(0, 50)) {
+            if (!tr.id || seenTrackIds.has(tr.id)) continue;
+            seenTrackIds.add(tr.id);
+            mappedTracks.push({
+              id: tr.id,
+              uri: tr.uri,
+              name: tr.name,
+              artistName: tr.artistName,
+              artistId: tr.artistId,
+              artistNamesList: tr.artistName.split(",").map((s, idx) => ({ id: idx === 0 ? tr.artistId : void 0, name: s.trim() })).filter((x) => Boolean(x.name)),
+              albumName: tr.albumName,
+              albumImageUrl: tr.albumImageUrl,
+              durationMs: tr.durationMs
+            });
+          }
+        }
+        setTopTracks(mappedTracks);
+        const rawArtistSource = desktopTop.artists.length > 0 ? desktopTop.artists : artistsRes && Array.isArray(artistsRes.items) ? artistsRes.items : [];
+        const hasNativePortraitIds = /* @__PURE__ */ new Set();
+        const rawTopArtists = rawArtistSource.filter((a) => a && a.id && a.name).map((a) => {
+          const id = String(a.id);
+          const name = String(a.name);
+          const imageUrl = normalizeSpotifyImage(a.images?.[0]?.url);
+          if (imageUrl) hasNativePortraitIds.add(id);
+          return {
+            id,
+            uri: String(a.uri || `spotify:artist:${id}`),
+            name,
+            imageUrl,
+            genres: Array.isArray(a.genres) && a.genres.length > 0 ? a.genres.map(String) : getFallbackGenresForArtist(name),
+            popularity: Number(a.popularity || 0),
+            followers: Number(a.followers?.total || 0)
+          };
+        });
+        const reconciled = reconcileTopArtists({
+          rawTopArtists,
+          periodTracks: mappedTracks,
+          likedTracks: libTracks,
+          savedAlbums: libAlbums,
+          followedArtists: libArtists,
+          trackedTracks: localSnap.tracks,
+          minTargetCount: 15,
+          getGenresForName: getFallbackGenresForArtist
+        });
+        const mappedArtists = reconciled.map((a) => ({
+          id: a.id,
+          uri: a.uri,
+          name: a.name,
+          imageUrl: a.imageUrl,
+          genres: a.genres.length > 0 ? a.genres : getFallbackGenresForArtist(a.name),
+          popularity: a.popularity,
+          followers: a.followers,
+          affinityScore: a.affinityScore,
+          periodTrackCount: a.periodTrackCount,
+          trackedSeconds: a.trackedSeconds
+        }));
+        setTopArtists(mappedArtists);
+        const needPortraitIds = mappedArtists.filter((a) => !a.id.startsWith("local:") && (!hasNativePortraitIds.has(a.id) || !a.imageUrl)).slice(0, 10).map((a) => a.id);
+        if (needPortraitIds.length > 0) {
+          void Promise.all(
+            needPortraitIds.map(async (id) => ({ id, info: await fetchArtistAvatarFromDesktop(id) }))
+          ).then((avatars) => {
+            if (seq !== loadSeqRef.current) return;
+            const byId = /* @__PURE__ */ new Map();
+            for (const item of avatars) {
+              if (item.info?.imageUrl) byId.set(item.id, item.info.imageUrl);
+            }
+            if (byId.size > 0) {
+              setTopArtists(
+                (prev) => prev.map((art) => byId.has(art.id) ? { ...art, imageUrl: byId.get(art.id) } : art)
+              );
+            }
+          });
+        }
+        if (CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall && document.documentElement.dataset.cronotofyPreset !== "focus") {
+          const seedCovers = [];
+          for (const tr of mappedTracks) {
+            if (tr.albumImageUrl) {
+              seedCovers.push({
+                id: tr.albumId || tr.id,
+                title: tr.albumName || tr.name,
+                artistName: tr.artistName,
+                imageUrl: tr.albumImageUrl
+              });
+            }
+          }
+          for (const alb of libAlbums) {
+            if (alb.imageUrl) {
+              seedCovers.push({
+                id: alb.id,
+                title: alb.name,
+                artistName: alb.artistName,
+                imageUrl: alb.imageUrl
+              });
+            }
+          }
+          for (const tr of libTracks) {
+            const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
+            if (img) {
+              seedCovers.push({
+                id: String(tr.album?.id || tr.id || img),
+                title: String(tr.album?.name || tr.name || ""),
+                artistName: String(tr.artists?.[0]?.name || ""),
+                imageUrl: img
+              });
+            }
+          }
+          if (seedCovers.length > 0) {
+            window.__CRONOTOFY_MOD__?.updateWallCovers?.(seedCovers);
+          }
+          const artistCandidates = mappedArtists.slice(0, 16).map((a) => ({
+            id: a.id.startsWith("local:") ? void 0 : a.id,
+            name: a.name
+          }));
+          const enrichedWall = await collectFavoriteArtistCovers({
+            userId: bridgeUser?.id || "default",
+            artistCandidates,
+            seedTrackCovers: seedCovers
+          });
+          if (seq !== loadSeqRef.current) return;
+          if (enrichedWall.length > 0) {
+            window.__CRONOTOFY_MOD__?.updateWallCovers?.(enrichedWall);
+          }
+        }
+      } finally {
+        if (seq === loadSeqRef.current) {
+          setLoading(false);
+        }
+      }
+    }, [t]);
+    const formatArtistStat = (artist) => {
+      if (artist.popularity > 0) return t.entities.popularityLabel(artist.popularity);
+      if (artist.periodTrackCount && artist.periodTrackCount > 0) {
+        return t.entities.topTracksCount(artist.periodTrackCount);
+      }
+      if (artist.trackedSeconds && artist.trackedSeconds > 0) {
+        return formatSecondsHuman(artist.trackedSeconds);
+      }
+      return t.entities.spotifyArtist;
+    };
+    useEffect(() => {
+      void loadAnalyticsData(timeRange);
+    }, [timeRange, loadAnalyticsData]);
+    const handlePlayOrToggleUri = async (uri, title) => {
+      try {
+        if (liveTrack && liveTrack.uri === uri) {
+          Spicetify?.Player?.togglePlay?.();
+          return;
+        }
+        await Spicetify?.Player?.playUri?.(uri);
+        Spicetify?.showNotification?.(t.actions.playingNowToast(title));
+      } catch {
+        Spicetify?.showNotification?.(t.actions.playbackErrorToast, true);
+      }
+    };
+    const handleQueueTrack = async (uri, title) => {
+      try {
+        await Spicetify?.addToQueue?.([{ uri }]);
+        Spicetify?.showNotification?.(t.actions.queuedToast(title));
+      } catch {
+        Spicetify?.showNotification?.(t.actions.queueErrorToast, true);
+      }
+    };
+    const navigateToSpotifyEntity = (type, id) => {
+      if (!id || id.startsWith("local:")) return;
+      Spicetify?.Platform?.History?.push?.(`/${type}/${id}`);
+    };
+    const aggregatedAlbums = useMemo(() => {
+      const map = /* @__PURE__ */ new Map();
+      topTracks.forEach((tr, idx) => {
+        if (!tr.albumName) return;
+        const key = tr.albumId || `${tr.albumName}::${tr.artistName}`;
+        const existing = map.get(key);
+        if (existing) {
+          existing.trackCount += 1;
+        } else {
+          map.set(key, {
+            id: tr.albumId || key,
+            uri: tr.albumId ? `spotify:album:${tr.albumId}` : void 0,
+            name: tr.albumName,
+            artistName: tr.artistName,
+            imageUrl: tr.albumImageUrl,
+            trackCount: 1,
+            topRank: idx + 1
+          });
+        }
+      });
+      return Array.from(map.values()).sort(
+        (a, b) => b.trackCount !== a.trackCount ? b.trackCount - a.trackCount : a.topRank - b.topRank
+      );
+    }, [topTracks]);
+    const genreStats = useMemo(() => {
+      const counts = /* @__PURE__ */ new Map();
+      let totalTags = 0;
+      topArtists.forEach((artist, idx) => {
+        const weight = Math.max(1, topArtists.length - idx);
+        for (const g of artist.genres.slice(0, 3)) {
+          const clean = g.trim();
+          if (!clean) continue;
+          counts.set(clean, (counts.get(clean) || 0) + weight);
+          totalTags += weight;
+        }
+      });
+      return Array.from(counts.entries()).map(([genre, score]) => ({
+        genre,
+        pct: totalTags > 0 ? Math.round(score / totalTags * 100) : 0
+      })).sort((a, b) => b.pct - a.pct).slice(0, 6);
+    }, [topArtists]);
+    const trackedArtistsSummary = useMemo(() => {
+      const map = /* @__PURE__ */ new Map();
+      for (const tr of snapshot.tracks) {
+        const primary = tr.artistName.split(",")[0].trim() || tr.artistName;
+        const prev = map.get(primary);
+        if (prev) {
+          prev.totalSeconds += tr.totalSeconds;
+          prev.plays += tr.playCount;
+          if (!prev.artistId && tr.artistId) prev.artistId = tr.artistId;
+        } else {
+          map.set(primary, {
+            name: primary,
+            artistId: tr.artistId,
+            totalSeconds: tr.totalSeconds,
+            plays: tr.playCount
+          });
+        }
+      }
+      return Array.from(map.values()).sort((a, b) => b.totalSeconds - a.totalSeconds).slice(0, 10);
+    }, [snapshot.tracks]);
+    const normalizedFilter = useMemo(() => normalizeLookupName(searchQuery), [searchQuery]);
+    const filteredArtists = useMemo(() => {
+      if (!normalizedFilter) return topArtists;
+      return topArtists.filter(
+        (a) => normalizeLookupName(a.name).includes(normalizedFilter) || a.genres.some((g) => normalizeLookupName(g).includes(normalizedFilter))
+      );
+    }, [topArtists, normalizedFilter]);
+    const filteredTracks = useMemo(() => {
+      if (!normalizedFilter) return topTracks;
+      return topTracks.filter(
+        (tr) => normalizeLookupName(tr.name).includes(normalizedFilter) || normalizeLookupName(tr.artistName).includes(normalizedFilter) || normalizeLookupName(tr.albumName).includes(normalizedFilter)
+      );
+    }, [topTracks, normalizedFilter]);
+    const filteredAlbums = useMemo(() => {
+      if (!normalizedFilter) return aggregatedAlbums;
+      return aggregatedAlbums.filter(
+        (alb) => normalizeLookupName(alb.name).includes(normalizedFilter) || normalizeLookupName(alb.artistName).includes(normalizedFilter)
+      );
+    }, [aggregatedAlbums, normalizedFilter]);
+    const filteredLiveTracks = useMemo(() => {
+      if (!normalizedFilter) return snapshot.tracks;
+      return snapshot.tracks.filter(
+        (tr) => normalizeLookupName(tr.name).includes(normalizedFilter) || normalizeLookupName(tr.artistName).includes(normalizedFilter) || normalizeLookupName(tr.albumName).includes(normalizedFilter)
+      );
+    }, [snapshot.tracks, normalizedFilter]);
+    const filteredRecentPlays = useMemo(() => {
+      if (!normalizedFilter) return snapshot.recentPlays;
+      return snapshot.recentPlays.filter(
+        (p) => normalizeLookupName(p.name).includes(normalizedFilter) || normalizeLookupName(p.artistName).includes(normalizedFilter) || normalizeLookupName(p.albumName).includes(normalizedFilter)
+      );
+    }, [snapshot.recentPlays, normalizedFilter]);
+    const topGenre = genreStats[0];
+    const topArtist = topArtists[0];
+    const topTrack = topTracks[0];
+    const periodLabels = {
+      short_term: t.periods.short_term,
+      medium_term: t.periods.medium_term,
+      long_term: t.periods.long_term
+    };
+    const tabItems = [
+      { id: "overview", label: t.tabs.overview },
+      { id: "artists", label: t.tabs.artists },
+      { id: "tracks", label: t.tabs.tracks },
+      { id: "albums", label: t.tabs.albums },
+      { id: "live", label: t.tabs.live }
+    ];
+    return /* @__PURE__ */ Spicetify.React.createElement("div", { ref: pageRef, className: "cronotofy-page" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-island-anchor" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-island-wrap" }, /* @__PURE__ */ Spicetify.React.createElement("div", { ref: islandRef, className: "cronotofy-island", "aria-hidden": "true" }, /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-island-brand",
+        onClick: () => {
+          setActiveTab("overview");
+          scrollToTop();
+        }
+      },
+      /* @__PURE__ */ Spicetify.React.createElement(
+        CronotofyBrandSvg,
+        {
+          accent: palette.accent,
+          accent2: palette.accent2,
+          gradId: "crono-island-grad",
+          className: "cronotofy-island-svg"
+        }
+      ),
+      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-island-title" }, "Cronotofy")
+    ), /* @__PURE__ */ Spicetify.React.createElement("nav", { className: "cronotofy-tabs cronotofy-island-tabs" }, tabItems.map((tab) => /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        key: tab.id,
+        type: "button",
+        className: `cronotofy-tab ${activeTab === tab.id ? "active" : ""}`,
+        onClick: () => {
+          setActiveTab(tab.id);
+          scrollToTop();
+        }
+      },
+      tab.label
+    )))))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-root-shell" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-root" }, /* @__PURE__ */ Spicetify.React.createElement("header", { ref: headerRef, className: "cronotofy-header-inline" }, /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-brand",
+        onClick: () => {
+          setActiveTab("overview");
+          scrollToTop();
+        }
+      },
+      /* @__PURE__ */ Spicetify.React.createElement(
+        CronotofyBrandSvg,
+        {
+          accent: palette.accent,
+          accent2: palette.accent2,
+          gradId: "crono-header-grad"
+        }
+      ),
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-brand-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-brand-heading" }, /* @__PURE__ */ Spicetify.React.createElement("h1", { className: "cronotofy-brand-title" }, "Cronotofy"), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-brand-credit" }, "By EdwHtx")), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-brand-sub" }, t.brandSubtitle))
+    ), /* @__PURE__ */ Spicetify.React.createElement("nav", { className: "cronotofy-tabs" }, tabItems.map((tab) => /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        key: tab.id,
+        type: "button",
+        className: `cronotofy-tab ${activeTab === tab.id ? "active" : ""}`,
+        onClick: () => {
+          setActiveTab(tab.id);
+          scrollToTop();
+        }
+      },
+      tab.label
+    )))), onboarding, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-row" }, languageControl, preferences, activeTab !== "overview" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-search-wrap" }, /* @__PURE__ */ Spicetify.React.createElement(
+      "svg",
+      {
+        className: "cronotofy-search-icon",
+        width: "14",
+        height: "14",
+        viewBox: "0 0 24 24",
+        fill: "none",
+        stroke: "currentColor",
+        strokeWidth: "2",
+        strokeLinecap: "round",
+        strokeLinejoin: "round",
+        "aria-hidden": "true"
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("circle", { cx: "11", cy: "11", r: "8" }),
+      /* @__PURE__ */ Spicetify.React.createElement("path", { d: "m21 21-4.3-4.3" })
+    ), /* @__PURE__ */ Spicetify.React.createElement(
+      "input",
+      {
+        type: "text",
+        className: "cronotofy-search-input",
+        value: searchQuery,
+        placeholder: t.search.placeholder,
+        "aria-label": t.search.placeholder,
+        onChange: (e) => setSearchQuery(e.target.value),
+        onKeyDown: (e) => {
+          if (e.key === "Escape" && searchQuery) {
+            e.preventDefault();
+            e.stopPropagation();
+            setSearchQuery("");
+          }
+        }
+      }
+    ), searchQuery && /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-search-clear",
+        "aria-label": t.search.clear,
+        title: t.search.clear,
+        onClick: () => setSearchQuery("")
+      },
+      "\xD7"
+    )), activeTab !== "live" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-periods" }, ["short_term", "medium_term", "long_term"].map((r) => /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        key: r,
+        type: "button",
+        className: `cronotofy-period-btn ${timeRange === r ? "active" : ""}`,
+        onClick: () => setTimeRange(r)
+      },
+      periodLabels[r]
+    )))), loading && topTracks.length === 0 && activeTab !== "live" ? /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty" }, t.loadingAnalytics) : null, activeTab === "overview" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-head" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.recordedTime), snapshot.streakDays >= 2 && /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.streak.daysBadge(snapshot.streakDays))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.kpis.todayLabel, " \xB7 ", t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds)))), /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        className: "cronotofy-card",
+        style: { cursor: topArtist && !topArtist.id.startsWith("local:") ? "pointer" : "default" },
+        onClick: () => navigateToSpotifyEntity("artist", topArtist?.id)
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.topArtist(periodLabels[timeRange])),
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, topArtist ? topArtist.name : "\u2014"),
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, topArtist?.genres?.[0] ? topArtist.genres[0] : t.kpis.artistsAnalyzed(topArtists.length))
+    ), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.topTrack(periodLabels[timeRange])), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, topTrack ? topTrack.name : "\u2014"), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub cronotofy-kpi-sub-row" }, /* @__PURE__ */ Spicetify.React.createElement("span", null, topTrack ? topTrack.artistName : t.kpis.noData), topTrack && /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyPlayButton,
+      {
+        isPlayingThis: Boolean(liveTrack && liveTrack.uri === topTrack.uri && liveTrack.isPlaying),
+        playLabel: t.actions.play,
+        pauseLabel: t.actions.pause,
+        onPress: () => void handlePlayOrToggleUri(topTrack.uri, topTrack.name)
+      }
+    ))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.kpis.favoriteGenre), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value", style: { textTransform: "capitalize" } }, topGenre ? topGenre.genre : t.kpis.varied), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, topGenre ? t.kpis.affinityAndRecent(topGenre.pct, recentApiCount) : t.kpis.tracksInRanking(topTracks.length)))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-two-col" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.top5Artists), /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-link-btn",
+        onClick: () => setActiveTab("artists")
+      },
+      t.sections.viewAll(topArtists.length)
+    )), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, topArtists.slice(0, 5).map((artist, idx) => /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        key: artist.id,
+        className: "cronotofy-row",
+        style: { cursor: artist.id.startsWith("local:") ? "default" : "pointer" },
+        onClick: () => navigateToSpotifyEntity("artist", artist.id)
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), artist.imageUrl && /* @__PURE__ */ Spicetify.React.createElement(
+        "img",
+        {
+          src: artist.imageUrl,
+          alt: artist.name,
+          className: "cronotofy-thumb circle"
+        }
+      ), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, artist.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, artist.genres.slice(0, 2).join(", ") || t.entities.spotifyArtist))),
+      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, formatArtistStat(artist))
+    )), topArtists.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, t.empty.noArtistsPeriod))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.top5Tracks), /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-link-btn",
+        onClick: () => setActiveTab("tracks")
+      },
+      t.sections.viewAll(topTracks.length)
+    )), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, topTracks.slice(0, 5).map((track, idx) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: track.id, className: "cronotofy-row" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), track.albumImageUrl && /* @__PURE__ */ Spicetify.React.createElement(
+      "img",
+      {
+        src: track.albumImageUrl,
+        alt: track.name,
+        className: "cronotofy-thumb"
+      }
+    ), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, track.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, track.artistName, " \xB7 ", formatDurationMs(track.durationMs)))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-actions" }, /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyPlayButton,
+      {
+        isPlayingThis: Boolean(liveTrack && liveTrack.uri === track.uri && liveTrack.isPlaying),
+        playLabel: t.actions.play,
+        pauseLabel: t.actions.pause,
+        onPress: () => void handlePlayOrToggleUri(track.uri, track.name)
+      }
+    ), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyQueueButton,
+      {
+        tooltip: t.actions.addToQueue,
+        onQueue: () => void handleQueueTrack(track.uri, track.name)
+      }
+    )))), topTracks.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, t.empty.noTracksPeriod))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.top4Albums), /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: "cronotofy-link-btn",
+        onClick: () => setActiveTab("albums")
+      },
+      t.sections.viewAll(aggregatedAlbums.length)
+    )), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, aggregatedAlbums.slice(0, 4).map((album, idx) => /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        key: album.id,
+        className: "cronotofy-row",
+        style: { cursor: album.uri ? "pointer" : "default" },
+        onClick: () => {
+          if (album.uri) navigateToSpotifyEntity("album", album.id);
+        }
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), album.imageUrl && /* @__PURE__ */ Spicetify.React.createElement("img", { src: album.imageUrl, alt: album.name, className: "cronotofy-thumb" }), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, album.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, album.artistName))),
+      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.entities.topTracksCount(album.trackCount))
+    )), aggregatedAlbums.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, t.empty.noAlbumsPeriod))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.genreDna), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.sections.mainGenresBadge(genreStats.length))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, genreStats.map((g) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: g.genre, style: { padding: "4px 2px" } }, /* @__PURE__ */ Spicetify.React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 12.5 } }, /* @__PURE__ */ Spicetify.React.createElement("span", { style: { fontWeight: 600, textTransform: "capitalize", color: "#f1f5f9" } }, g.genre), /* @__PURE__ */ Spicetify.React.createElement("span", { style: { color: palette.accentSoft, fontWeight: 700 } }, g.pct, "%")), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-genre-bar-bg" }, /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        className: "cronotofy-genre-bar-fill",
+        style: { width: `${Math.max(4, Math.min(100, g.pct * 2.2))}%` }
+      }
+    )))), genreStats.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, t.empty.noGenres))))), activeTab === "artists" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-cards-grid" }, filteredArtists.map((artist, idx) => /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        key: artist.id,
+        className: "cronotofy-entity-card",
+        onClick: () => navigateToSpotifyEntity("artist", artist.id)
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card-cover-wrap" }, artist.imageUrl ? /* @__PURE__ */ Spicetify.React.createElement(
+        "img",
+        {
+          src: artist.imageUrl,
+          alt: artist.name,
+          className: "cronotofy-entity-cover circle"
+        }
+      ) : /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-cover circle" }), artist.uri && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card-play-overlay" }, /* @__PURE__ */ Spicetify.React.createElement(
+        SpotifyPlayButton,
+        {
+          size: "lg",
+          playLabel: t.actions.play,
+          pauseLabel: t.actions.pause,
+          onPress: () => void handlePlayOrToggleUri(artist.uri, artist.name)
+        }
+      ))),
+      /* @__PURE__ */ Spicetify.React.createElement("div", null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-meta" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, "#", idx + 1), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-entity-stat" }, formatArtistStat(artist))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title", style: { marginTop: 8, fontSize: 14 } }, artist.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, artist.genres.slice(0, 2).join(" \xB7 ") || t.entities.spotifyArtist)),
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-genre-bar-bg", style: { marginTop: "auto" } }, /* @__PURE__ */ Spicetify.React.createElement(
+        "div",
+        {
+          className: "cronotofy-genre-bar-fill",
+          style: {
+            width: `${Math.min(
+              100,
+              Math.max(8, artist.popularity || artist.affinityScore || 50)
+            )}%`
+          }
+        }
+      ))
+    )), !loading && filteredArtists.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty", style: { gridColumn: "1 / -1" } }, normalizedFilter && topArtists.length > 0 ? t.search.noResults : t.empty.noArtistsFound)), activeTab === "tracks" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.tracksRanking(periodLabels[timeRange])), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.sections.tracksBadge(filteredTracks.length))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, filteredTracks.map((track, idx) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: track.id, className: "cronotofy-row" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), track.albumImageUrl && /* @__PURE__ */ Spicetify.React.createElement("img", { src: track.albumImageUrl, alt: track.name, className: "cronotofy-thumb" }), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, track.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, track.artistName, track.albumName ? ` \xB7 ${track.albumName}` : ""))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-actions" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-track-duration" }, formatDurationMs(track.durationMs)), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyPlayButton,
+      {
+        isPlayingThis: Boolean(liveTrack && liveTrack.uri === track.uri && liveTrack.isPlaying),
+        playLabel: t.actions.play,
+        pauseLabel: t.actions.pause,
+        onPress: () => void handlePlayOrToggleUri(track.uri, track.name)
+      }
+    ), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyQueueButton,
+      {
+        tooltip: t.actions.addToQueue,
+        onQueue: () => void handleQueueTrack(track.uri, track.name)
+      }
+    )))), !loading && filteredTracks.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, normalizedFilter && topTracks.length > 0 ? t.search.noResults : t.empty.noTracksPeriod))), activeTab === "albums" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-cards-grid" }, filteredAlbums.map((album, idx) => /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        key: album.id,
+        className: "cronotofy-entity-card",
+        onClick: () => {
+          if (album.uri) navigateToSpotifyEntity("album", album.id);
+        }
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card-cover-wrap" }, album.imageUrl ? /* @__PURE__ */ Spicetify.React.createElement("img", { src: album.imageUrl, alt: album.name, className: "cronotofy-entity-cover" }) : /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-cover" }), album.uri && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card-play-overlay" }, /* @__PURE__ */ Spicetify.React.createElement(
+        SpotifyPlayButton,
+        {
+          size: "lg",
+          playLabel: t.actions.play,
+          pauseLabel: t.actions.pause,
+          onPress: () => void handlePlayOrToggleUri(album.uri, album.name)
+        }
+      ))),
+      /* @__PURE__ */ Spicetify.React.createElement("div", null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-entity-meta" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, "#", idx + 1), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-entity-stat", style: { color: palette.accentSoft, fontWeight: 700 } }, album.trackCount, " ", album.trackCount === 1 ? t.entities.songSingular : t.entities.songPlural)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title", style: { marginTop: 8, fontSize: 14 } }, album.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, album.artistName))
+    )), !loading && filteredAlbums.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card cronotofy-empty", style: { gridColumn: "1 / -1" } }, normalizedFilter && aggregatedAlbums.length > 0 ? t.search.noResults : t.empty.noAlbumsPeriod)), activeTab === "live" && /* @__PURE__ */ Spicetify.React.createElement(Spicetify.React.Fragment, null, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-grid" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.sections.tracksListenedToday), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.todaySeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, snapshot.last7DaysSeconds > 0 ? `${t.streak.last7Days(formatSecondsHuman(snapshot.last7DaysSeconds))}${snapshot.streakDays >= 1 ? ` \xB7 ${t.streak.daysBadge(snapshot.streakDays)}` : ""}` : t.sections.localDateLabel(snapshot.todayDate || t.today))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.sections.accumulatedDesktop), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, formatSecondsHuman(snapshot.totalSeconds)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.sections.exactSecondBySecond)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.sections.capturedTracks), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value" }, snapshot.tracks.length), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, t.sections.completedPlays(snapshot.recentPlays.length))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-label" }, t.sections.lastSync), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-value", style: { fontSize: 18 } }, snapshot.lastSyncedAt ? formatRelativeTimeLocalized(snapshot.lastSyncedAt, t, rawLocale) : t.sections.pending), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-kpi-sub" }, user ? user.displayName : "Spotify Desktop"))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-two-col" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.topRealTimeTracks), /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, t.sections.topNBadge(Math.min(15, filteredLiveTracks.length)))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, filteredLiveTracks.slice(0, 15).map((tr, idx) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: tr.id, className: "cronotofy-row" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), tr.albumImageUrl && /* @__PURE__ */ Spicetify.React.createElement("img", { src: tr.albumImageUrl, alt: tr.name, className: "cronotofy-thumb" }), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, tr.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, tr.artistName, " \xB7 ", tr.playCount, " ", tr.playCount === 1 ? t.entities.playSingular : t.entities.playPlural))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-actions" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, formatSecondsHuman(tr.totalSeconds)), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyPlayButton,
+      {
+        isPlayingThis: Boolean(liveTrack && liveTrack.uri === tr.uri && liveTrack.isPlaying),
+        playLabel: t.actions.play,
+        pauseLabel: t.actions.pause,
+        onPress: () => void handlePlayOrToggleUri(tr.uri, tr.name)
+      }
+    ), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyQueueButton,
+      {
+        tooltip: t.actions.addToQueue,
+        onQueue: () => void handleQueueTrack(tr.uri, tr.name)
+      }
+    )))), filteredLiveTracks.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, normalizedFilter && snapshot.tracks.length > 0 ? t.search.noResults : t.empty.noTrackedTimeYet))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-card" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header" }, /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title" }, t.sections.realArtistsAndRecent), snapshot.tracks.length > 0 && /* @__PURE__ */ Spicetify.React.createElement(
+      "button",
+      {
+        type: "button",
+        className: `cronotofy-link-btn ${confirmClear ? "danger" : ""}`,
+        onClick: () => {
+          if (!confirmClear) {
+            setConfirmClear(true);
+            return;
+          }
+          setConfirmClear(false);
+          window.__CRONOTOFY_MOD__?.clearLocalHistory();
+          Spicetify?.showNotification?.(t.actions.historyClearedToast);
+        }
+      },
+      confirmClear ? t.actions.confirmClearHistory : t.sections.clearLocalHistory
+    )), trackedArtistsSummary.length > 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list", style: { marginBottom: 16 } }, trackedArtistsSummary.slice(0, 5).map((a, idx) => /* @__PURE__ */ Spicetify.React.createElement(
+      "div",
+      {
+        key: a.name,
+        className: "cronotofy-row",
+        style: { cursor: a.artistId ? "pointer" : "default" },
+        onClick: () => navigateToSpotifyEntity("artist", a.artistId)
+      },
+      /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-rank" }, "#", idx + 1), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, a.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, t.sections.recordedPlays(a.plays)))),
+      /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, formatSecondsHuman(a.totalSeconds))
+    ))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-section-header", style: { marginTop: 8 } }, /* @__PURE__ */ Spicetify.React.createElement("h3", { className: "cronotofy-section-title", style: { fontSize: 13.5 } }, t.sections.latestCapturedPlays)), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-list" }, filteredRecentPlays.slice(0, 12).map((p, idx) => /* @__PURE__ */ Spicetify.React.createElement("div", { key: `${p.id}-${p.playedAt}-${idx}`, className: "cronotofy-row" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-left" }, p.albumImageUrl && /* @__PURE__ */ Spicetify.React.createElement("img", { src: p.albumImageUrl, alt: p.name, className: "cronotofy-thumb" }), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-text" }, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-title" }, p.name), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-sub" }, p.artistName, " \xB7 ", formatRelativeTimeLocalized(p.playedAt, t, rawLocale)))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-row-actions" }, /* @__PURE__ */ Spicetify.React.createElement("span", { className: "cronotofy-badge" }, formatSecondsHuman(p.listenedSeconds)), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyPlayButton,
+      {
+        isPlayingThis: Boolean(liveTrack && liveTrack.uri === p.uri && liveTrack.isPlaying),
+        playLabel: t.actions.play,
+        pauseLabel: t.actions.pause,
+        onPress: () => void handlePlayOrToggleUri(p.uri, p.name)
+      }
+    ), /* @__PURE__ */ Spicetify.React.createElement(
+      SpotifyQueueButton,
+      {
+        tooltip: t.actions.addToQueue,
+        onQueue: () => void handleQueueTrack(p.uri, p.name)
+      }
+    )))), filteredRecentPlays.length === 0 && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-empty" }, normalizedFilter && snapshot.recentPlays.length > 0 ? t.search.noResults : t.empty.noRecentPlaysYet))))))));
+  }
+  var cachedErrorBoundary = null;
+  function getErrorBoundary() {
+    if (cachedErrorBoundary) return cachedErrorBoundary;
+    const BaseComponent = Spicetify.React.Component;
+    class CronotofyErrorBoundary extends BaseComponent {
+      constructor(props) {
+        super(props);
+        this.state = { hasError: false, message: "" };
+      }
+      static getDerivedStateFromError(error) {
+        return {
+          hasError: true,
+          message: error instanceof Error ? error.message : String(error || "Unexpected error")
+        };
+      }
+      render() {
+        if (this.state.hasError) {
+          ensureCronotofyStyles();
+          const { t } = getTranslations();
+          return /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-root" }, /* @__PURE__ */ Spicetify.React.createElement(
+            "div",
+            {
+              className: "cronotofy-card",
+              style: { maxWidth: 520, margin: "40px auto", textAlign: "center" }
+            },
+            /* @__PURE__ */ Spicetify.React.createElement("h2", { className: "cronotofy-section-title", style: { marginBottom: 8 } }, t.errorBoundary.title),
+            /* @__PURE__ */ Spicetify.React.createElement("p", { style: { fontSize: 13, color: "#94a3b8", marginBottom: 16 } }, this.state.message || t.errorBoundary.fallbackMsg),
+            /* @__PURE__ */ Spicetify.React.createElement(
+              "button",
+              {
+                type: "button",
+                className: "cronotofy-btn cronotofy-btn-primary",
+                onClick: () => this.setState({ hasError: false, message: "" })
+              },
+              t.errorBoundary.retry
+            )
+          ));
+        }
+        return this.props.children;
+      }
+    }
+    cachedErrorBoundary = CronotofyErrorBoundary;
+    return cachedErrorBoundary;
+  }
+  function render() {
+    const ErrorBoundary = getErrorBoundary();
+    return Spicetify.React.createElement(
+      ErrorBoundary,
+      null,
+      Spicetify.React.createElement(CronotofyApp, null)
+    );
+  }
+
+  // spicetify-cronotofy/src/sleepTimer.ts
+  var SLEEP_TIMER_CYCLE = [
+    "off",
+    "end-of-track",
+    "15m",
+    "30m",
+    "60m"
+  ];
+  function nextSleepTimerMode(current) {
+    const idx = SLEEP_TIMER_CYCLE.indexOf(current);
+    return SLEEP_TIMER_CYCLE[(idx + 1) % SLEEP_TIMER_CYCLE.length];
+  }
+  function modeDurationSeconds(mode) {
+    if (mode === "15m") return 15 * 60;
+    if (mode === "30m") return 30 * 60;
+    if (mode === "60m") return 60 * 60;
+    return 0;
+  }
+  function formatRemainingBadge(remainingSeconds) {
+    const sec = Math.max(0, Math.floor(remainingSeconds || 0));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  var SleepTimerController = class {
+    constructor(onExpire) {
+      this.mode = "off";
+      this.remainingSeconds = 0;
+      this.intervalId = null;
+      this.listeners = /* @__PURE__ */ new Set();
+      this.onExpire = onExpire;
+    }
+    notify() {
+      for (const fn of this.listeners) {
+        try {
+          fn();
+        } catch {
+        }
+      }
+    }
+    clearTick() {
+      if (this.intervalId !== null) {
+        clearInterval(this.intervalId);
+        this.intervalId = null;
+      }
+    }
+    getState() {
+      return {
+        mode: this.mode,
+        remainingSeconds: this.remainingSeconds,
+        active: this.mode !== "off"
+      };
+    }
+    cycle() {
+      const next = nextSleepTimerMode(this.mode);
+      this.clearTick();
+      this.mode = next;
+      this.remainingSeconds = modeDurationSeconds(next);
+      if (this.remainingSeconds > 0) {
+        this.intervalId = setInterval(() => {
+          this.remainingSeconds -= 1;
+          if (this.remainingSeconds <= 0) {
+            this.cancel();
+            this.onExpire();
+          } else {
+            this.notify();
+          }
+        }, 1e3);
+      }
+      this.notify();
+      return next;
+    }
+    cancel() {
+      this.clearTick();
+      if (this.mode === "off" && this.remainingSeconds === 0) return;
+      this.mode = "off";
+      this.remainingSeconds = 0;
+      this.notify();
+    }
+    onSongChange() {
+      if (this.mode !== "end-of-track") return;
+      this.cancel();
+      this.onExpire();
+    }
+    subscribe(fn) {
+      this.listeners.add(fn);
+      return () => {
+        this.listeners.delete(fn);
+      };
+    }
+    destroy() {
+      this.clearTick();
+      this.mode = "off";
+      this.remainingSeconds = 0;
+      this.listeners.clear();
+    }
+  };
+
+  // spicetify-cronotofy/src/chromeWidgets.ts
+  var NAV_BTN_ID = "cronotofy-nav-btn";
+  function findCronotofyMainView() {
+    return document.querySelector(".Root__main-view") ||
+      document.querySelector('#main-view, [data-testid="main-view"], main[role="main"]');
+  }
+  var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
+  var VOLUME_PCT_ID = "cronotofy-volume-pct";
+  var SLEEP_BTN_ID = "cronotofy-sleep-btn";
+  function isCronotofyRoute(pathname) {
+    const path = pathname ?? (typeof Spicetify !== "undefined" ? Spicetify?.Platform?.History?.location?.pathname : "") ?? (typeof window !== "undefined" ? window.location.pathname : "");
+    return typeof path === "string" && path.startsWith("/cronotofy");
+  }
+  function scrollCronotofyToTop() {
+    const viewport = document.getElementById("cronotofy-ext-host") || document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".main-view-container__scroll-node") || document.querySelector("[data-overlayscrollbars-viewport]");
+    if (viewport && typeof viewport.scrollTo === "function") {
+      viewport.scrollTo({ top: 0, behavior: "smooth" });
+    } else {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }
+  var CronotofyChromeWidgets = class {
+    constructor(tracker, options = {}) {
+      this.navBtn = null;
+      this.telemetryEl = null;
+      this.sessionPill = null;
+      this.todayPill = null;
+      this.volumePctEl = null;
+      this.sleepBtn = null;
+      this.sleepLabelEl = null;
+      this.lastSessionText = "";
+      this.lastTodayText = "";
+      this.lastVolumeText = "";
+      this.lastSleepLabel = "";
+      this.lastSleepActive = false;
+      this.boundVolumeBars = /* @__PURE__ */ new WeakSet();
+      this.boundScrollViewports = /* @__PURE__ */ new WeakSet();
+      this.bannerScrollRaf = false;
+      this.observer = null;
+      this.rafPending = false;
+      this.initialized = false;
+      this.historyUnsub = null;
+      this.handleSongChange = () => {
+        this.sleepTimer.onSongChange();
+      };
+      this.handleShortcut = (e) => {
+        if (!e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey) return;
+        const target = e.target;
+        if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
+          return;
+        }
+        if (e.code === "KeyS") {
+          e.preventDefault();
+          this.cycleSleepTimerWithToast();
+        } else if (e.code === "KeyC") {
+          e.preventDefault();
+          const live = this.tracker.getLiveTrack();
+          const { t } = getTranslations();
+          void copyLiveTrackToClipboard(live).then((res) => {
+            if (res === "copied" && live) {
+              Spicetify?.showNotification?.(t.actions.copiedTrackToast(live.name));
+            } else if (res === "empty") {
+              Spicetify?.showNotification?.(t.actions.noTrackPlayingToast, true);
+            } else {
+              Spicetify?.showNotification?.(t.actions.copyErrorToast, true);
+            }
+          });
+        }
+      };
+      this.tracker = tracker;
+      this.options = options;
+      this.sleepTimer = new SleepTimerController(() => {
+        const player = Spicetify?.Player;
+        if (player?.isPlaying?.()) {
+          player.togglePlay?.();
+        }
+        const { t } = getTranslations();
+        Spicetify?.showNotification?.(t.sleepTimer.triggeredToast);
+      });
+    }
+    init() {
+      if (this.initialized || typeof document === "undefined") return;
+      this.initialized = true;
+      this.ensureMounted();
+      this.updateTelemetry();
+      this.updateVolumePct();
+      this.updateSleepButton();
+      this.syncActiveRoute();
+      this.tracker.subscribe(() => {
+        this.updateTelemetry();
+        this.updateVolumePct();
+      });
+      this.sleepTimer.subscribe(() => {
+        this.updateSleepButton();
+      });
+      const unsub = Spicetify?.Platform?.History?.listen?.((loc) => {
+        this.syncActiveRoute(loc?.pathname);
+        this.syncBannerScroll();
+      });
+      if (typeof unsub === "function") {
+        this.historyUnsub = unsub;
+      }
+      Spicetify?.Player?.addEventListener?.("songchange", this.handleSongChange);
+      if (typeof window !== "undefined") {
+        window.addEventListener("keydown", this.handleShortcut);
+      }
+      if (document.body && typeof MutationObserver !== "undefined") {
+        this.observer = new MutationObserver(() => {
+          if (this.rafPending) return;
+          this.rafPending = true;
+          requestAnimationFrame(() => {
+            this.rafPending = false;
+            this.ensureMounted();
+            this.syncActiveRoute();
+          });
+        });
+        this.observer.observe(document.body, { childList: true, subtree: true });
+      }
+    }
+    cycleSleepTimerWithToast() {
+      const next = this.sleepTimer.cycle();
+      const { t } = getTranslations();
+      if (next === "off") {
+        Spicetify?.showNotification?.(t.sleepTimer.offToast);
+      } else if (next === "end-of-track") {
+        Spicetify?.showNotification?.(t.sleepTimer.endOfTrackToast);
+      } else {
+        const mins = Math.round(modeDurationSeconds(next) / 60);
+        Spicetify?.showNotification?.(t.sleepTimer.minutesToast(mins));
+      }
+    }
+    getOrCreateSleepButton() {
+      if (this.sleepBtn) return this.sleepBtn;
+      const btn = document.createElement("button");
+      btn.id = SLEEP_BTN_ID;
+      btn.type = "button";
+      btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>`;
+      const label = document.createElement("span");
+      label.className = "cronotofy-sleep-label";
+      btn.appendChild(label);
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.cycleSleepTimerWithToast();
+      });
+      btn.addEventListener("contextmenu", (e) => {
+        if (!this.sleepTimer.getState().active) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.sleepTimer.cancel();
+        Spicetify?.showNotification?.(getTranslations().t.sleepTimer.offToast);
+      });
+      this.sleepBtn = btn;
+      this.sleepLabelEl = label;
+      return btn;
+    }
+    updateSleepButton() {
+      const btn = this.getOrCreateSleepButton();
+      const state = this.sleepTimer.getState();
+      const { t } = getTranslations();
+      const label = state.mode === "off" ? "" : state.mode === "end-of-track" ? t.sleepTimer.endOfTrackShort : formatRemainingBadge(state.remainingSeconds);
+      if (this.lastSleepActive !== state.active) {
+        this.lastSleepActive = state.active;
+        btn.classList.toggle("active", state.active);
+      }
+      if (this.sleepLabelEl && this.lastSleepLabel !== label) {
+        this.lastSleepLabel = label;
+        this.sleepLabelEl.textContent = label;
+      }
+      const tooltip = state.active ? t.sleepTimer.tooltipActive(
+        state.mode === "end-of-track" ? t.sleepTimer.endOfTrackToast : formatRemainingBadge(state.remainingSeconds)
+      ) : t.sleepTimer.tooltipIdle;
+      if (btn.title !== tooltip) {
+        btn.title = tooltip;
+        btn.setAttribute("aria-label", tooltip);
+      }
+    }
+    getOrCreateNavButton() {
+      if (this.navBtn) return this.navBtn;
+      const btn = document.createElement("button");
+      btn.id = NAV_BTN_ID;
+      btn.type = "button";
+      btn.setAttribute("aria-label", "Cronotofy");
+      btn.title = "Cronotofy";
+      btn.innerHTML = `<svg width="22" height="22" viewBox="1.4 1.4 30 29.2" style="display:block" aria-hidden="true"><defs><linearGradient id="crono-nav-grad" x1="1.4" y1="16" x2="31.4" y2="16" gradientUnits="userSpaceOnUse"><stop offset="0%" stop-color="var(--cronotofy-accent, #e2e8f0)"/><stop offset="100%" stop-color="var(--cronotofy-accent-2, #94a3b8)"/></linearGradient></defs><g class="cronotofy-nav-glyph" fill="currentColor"><rect x="14" y="13.5" width="2" height="5" rx="1"/><rect x="17" y="11.5" width="2" height="9" rx="1"/><rect x="20" y="9" width="2" height="14" rx="1"/><rect x="23" y="5" width="2" height="22" rx="1"/><rect x="26" y="8.5" width="2" height="15" rx="1"/><rect x="29" y="12.5" width="2" height="7" rx="1"/><path d="M 23.07 28.25 A 14.15 14.15 0 1 1 23.07 3.75 L 21.97 5.66 A 11.95 11.95 0 1 0 21.97 26.34 Z"/><path d="M 21.08 24.79 A 10.15 10.15 0 1 1 21.08 7.21 L 19.97 9.12 A 7.95 7.95 0 1 0 19.97 22.88 Z"/></g></svg>`;
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.options.onOpen) {
+          this.options.onOpen();
+        } else if (isCronotofyRoute()) {
+          scrollCronotofyToTop();
+        } else {
+          Spicetify?.Platform?.History?.push?.("/cronotofy");
+        }
+      });
+      this.navBtn = btn;
+      return btn;
+    }
+    getOrCreateTelemetry() {
+      if (this.telemetryEl) return this.telemetryEl;
+      const wrap = document.createElement("button");
+      wrap.id = NPB_TELEMETRY_ID;
+      wrap.type = "button";
+      wrap.title = "Cronotofy";
+      wrap.setAttribute("aria-label", "Cronotofy");
+      const sessionPill = document.createElement("span");
+      sessionPill.className = "cronotofy-npb-pill cronotofy-npb-session";
+      const todayPill = document.createElement("span");
+      todayPill.className = "cronotofy-npb-pill cronotofy-npb-today";
+      wrap.append(sessionPill, todayPill);
+      wrap.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.options.onOpen) {
+          this.options.onOpen();
+        } else {
+          Spicetify?.Platform?.History?.push?.("/cronotofy");
+        }
+      });
+      this.telemetryEl = wrap;
+      this.sessionPill = sessionPill;
+      this.todayPill = todayPill;
+      return wrap;
+    }
+    getOrCreateVolumePct() {
+      if (this.volumePctEl) return this.volumePctEl;
+      const span = document.createElement("span");
+      span.id = VOLUME_PCT_ID;
+      span.setAttribute("aria-hidden", "true");
+      this.volumePctEl = span;
+      return span;
+    }
+    readVolumePercent() {
+      const player = Spicetify?.Player;
+      if (player?.getMute?.() === true) return 0;
+      const input = document.querySelector(
+        '[data-testid="volume-bar"] input[type="range"]'
+      );
+      if (input) {
+        const val = Number(input.value);
+        if (Number.isFinite(val)) {
+          return Math.round(Math.max(0, Math.min(1, val)) * 100);
+        }
+      }
+      const vol = player?.getVolume?.();
+      if (typeof vol === "number" && Number.isFinite(vol)) {
+        return Math.round(Math.max(0, Math.min(1, vol)) * 100);
+      }
+      return null;
+    }
+    updateVolumePct() {
+      const pct = this.readVolumePercent();
+      if (pct === null) return;
+      const el = this.getOrCreateVolumePct();
+      const text = `${pct}%`;
+      if (this.lastVolumeText !== text) {
+        this.lastVolumeText = text;
+        el.textContent = text;
+      }
+    }
+    ensureMounted() {
+      const searchContainer = document.querySelector(".main-globalNav-searchContainer") ||
+        document.querySelector('#global-nav-bar, [data-testid="global-nav-bar"], .Root__globalNav');
+      if (searchContainer) {
+        const btn = this.getOrCreateNavButton();
+        const orphan = document.getElementById(NAV_BTN_ID);
+        if (orphan && orphan !== btn) orphan.remove();
+        if (btn.parentElement !== searchContainer || searchContainer.lastElementChild !== btn) {
+          searchContainer.appendChild(btn);
+        }
+      }
+      const leftBar = document.querySelector(".main-nowPlayingBar-left") ||
+        document.querySelector('[data-testid="now-playing-bar"] [data-testid="now-playing-widget"]')?.parentElement;
+      if (leftBar) {
+        const telemetry = this.getOrCreateTelemetry();
+        const orphan = document.getElementById(NPB_TELEMETRY_ID);
+        if (orphan && orphan !== telemetry) orphan.remove();
+        if (telemetry.parentElement !== leftBar || leftBar.lastElementChild !== telemetry) {
+          leftBar.appendChild(telemetry);
+        }
+      }
+      const volumeBar = document.querySelector('[data-testid="volume-bar"]');
+      const extraControls = document.querySelector(".main-nowPlayingBar-extraControls") || volumeBar?.parentElement;
+      if (extraControls) {
+        const sleepBtn = this.getOrCreateSleepButton();
+        const orphanSleep = document.getElementById(SLEEP_BTN_ID);
+        if (orphanSleep && orphanSleep !== sleepBtn) orphanSleep.remove();
+        if (volumeBar && volumeBar.parentElement === extraControls) {
+          if (sleepBtn.parentElement !== extraControls || sleepBtn.nextElementSibling !== volumeBar) {
+            extraControls.insertBefore(sleepBtn, volumeBar);
+          }
+        } else if (sleepBtn.parentElement !== extraControls || extraControls.lastElementChild !== sleepBtn) {
+          extraControls.appendChild(sleepBtn);
+        }
+        this.updateSleepButton();
+      }
+      if (volumeBar) {
+        const volEl = this.getOrCreateVolumePct();
+        const orphan = document.getElementById(VOLUME_PCT_ID);
+        if (orphan && orphan !== volEl) orphan.remove();
+        if (volEl.parentElement !== volumeBar || volumeBar.lastElementChild !== volEl) {
+          volumeBar.appendChild(volEl);
+        }
+        if (!this.boundVolumeBars.has(volumeBar)) {
+          this.boundVolumeBars.add(volumeBar);
+          const schedule = () => requestAnimationFrame(() => this.updateVolumePct());
+          for (const ev of ["input", "change", "wheel", "click", "pointerup"]) {
+            volumeBar.addEventListener(ev, schedule, { passive: true });
+          }
+        }
+        this.updateVolumePct();
+      }
+      const viewport = document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".Root__main-view .main-view-container__scroll-node");
+      if (viewport && !this.boundScrollViewports.has(viewport)) {
+        this.boundScrollViewports.add(viewport);
+        viewport.addEventListener(
+          "scroll",
+          () => {
+            if (this.bannerScrollRaf) return;
+            this.bannerScrollRaf = true;
+            requestAnimationFrame(() => {
+              this.bannerScrollRaf = false;
+              this.syncBannerScroll();
+            });
+          },
+          { passive: true }
+        );
+      }
+      this.syncBannerScroll();
+    }
+    syncBannerScroll() {
+      const viewport = document.querySelector(".Root__main-view [data-overlayscrollbars-viewport]") || document.querySelector(".Root__main-view .main-view-container__scroll-node");
+      const y = viewport ? -Math.max(0, Math.round(viewport.scrollTop)) : 0;
+      const val = `${y}px`;
+      const banners = document.querySelectorAll(
+        '.MlWLm9_5qALi6Ay0_OCr, .FNyVAJwiyJvKSs7fgcmI, .Root__main-view div:has(> [data-testid="background-image"])'
+      );
+      banners.forEach((el) => {
+        if (el.style.getPropertyValue("--cronotofy-banner-y") !== val) {
+          el.style.setProperty("--cronotofy-banner-y", val);
+        }
+      });
+    }
+    syncActiveRoute(pathname) {
+      const active = this.options.isOpen ? this.options.isOpen() : isCronotofyRoute(pathname);
+      if (this.navBtn) {
+        this.navBtn.classList.toggle("active", active);
+      }
+    }
+    updateTelemetry() {
+      this.getOrCreateTelemetry();
+      const { t } = getTranslations();
+      const snapshot = this.tracker.getCounters();
+      const sessionText = `${t.currentSession}: ${formatSecondsHuman(snapshot.currentTrackSeconds)}`;
+      const todayText = `${t.today}: ${formatSecondsHuman(snapshot.todaySeconds)}`;
+      if (this.sessionPill && this.lastSessionText !== sessionText) {
+        this.lastSessionText = sessionText;
+        this.sessionPill.textContent = sessionText;
+      }
+      if (this.todayPill && this.lastTodayText !== todayText) {
+        this.lastTodayText = todayText;
+        this.todayPill.textContent = todayText;
+      }
+      if (this.telemetryEl) {
+        const parts = [todayText, t.kpis.totalMod(formatSecondsHuman(snapshot.totalSeconds))];
+        if (snapshot.streakDays >= 2) {
+          parts.push(t.streak.daysBadge(snapshot.streakDays));
+        }
+        const nextTitle = parts.join(" \xB7 ");
+        if (this.telemetryEl.title !== nextTitle) {
+          this.telemetryEl.title = nextTitle;
+        }
+      }
+    }
+    destroy() {
+      this.observer?.disconnect();
+      this.observer = null;
+      this.sleepTimer.destroy();
+      this.historyUnsub?.();
+      this.historyUnsub = null;
+      Spicetify?.Player?.removeEventListener?.("songchange", this.handleSongChange);
+      if (typeof window !== "undefined") {
+        window.removeEventListener("keydown", this.handleShortcut);
+      }
+      this.initialized = false;
+    }
+  };
+
+  // spicetify-cronotofy/src/globalWall.ts
+  var GLOBAL_WALL_STYLE_ID = "cronotofy-global-wall-style";
+  var GLOBAL_WALL_ROOT_ID = "cronotofy-global-wall";
+  var GLOBAL_WALL_CSS = `
+#${GLOBAL_WALL_ROOT_ID} {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+  user-select: none;
+  background-color: var(--cronotofy-bg-main, #0b0f17);
+}
+
+.cronotofy-gwall-grid {
+  position: absolute;
+  inset: -140px -120px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+  transform: rotate(-3deg) scale(1.12);
+}
+
+.cronotofy-gwall-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  width: max-content;
+  will-change: transform;
+}
+
+.cronotofy-gwall-row.left {
+  animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 118s) linear infinite;
+}
+
+:root[data-cronotofy-preset="still"] .cronotofy-gwall-row {
+  animation: none;
+}
+
+:root[data-cronotofy-preset="focus"] #cronotofy-global-wall {
+  display: none !important;
+}
+
+.cronotofy-gwall-row.right {
+  animation: cronotofyGlobalMarqueeRight var(--cronotofy-gmarquee-duration, 130s) linear infinite;
+}
+
+@keyframes cronotofyGlobalMarqueeLeft {
+  0% {
+    transform: translate3d(0, 0, 0);
+  }
+  100% {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+@keyframes cronotofyGlobalMarqueeRight {
+  0% {
+    transform: translate3d(-50%, 0, 0);
+  }
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.cronotofy-gwall-tile {
+  width: 148px;
+  height: 148px;
+  border-radius: 16px;
+  overflow: hidden;
+  flex-shrink: 0;
+  opacity: 0.68;
+  filter: brightness(0.78) saturate(1.15);
+  background: rgba(17, 23, 34, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.cronotofy-gwall-tile img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.cronotofy-gwall-scrim {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 50% 25%, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.14) 0%, transparent 62%),
+    radial-gradient(ellipse at 50% 100%, rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.10) 0%, transparent 60%),
+    linear-gradient(
+      180deg,
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.48) 0%,
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.54) 50%,
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.62) 100%
+    );
+  pointer-events: none;
+}
+
+/* Global Encore & Spice translucent variables (clean smoked Apple crystal) */
+:root,
+.encore-dark-theme,
+.encore-dark-theme .encore-base-set {
+  --background-base: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.18) !important;
+  --background-elevated-base: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  --background-elevated-highlight: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.36) !important;
+  --background-highlight: rgba(255, 255, 255, 0.08) !important;
+  --background-press: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.48) !important;
+  --background-tinted-base: rgba(255, 255, 255, 0.06) !important;
+  --background-tinted-highlight: rgba(255, 255, 255, 0.12) !important;
+  --section-background-base: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) !important;
+}
+
+/* Transparent root shell so the animated album wall shows behind the entire app */
+html,
+body,
+#main,
+.Root__top-container {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+#main,
+.Root__top-container {
+  position: relative;
+  z-index: 1;
+}
+
+.Root__top-container {
+  grid-template-areas:
+    "top-banner top-banner top-banner"
+    "global-nav global-nav global-nav"
+    "left-sidebar main-view right-sidebar" !important;
+  grid-template-rows: auto auto 1fr !important;
+}
+
+.Root__main-view .main-view-container__scroll-node-child,
+.Root__nav-bar [data-overlayscrollbars-viewport],
+.Root__right-sidebar [data-overlayscrollbars-viewport],
+#cronotofy-ext-host {
+  padding-bottom: 92px !important;
+}
+
+/* Top Global Nav Bar \u2014 Clean Dark Apple Liquid Glass
+   Keep backdrop-filter on ::before so .Root__globalNav stays above .Root__main-view
+   and descendants (Recent Searches dropdown) are not trapped behind a Backdrop Root */
+.Root__globalNav {
+  position: relative !important;
+  z-index: 100 !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  overflow: visible !important;
+}
+
+.Root__globalNav::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+/* Search / Recent Searches dropdown over Liquid Glass */
+.Root__globalNav [role="listbox"],
+.qGPO5O89umT0jc_uov5X {
+  z-index: 100 !important;
+}
+
+.Root__globalNav [role="listbox"] > div,
+.main-globalNav-searchInputSection [role="listbox"] > div,
+.ATzSlFakPhgCcp6m2wgQ {
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.62) !important;
+  backdrop-filter: blur(18px) saturate(175%) brightness(0.84) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(175%) brightness(0.84) !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  border-radius: 18px !important;
+  box-shadow:
+    0 20px 48px -8px rgba(0, 0, 0, 0.68),
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+.main-topBar-searchBar,
+.Root__globalNav .main-globalNav-navLink {
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+}
+
+/* Left Sidebar ("Your Library") \u2014 Clean Dark Apple Liquid Glass */
+.Root__nav-bar {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 20px !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  overflow: hidden !important;
+}
+
+.main-yourLibraryX-libraryContainer,
+.main-yourLibraryX-entryPoints,
+.main-yourLibraryX-library,
+#Desktop_LeftSidebar_Id,
+#Desktop_LeftSidebar_Id > div {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/* Right Sidebar ("Now Playing View") \u2014 Clean Dark Apple Liquid Glass */
+.Root__right-sidebar,
+.Root__right-sidebar-peek {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
+  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 20px !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  overflow: hidden !important;
+}
+
+.Root__right-sidebar > div,
+.Root__right-sidebar aside,
+[data-testid="NPV_Panel_OpenDiv"],
+.Root__right-sidebar [data-overlayscrollbars-viewport] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+.main-nowPlayingView-section,
+.main-nowPlayingView-aboutArtist,
+.tMptdCSOI4gCghRCF74n,
+[data-testid="NPV_Panel_OpenDiv"] section {
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  border-radius: 18px !important;
+}
+
+/* Right Sidebar Lyrics Preview \u2014 Unified Dark Liquid Glass (fix opaque mask/color overlap) */
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0,
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0.YWvtYcp4OVsd4WMPoZOq,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0.YWvtYcp4OVsd4WMPoZOq {
+  --lyrics-color-background: transparent !important;
+  --lyrics-color-active: #ffffff !important;
+  --lyrics-color-inactive: rgba(255, 255, 255, 0.56) !important;
+  --lyrics-color-passed: rgba(255, 255, 255, 0.72) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
+  background-color: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 18px !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .ZZZvR59MO7b3EXPV7ZmC,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .ZZZvR59MO7b3EXPV7ZmC {
+  -webkit-mask-image: linear-gradient(transparent 0%, #000 14%, #000 72%, transparent 100%) !important;
+  mask-image: linear-gradient(transparent 0%, #000 14%, #000 72%, transparent 100%) !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .jQyqeKFeNAxw188HTqK4,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .jQyqeKFeNAxw188HTqK4 {
+  background: transparent !important;
+}
+
+.Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON,
+[data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.62) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(10px) saturate(160%) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(160%) !important;
+}
+
+[data-testid="NPV_Panel_OpenDiv"] section:has(.NknVk8hYvXI6ovbE8Zj0) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Bottom Player Bar \u2014 Floating Smoked Liquid Glass Capsule */
+.Root__now-playing-bar {
+  position: fixed !important;
+  left: 50% !important;
+  bottom: 10px !important;
+  transform: translateX(-50%) !important;
+  z-index: 60 !important;
+  width: min(880px, calc(100vw - 24px)) !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  overflow: visible !important;
+  pointer-events: none !important;
+}
+
+.Root__now-playing-bar footer,
+[data-testid="now-playing-bar"],
+.main-nowPlayingBar-container {
+  background: transparent !important;
+  background-color: transparent !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  margin: 0 auto !important;
+  overflow: visible !important;
+  pointer-events: none !important;
+}
+
+.RgDSkGVKeiIGEZLtWcYj {
+  background: transparent !important;
+  overflow: visible !important;
+  height: auto !important;
+}
+
+/* Center Panel (.Root__main-view) \u2014 Near-invisible shell so cards float cleanly */
+.Root__main-view {
+  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.12) !important;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  border-radius: 20px !important;
+  box-shadow: none !important;
+}
+
+html.cronotofy-route-active .Root__main-view {
+  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.04) !important;
+}
+
+.main-view-container,
+.main-view-container__scroll-node,
+.main-view-container__scroll-node-child,
+.main-view-container__mh-footer-container,
+.main-home-home,
+.main-actionBarBackground-background,
+.main-entityHeader-backgroundColor,
+.main-entityHeader-backgroundColor[data-seamless-gradient],
+.main-entityHeader-overlay,
+[data-testid="overscroll-background"],
+.P1kwly6O5plr1VQVdOLV {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+/* Artist / Entity Banner \u2014 scroll smoothly with the page and feather into Liquid Glass */
+.MlWLm9_5qALi6Ay0_OCr,
+.FNyVAJwiyJvKSs7fgcmI,
+.Root__main-view div:has(> [data-testid="background-image"]) {
+  transform: translate3d(0, var(--cronotofy-banner-y, 0px), 0) !important;
+  will-change: transform;
+  -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 72%, transparent 100%) !important;
+  mask-image: linear-gradient(180deg, #000 0%, #000 72%, transparent 100%) !important;
+}
+
+.MlWLm9_5qALi6Ay0_OCr [data-testid="background-image"],
+.FNyVAJwiyJvKSs7fgcmI [data-testid="background-image"],
+.b7x0AwQ51vLACMAHB71B,
+.L0UgUY1nWxdZ3XyrJNMt {
+  animation: none !important;
+  transform: none !important;
+}
+
+/* Soft neutral readability scrim on the banner \u2014 never mix Spotify's opaque artist color curtain */
+.venMPE3QitySGonlITLf,
+.AE3dcjFNJ9068_vrnLB6,
+.Root__main-view [data-testid="background-image"] + div {
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.06) 0%,
+    rgba(0, 0, 0, 0.28) 65%,
+    rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.72) 100%
+  ) !important;
+}
+
+.venMPE3QitySGonlITLf::after,
+.AE3dcjFNJ9068_vrnLB6::after,
+.Root__main-view [data-testid="background-image"] + div::after {
+  display: none !important;
+  opacity: 0 !important;
+  background: none !important;
+  animation: none !important;
+}
+
+/* Scrolled sticky topbar on Spotify pages (Artist/Album/Playlist) \u2014 clean dark Liquid Glass */
+.main-topBar-background {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
+  background-image: none !important;
+  backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+.main-topBar-overlay {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+.main-card-card,
+.view-homeShortcutsGrid-shortcut,
+.main-contextMenu-menu,
+[role="menu"],
+.GenericModal,
+.main-trackList-trackListHeader {
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 18px !important;
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+}
+
+/* Hide Spotify's black scroll topbar cleanly when inside Cronotofy */
+html.cronotofy-route-active .main-topBar-container,
+html.cronotofy-route-active .main-topBar-background,
+html.cronotofy-route-active .main-topBar-overlay {
+  display: none !important;
+  opacity: 0 !important;
+  background: transparent !important;
+  pointer-events: none !important;
+}
+
+/* Hide Spicetify's left-side Cronotofy link without mutating its React tree */
+.custom-navlinks-scrollable_container .custom-navlink[aria-label="Cronotofy"] {
+  display: none !important;
+}
+
+/* Centered Cronotofy nav button to the right of Spotify's search bar */
+.main-globalNav-searchContainer {
+  align-items: center !important;
+}
+
+#cronotofy-nav-btn {
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  min-height: 48px;
+  border-radius: 50%;
+  margin-inline-start: 8px;
+  flex-shrink: 0;
+  padding: 0;
+  line-height: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-subdued, #b3b3b3);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
+  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
+  -webkit-app-region: no-drag;
+  transition: transform 0.16s ease, color 0.16s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+#cronotofy-nav-btn svg {
+  display: block;
+}
+
+#cronotofy-nav-btn:hover {
+  transform: scale(1.04);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+#cronotofy-nav-btn.active {
+  color: #ffffff;
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.42);
+  box-shadow:
+    0 10px 28px -8px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+}
+
+#cronotofy-nav-btn.active .cronotofy-nav-glyph {
+  fill: url(#crono-nav-grad);
+}
+
+@media (max-width: 1100px) {
+  .cronotofy-gwall-grid,
+  .cronotofy-gwall-row {
+    gap: 14px;
+  }
+
+  .cronotofy-gwall-tile {
+    width: 98px;
+    height: 98px;
+    border-radius: 12px;
+  }
+}
+
+@media (max-width: 980px) {
+  #cronotofy-nav-btn {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    margin-inline-start: 6px;
+  }
+
+  #cronotofy-nav-btn svg {
+    width: 19px;
+    height: 19px;
+  }
+}
+
+/* Bottom Floating Capsule Grid: [controls | recessed track card + Cronotofy telemetry | extras + volume%] + full-width progress bar */
+.main-nowPlayingBar-nowPlayingBar {
+  display: grid !important;
+  grid-template-columns: auto minmax(220px, 1fr) auto !important;
+  grid-template-rows: auto auto !important;
+  grid-template-areas:
+    "controls track extras"
+    "progress progress progress" !important;
+  align-items: center !important;
+  column-gap: 10px !important;
+  row-gap: 4px !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 68px !important;
+  padding: 7px 20px 7px !important;
+  border-radius: 999px !important;
+  background: linear-gradient(
+    180deg,
+    rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.56) 0%,
+    rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.64) 100%
+  ) !important;
+  backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
+  -webkit-backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  box-shadow:
+    0 14px 36px -6px rgba(0, 0, 0, 0.62),
+    0 0 0 1px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
+  overflow: visible !important;
+  position: relative !important;
+  pointer-events: auto !important;
+}
+
+.main-nowPlayingBar-center,
+.main-nowPlayingBar-center .player-controls {
+  display: contents !important;
+  container-type: normal !important;
+  width: auto !important;
+  max-width: none !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .player-controls__buttons {
+  grid-area: controls !important;
+  width: auto !important;
+  margin: 0 !important;
+  gap: 4px !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  flex-shrink: 0 !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .player-controls__left,
+.main-nowPlayingBar-nowPlayingBar .player-controls__right {
+  flex: 0 0 auto !important;
+  gap: 2px !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="control-button-playpause"] {
+  width: 32px !important;
+  height: 32px !important;
+  min-width: 32px !important;
+  min-height: 32px !important;
+  transition: transform 0.15s ease !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .playback-bar {
+  grid-area: progress !important;
+  width: 100% !important;
+  padding: 0 8px !important;
+  --playback-bar-grid-gap: 10px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .playback-bar [data-testid="playback-position"],
+.main-nowPlayingBar-nowPlayingBar .playback-bar [data-testid="playback-duration"] {
+  font-size: 10.5px !important;
+  font-variant-numeric: tabular-nums !important;
+  opacity: 0.78 !important;
+  min-width: 32px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="playback-progressbar"] [data-testid="progress-bar-background"] {
+  background-color: rgba(255, 255, 255, 0.14) !important;
+  border-radius: 999px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+  grid-area: track !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 400px !important;
+  justify-self: center !important;
+  padding: 4px 8px 4px 5px !important;
+  border-radius: 12px !important;
+  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.44) !important;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 4px 14px rgba(0, 0, 0, 0.26) !important;
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 7px !important;
+  overflow: hidden !important;
+  container-type: normal !important;
+}
+
+.main-nowPlayingBar-left > :not(#cronotofy-npb-telemetry) {
+  order: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  max-width: 100% !important;
+  overflow: hidden !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-nowPlayingWidget-coverArt,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-coverSlotCollapsed-container,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .QjXBPUJOGqRvUKoKLwBv,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .hx8RwqDIY4ZzmBQcomN5,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] [data-testid="cover-art-button"] {
+  width: 36px !important;
+  height: 36px !important;
+  min-width: 36px !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  margin-inline-end: 2px !important;
+}
+
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-nowPlayingWidget-coverArt img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .main-coverSlotCollapsed-container img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] .QjXBPUJOGqRvUKoKLwBv img,
+.main-nowPlayingBar-left [data-testid="now-playing-widget"] [data-testid="cover-art-button"] img {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+}
+
+.main-nowPlayingBar-left .tUoHgXvEUCxKvXSJQmH9,
+.main-nowPlayingBar-left .main-nowPlayingWidget-trackInfo {
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+  margin: 0 4px !important;
+}
+
+.main-nowPlayingBar-left .N3In4008lBbhQsHzxo9g {
+  margin: 0 2px !important;
+  gap: 6px !important;
+  flex-shrink: 0 !important;
+}
+
+[data-testid="bpm-key-metadata"] {
+  gap: 2px !important;
+  margin-inline: 2px !important;
+}
+
+[data-testid="bpm-key-metadata"] .FQzlEc9iLGlUtjpCFOUx > *,
+[data-testid="bpm-key-metadata"] > div:nth-child(2) > * {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16) !important;
+  background-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16) !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.30) !important;
+  border-radius: 6px !important;
+  padding: 1px 5px !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  line-height: 1.25 !important;
+  box-shadow: none !important;
+  filter: none !important;
+}
+
+#cronotofy-npb-telemetry {
+  order: 99 !important;
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  min-width: 0;
+  max-width: 138px;
+  z-index: 2;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.11);
+  border-radius: 0 8px 8px 0;
+  padding: 2px 4px 2px 8px;
+  margin: 0;
+  text-align: right;
+  color: inherit;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+
+#cronotofy-npb-telemetry:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.12);
+}
+
+.cronotofy-npb-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border-radius: 0;
+  line-height: 1.25;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.cronotofy-npb-pill.cronotofy-npb-session {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+}
+
+.cronotofy-npb-pill.cronotofy-npb-session::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--cronotofy-accent, #e2e8f0);
+  box-shadow: 0 0 6px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.7);
+}
+
+.cronotofy-npb-pill.cronotofy-npb-today {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.68);
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-right {
+  grid-area: extras !important;
+  width: auto !important;
+  min-width: 0 !important;
+  flex: 0 0 auto !important;
+  justify-content: flex-end !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-extraControls {
+  gap: 2px !important;
+  flex-wrap: nowrap !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  margin-right: 4px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 4px !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] .GRePaldGFb3UeyjULrVd {
+  width: 32px !important;
+  min-width: 32px !important;
+  transition: width 0.2s cubic-bezier(0.22, 1, 0.36, 1) !important;
+}
+
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:hover .GRePaldGFb3UeyjULrVd,
+.main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:focus-within .GRePaldGFb3UeyjULrVd {
+  width: 68px !important;
+}
+
+#cronotofy-volume-pct {
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.80);
+  min-width: 30px;
+  text-align: right;
+  pointer-events: none;
+  user-select: none;
+  line-height: 1;
+}
+
+#cronotofy-sleep-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 7px;
+  margin-inline: 2px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.32);
+  color: rgba(255, 255, 255, 0.72);
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
+}
+
+#cronotofy-sleep-btn:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16);
+  border-color: rgba(255, 255, 255, 0.24);
+  color: #ffffff;
+}
+
+#cronotofy-sleep-btn.active {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.22);
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48);
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  box-shadow: 0 0 12px -2px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.42);
+}
+
+#cronotofy-sleep-btn:not(.active) .cronotofy-sleep-label:empty {
+  display: none;
+}
+
+.main-nowPlayingBar-container .main-connectBar-connectBar {
+  margin: 5px auto 0 !important;
+  border-radius: 999px !important;
+  width: fit-content !important;
+  padding-inline: 14px !important;
+  pointer-events: auto !important;
+}
+
+@media (max-width: 1440px) {
+  #cronotofy-npb-telemetry {
+    max-width: 142px;
+    padding-left: 8px;
+  }
+
+  .cronotofy-npb-pill.cronotofy-npb-session {
+    font-size: 10px;
+  }
+
+  .cronotofy-npb-pill.cronotofy-npb-today {
+    font-size: 9.5px;
+  }
+}
+
+@media (max-width: 1060px) {
+  .main-nowPlayingBar-nowPlayingBar {
+    padding: 8px 16px 7px !important;
+    column-gap: 10px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
+    gap: 6px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"] .GRePaldGFb3UeyjULrVd {
+    width: 22px !important;
+    min-width: 22px !important;
+  }
+
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:hover .GRePaldGFb3UeyjULrVd,
+  .main-nowPlayingBar-nowPlayingBar [data-testid="volume-bar"]:focus-within .GRePaldGFb3UeyjULrVd {
+    width: 62px !important;
+  }
+
+  #cronotofy-npb-telemetry {
+    max-width: 116px;
+  }
+}
+
+@media (max-width: 820px) {
+  .main-nowPlayingBar-nowPlayingBar {
+    border-radius: 26px !important;
+    padding: 8px 12px 7px !important;
+  }
+
+  #cronotofy-npb-telemetry,
+  #cronotofy-volume-pct,
+  #cronotofy-sleep-btn:not(.active) {
+    display: none;
+  }
+}
+
+#cronotofy-ext-host {
+  position: absolute;
+  inset: 0;
+  z-index: 45;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: transparent;
+}
+
+.cronotofy-panel-anchor {
+  position: relative;
+}
+
+.cronotofy-panel-anchor .main-view-container__scroll-node,
+.cronotofy-panel-anchor [data-overlayscrollbars-viewport] {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+`;
+  function ensureGlobalWallStyle() {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById(GLOBAL_WALL_STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== GLOBAL_WALL_CSS) {
+        existing.textContent = GLOBAL_WALL_CSS;
+      }
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = GLOBAL_WALL_STYLE_ID;
+    style.textContent = GLOBAL_WALL_CSS;
+    document.head.appendChild(style);
+  }
+  var GlobalAlbumWallController = class {
+    constructor() {
+      this.container = null;
+      this.currentCovers = [];
+      this.renderSignature = "";
+      this.userId = "default";
+      this.initialized = false;
+    }
+    async init() {
+      if (this.initialized) return;
+      this.initialized = true;
+      this.ensureMounted();
+      const user = await resolveCurrentSpotifyUser();
+      this.userId = user?.id || "default";
+      this.loadCachedImmediately(this.userId);
+      if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
+      try {
+        const [topShort, topMid, topLong, libTracks, libAlbums, libArtists] = await Promise.all([
+          fetchTopContentFromDesktop("short_term", 50).catch(() => ({ tracks: [], artists: [] })),
+          fetchTopContentFromDesktop("medium_term", 50).catch(() => ({ tracks: [], artists: [] })),
+          fetchTopContentFromDesktop("long_term", 50).catch(() => ({ tracks: [], artists: [] })),
+          fetchLibraryTracksFromDesktop(150).catch(() => []),
+          fetchLibraryAlbumsFromDesktop(100).catch(() => []),
+          fetchLibraryArtistsFromDesktop(50).catch(() => [])
+        ]);
+        const seedCovers = [];
+        const artistCandidates = [];
+        const seenArtistKeys = /* @__PURE__ */ new Set();
+        const pushArtist = (id, name) => {
+          const clean = (name || "").trim();
+          if (!clean) return;
+          const key = id || clean.toLowerCase();
+          if (seenArtistKeys.has(key)) return;
+          seenArtistKeys.add(key);
+          artistCandidates.push({ id, name: clean });
+        };
+        const pushTrackSeed = (tr) => {
+          if (!tr) return;
+          const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
+          if (img) {
+            seedCovers.push({
+              id: String(tr.album?.id || tr.id || img),
+              title: String(tr.album?.name || tr.name || ""),
+              artistName: String(tr.artists?.[0]?.name || ""),
+              imageUrl: img
+            });
+          }
+          if (Array.isArray(tr?.artists)) {
+            for (const a of tr.artists) {
+              if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
+            }
+          }
+        };
+        for (const a of [...topShort.artists, ...topMid.artists, ...topLong.artists, ...libArtists]) {
+          if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
+        }
+        for (const alb of libAlbums) {
+          if (alb.imageUrl) {
+            seedCovers.push({
+              id: alb.id,
+              title: alb.name,
+              artistName: alb.artistName,
+              imageUrl: alb.imageUrl
+            });
+          }
+        }
+        for (const tr of [...topShort.tracks, ...topMid.tracks, ...topLong.tracks, ...libTracks]) {
+          pushTrackSeed(tr);
+        }
+        const uniqueSeeds = deduplicateWallCovers(seedCovers);
+        if (uniqueSeeds.length > 0 && this.currentCovers.length === 0) {
+          this.updateCovers(uniqueSeeds, this.userId);
+        }
+        const enriched = await collectFavoriteArtistCovers({
+          userId: this.userId,
+          artistCandidates: artistCandidates.slice(0, 16),
+          seedTrackCovers: uniqueSeeds
+        });
+        if (enriched.length > 0) {
+          this.updateCovers(enriched, this.userId);
+        }
+      } catch {
+      }
+    }
+    ensureMounted() {
+      if (typeof document === "undefined" || !document.body) return null;
+      if (this.container && document.body.contains(this.container)) {
+        return this.container;
+      }
+      const existing = document.getElementById(GLOBAL_WALL_ROOT_ID);
+      if (existing) {
+        this.container = existing;
+        return existing;
+      }
+      const el = document.createElement("div");
+      el.id = GLOBAL_WALL_ROOT_ID;
+      el.setAttribute("aria-hidden", "true");
+      document.body.prepend(el);
+      this.container = el;
+      return el;
+    }
+    loadCachedImmediately(uid) {
+      try {
+        const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${uid || "default"}`;
+        const raw = localStorage.getItem(key) || localStorage.getItem(`${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_default`);
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.covers) && parsed.covers.length > 0) {
+          this.updateCovers(parsed.covers, uid);
+        }
+      } catch {
+      }
+    }
+    updateCovers(covers, seedKey) {
+      if (!Array.isArray(covers) || covers.length === 0) return;
+      if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
+      const unique = deduplicateWallCovers(covers);
+      if (unique.length === 0) return;
+      if (this.currentCovers.length >= unique.length && this.renderSignature !== "") {
+        return;
+      }
+      this.currentCovers = unique;
+      if (seedKey) this.userId = seedKey;
+      this.renderWall();
+    }
+    renderWall() {
+      if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
+      const unique = deduplicateWallCovers(this.currentCovers);
+      if (unique.length === 0) return;
+      const firstId = unique[0]?.id || "";
+      const lastId = unique[unique.length - 1]?.id || "";
+      const sig = `horizontal:${unique.length}:${firstId}:${lastId}`;
+      if (this.renderSignature === sig) return;
+      this.renderSignature = sig;
+      const container = this.ensureMounted();
+      if (!container) return;
+      const rows = buildAlbumWallLanes(unique, this.userId || "cronotofy", 6, 12);
+      const speeds = ["118s", "136s", "110s", "130s", "114s", "142s"];
+      const grid = document.createElement("div");
+      grid.className = "cronotofy-gwall-grid";
+      rows.forEach((rowItems, rowIndex) => {
+        const row = document.createElement("div");
+        const dir = rowIndex % 2 === 0 ? "left" : "right";
+        row.className = `cronotofy-gwall-row ${dir}`;
+        row.style.setProperty("--cronotofy-gmarquee-duration", speeds[rowIndex % speeds.length]);
+        for (const cover of [...rowItems, ...rowItems]) {
+          const tile = document.createElement("div");
+          tile.className = "cronotofy-gwall-tile";
+          const img = document.createElement("img");
+          img.src = cover.imageUrl;
+          img.alt = "";
+          img.loading = "lazy";
+          tile.appendChild(img);
+          row.appendChild(tile);
+        }
+        grid.appendChild(row);
+      });
+      const scrim = document.createElement("div");
+      scrim.className = "cronotofy-gwall-scrim";
+      container.replaceChildren(grid, scrim);
+    }
+  };
+
+  // spicetify-cronotofy/src/neonLyrics.ts
+  var NEON_LYRICS_STYLE_ID = "cronotofy-neon-lyrics-style";
+  var VINYL_HOST_ID = "cronotofy-lyrics-vinyl";
+  var BROWSE_TIMEOUT_MS = 1e4;
+  function computeCharDisintegration(index, codePoint) {
+    const hash = Math.abs((index + 1) * 73 + codePoint * 31);
+    return {
+      dx: hash % 59 - 14,
+      dy: -16 - Math.floor(hash / 7) % 35,
+      rot: Math.floor(hash / 13) % 57 - 26,
+      spark: index % 4 === 0
+    };
+  }
+  function findFullLyricsContainer() {
+    return Array.from(document.querySelectorAll(".u42Yq3ZaAiFZXbkvIpwy .z5jGVvMKwt3RUCcmlwby")).find(
+      (el) => !el.closest(".NknVk8hYvXI6ovbE8Zj0")
+    ) || null;
+  }
+  function findScrollParent(el) {
+    let cur = el.parentElement;
+    while (cur && cur !== document.documentElement) {
+      if (cur.hasAttribute("data-overlayscrollbars-viewport")) {
+        return cur;
+      }
+      const overflowY = window.getComputedStyle(cur).overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && cur.scrollHeight >= cur.clientHeight) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+  var NEON_LYRICS_CSS = `
+/* Full Lyrics View \u2014 Transparent Album-Wall Backdrop (never flat cover tint) */
+html.cronotofy-lyrics-open .Root__main-view {
+  position: relative !important;
+  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.04) !important;
+  background-image: none !important;
+}
+
+html.cronotofy-lyrics-open .Root__cinema-view,
+html.cronotofy-lyrics-open .wtCMUhX_QmNKSCghbq4h,
+html.cronotofy-lyrics-open .jGYHNMjn1dKKjOUSxUdN,
+html.cronotofy-lyrics-open .frs5ZPluzLbWTu5dCHr0,
+html.cronotofy-lyrics-open .SJ6kQcks6OWaQD8WvlrE,
+html.cronotofy-lyrics-open .KQ5SDwOFi3U9EYsWMAag,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::before,
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::after,
+html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport],
+html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport] > div,
+html.cronotofy-lyrics-open .Ke_cNZcH3Yvd2QEbgKJk::before,
+.wYWhVPZoG93lR7ogMIug,
+.Ii0P5lvVrAzHgsutQTVz,
+.u42Yq3ZaAiFZXbkvIpwy,
+html.cronotofy-lyrics-open .main-topBar-background,
+html.cronotofy-lyrics-open .main-topBar-overlay,
+html.cronotofy-lyrics-open .main-view-container__scroll-node,
+html.cronotofy-lyrics-open .main-view-container__scroll-node-child {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  outline: none !important;
+  border: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  --lyrics-color-background: transparent !important;
+  --cinema-mode-bg-color-from: transparent !important;
+  --cinema-mode-bg-color-to: transparent !important;
+}
+
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua {
+  display: none !important;
+}
+
+/* Lift Spotify's floating Sync button cleanly above the Now Playing bar capsule */
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW {
+  bottom: 120px !important;
+  z-index: 75 !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP),
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) {
+  pointer-events: auto !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button {
+  pointer-events: auto !important;
+  cursor: pointer !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.78) !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48) !important;
+  backdrop-filter: blur(14px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.58),
+    0 0 18px -4px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.45) !important;
+}
+
+html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button:hover,
+html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button:hover {
+  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.26) !important;
+  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
+}
+
+/* Hide underlying panels in Cinema Lyrics so no vertical bar bleeds behind vinyl */
+html.cronotofy-cinema-lyrics .Root__right-sidebar,
+html.cronotofy-cinema-lyrics .Root__right-sidebar-peek,
+html.cronotofy-cinema-lyrics .Root__nav-bar,
+html.cronotofy-cinema-lyrics .Root__main-view {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/* Shared layout geometry: large spinning vinyl on left + lyrics neatly beside it */
+:root {
+  --nl-vinyl-left: clamp(24px, 3vw, 48px);
+  --nl-vinyl-size: clamp(260px, 24vw, 340px);
+  --nl-vinyl-gap: clamp(28px, 3vw, 48px);
+}
+
+html.cronotofy-cinema-lyrics {
+  --nl-vinyl-left: clamp(44px, 8vw, 150px);
+  --nl-vinyl-size: clamp(340px, 30vw, 460px);
+  --nl-vinyl-gap: clamp(36px, 3.8vw, 64px);
+}
+
+.u42Yq3ZaAiFZXbkvIpwy {
+  align-items: flex-start !important;
+  padding-inline-start: calc(var(--nl-vinyl-left) + var(--nl-vinyl-size) + var(--nl-vinyl-gap)) !important;
+  padding-inline-end: clamp(28px, 4vw, 72px) !important;
+  box-sizing: border-box !important;
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .z5jGVvMKwt3RUCcmlwby {
+  width: 100% !important;
+  max-width: 840px !important;
+  font-size: clamp(2.45rem, 3.9vw, 3.95rem) !important;
+  line-height: 1.24 !important;
+  letter-spacing: -0.015em;
+}
+
+/* Hide unsung and unenhanced passed lines smoothly when not scrolling */
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.y45YX8smwP4lW13IQulz:not(.cronotofy-nl-enhanced),
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.l_p6nU70V4sJ7XaycCp3:not(.cronotofy-nl-enhanced) {
+  opacity: 0 !important;
+  transition: opacity 0.8s ease;
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced {
+  position: relative;
+  contain: layout style;
+}
+
+/* Keep React's text node in place untouched while visually presenting the kinetic stage */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced > .lyrics-lyricsContent-text {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.cronotofy-nl-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.24;
+}
+
+.cronotofy-nl-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.cronotofy-nl-space {
+  display: inline-block;
+  width: 0.28em;
+}
+
+.cronotofy-nl-ch {
+  display: inline-block;
+  position: relative;
+  transform-origin: center 65%;
+}
+
+/* Upcoming & already-finished lines: fade smoothly away when idle */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.y45YX8smwP4lW13IQulz .cronotofy-nl-ch,
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-gone .cronotofy-nl-ch {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.55s ease;
+}
+
+/* Manual scroll reveal (stays visible for 30s after last scroll gesture) */
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:not(.cronotofy-nl-active):not(.cronotofy-nl-disintegrating) .cronotofy-nl-ch,
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr:not(.cronotofy-nl-enhanced) {
+  opacity: 0.48 !important;
+  filter: none !important;
+  transform: none !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow: 0 0 12px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.32);
+  transition: opacity 0.45s ease !important;
+  pointer-events: auto;
+}
+
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:hover .cronotofy-nl-ch {
+  opacity: 0.94 !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow: 0 0 18px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
+}
+
+/* Active line: fluid GPU-composited neon materialization tinted with active cover palette */
+@keyframes cronotofyNeonFluidIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(-8px, 14px, 0) scale(0.9) skewX(-4deg);
+  }
+  60% {
+    opacity: 0.96;
+    transform: translate3d(0.5px, -1px, 0) scale(1.015) skewX(0deg);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1) skewX(0deg);
+  }
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-active .cronotofy-nl-ch {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  will-change: transform, opacity;
+  text-shadow:
+    0 0 4px rgba(255, 255, 255, 0.72),
+    0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+    0 0 32px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.58);
+  animation: cronotofyNeonFluidIn 480ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--i, 0) * var(--in-step, 20ms));
+}
+
+/* Passed bar: GPU-composited ash/ember disintegration + glowing sparks */
+@keyframes cronotofyNeonCharDisintegrate {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) rotate(0deg) scale(1);
+  }
+  22% {
+    opacity: 0.9;
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.16), calc(var(--dy, -24px) * 0.16), 0)
+      rotate(calc(var(--rot, 8deg) * 0.16))
+      scale(1.03);
+  }
+  62% {
+    opacity: 0.34;
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.66), calc(var(--dy, -24px) * 0.66), 0)
+      rotate(calc(var(--rot, 8deg) * 0.66))
+      scale(0.74);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--dx, 12px), var(--dy, -24px), 0) rotate(var(--rot, 8deg)) scale(0.32);
+  }
+}
+
+@keyframes cronotofyNeonSpark {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 0, 0) scale(0.4);
+  }
+  25% {
+    opacity: 1;
+    transform: translate3d(calc(var(--dx, 12px) * 0.3), calc(var(--dy, -24px) * 0.4), 0) scale(1.1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(calc(var(--dx, 12px) * 1.35), calc(var(--dy, -24px) * 1.45), 0) scale(0.15);
+  }
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  will-change: transform, opacity;
+  text-shadow:
+    0 0 10px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.85),
+    0 0 24px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.45);
+  animation: cronotofyNeonCharDisintegrate 720ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 12ms));
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  pointer-events: none;
+  background: var(--cronotofy-accent, #e2e8f0);
+  box-shadow:
+    0 0 8px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+    0 0 14px #ffffff;
+  animation: cronotofyNeonSpark 780ms ease-out forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 16ms) + 60ms);
+}
+
+/* Right-side slow spinning vinyl record */
+@keyframes cronotofyVinylSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+#${VINYL_HOST_ID} {
+  position: absolute;
+  left: var(--nl-vinyl-left);
+  right: auto;
+  top: 47%;
+  transform: translateY(-50%);
+  z-index: 6;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: var(--nl-vinyl-size);
+  opacity: 1;
+  transition: opacity 0.4s ease;
+}
+
+#${VINYL_HOST_ID}.is-fixed {
+  position: fixed;
+  left: var(--nl-vinyl-left);
+  right: auto;
+  top: 47%;
+  transform: translateY(-50%);
+  z-index: 50;
+}
+
+html.cronotofy-ext-open #${VINYL_HOST_ID} {
+  display: none !important;
+}
+
+.cronotofy-vinyl-stage {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  position: relative;
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.68),
+    0 0 64px -8px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.46);
+}
+
+.cronotofy-vinyl-disc {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: repeating-radial-gradient(
+    circle at center,
+    rgba(255, 255, 255, 0.045) 0px,
+    rgba(255, 255, 255, 0.045) 1px,
+    rgba(6, 8, 12, 0.94) 2px,
+    rgba(14, 18, 26, 0.96) 4px
+  );
+  border: 1.5px solid rgba(255, 255, 255, 0.16);
+  animation: cronotofyVinylSpin 24s linear infinite;
+  will-change: transform;
+}
+
+#${VINYL_HOST_ID}.is-paused .cronotofy-vinyl-disc {
+  animation-play-state: paused;
+}
+
+.cronotofy-vinyl-sheen {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(
+    from 25deg,
+    transparent 0deg,
+    rgba(255, 255, 255, 0.13) 34deg,
+    transparent 74deg,
+    transparent 180deg,
+    rgba(255, 255, 255, 0.09) 216deg,
+    transparent 255deg
+  );
+}
+
+.cronotofy-vinyl-cover {
+  width: 68%;
+  height: 68%;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48);
+  box-shadow: 0 0 20px rgba(0, 0, 0, 0.55);
+  background: rgba(11, 15, 23, 0.85);
+}
+
+.cronotofy-vinyl-spindle {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #060910 42%, rgba(255, 255, 255, 0.34) 55%, #111722 72%);
+  border: 1.5px solid rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.cronotofy-vinyl-meta {
+  text-align: center;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cronotofy-vinyl-title {
+  font-family: var(--encore-title-font-stack, SpotifyMixUITitle, sans-serif);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow: 0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.65);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cronotofy-vinyl-artist {
+  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1120px) {
+  :root {
+    --nl-vinyl-size: 230px;
+    --nl-vinyl-left: 24px;
+    --nl-vinyl-gap: 26px;
+  }
+
+  html.cronotofy-cinema-lyrics {
+    --nl-vinyl-size: 280px;
+    --nl-vinyl-left: 32px;
+    --nl-vinyl-gap: 32px;
+  }
+}
+
+@media (max-width: 880px) {
+  #${VINYL_HOST_ID} {
+    display: none !important;
+  }
+
+  .u42Yq3ZaAiFZXbkvIpwy {
+    padding-inline: 24px !important;
+    align-items: center !important;
+  }
+}
+
+/* Unsynced lyrics & right-panel mini preview neon bloom */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.tTJvSBNfeQLp4kyD7ULO {
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow:
+    0 0 10px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.55),
+    0 0 26px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.30);
+}
+
+.NknVk8hYvXI6ovbE8Zj0 .SOT5gG00YqnGQ4uR7PwQ {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow:
+    0 0 6px rgba(255, 255, 255, 0.75),
+    0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.85);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced .cronotofy-nl-ch,
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after,
+  .cronotofy-vinyl-disc {
+    animation: none !important;
+    filter: none !important;
+    transform: none !important;
+    transition: opacity 0.25s ease !important;
+  }
+
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+    opacity: 0;
+  }
+}
+`;
+  function ensureNeonLyricsStyle() {
+    if (typeof document === "undefined") return;
+    const existing = document.getElementById(NEON_LYRICS_STYLE_ID);
+    if (existing) {
+      if (existing.textContent !== NEON_LYRICS_CSS) {
+        existing.textContent = NEON_LYRICS_CSS;
+      }
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = NEON_LYRICS_STYLE_ID;
+    style.textContent = NEON_LYRICS_CSS;
+    document.head.appendChild(style);
+  }
+  var NeonLyricsController = class {
+    constructor() {
+      this.observer = null;
+      this.syncRafPending = false;
+      this.initialized = false;
+      this.activeLineKeys = /* @__PURE__ */ new Set();
+      this.disintegratingKeys = /* @__PURE__ */ new Set();
+      this.disintegratedKeys = /* @__PURE__ */ new Set();
+      this.keyTimers = /* @__PURE__ */ new Map();
+      this.boundScrollTargets = /* @__PURE__ */ new WeakSet();
+      this.browseTimer = null;
+      this.vinylHost = null;
+      this.vinylImg = null;
+      this.vinylTitleEl = null;
+      this.vinylArtistEl = null;
+      this.lastVinylCover = "";
+      this.lastVinylTitle = "";
+      this.lastVinylArtist = "";
+      this.lastSongSignature = "";
+      this.handleKeydown = (e) => {
+        if (document.documentElement.classList.contains("cronotofy-lyrics-open") && (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "PageUp" || e.key === "PageDown" || e.key === "Home" || e.key === "End")) {
+          this.triggerBrowseReveal();
+        }
+      };
+      this.handlePlayerUpdate = () => {
+        this.syncVinyl(findFullLyricsContainer());
+      };
+      this.handleDocumentClick = (e) => {
+        const target = e.target;
+        if (target?.closest?.(".rxth_Ddcp6DIwLpwR4ZW")) {
+          this.clearBrowseReveal();
+        }
+      };
+    }
+    init() {
+      if (this.initialized || typeof document === "undefined") return;
+      this.initialized = true;
+      ensureNeonLyricsStyle();
+      this.sync();
+      if (typeof window !== "undefined") {
+        window.addEventListener("keydown", this.handleKeydown);
+      }
+      document.addEventListener("click", this.handleDocumentClick, true);
+      Spicetify?.Player?.addEventListener?.("songchange", this.handlePlayerUpdate);
+      Spicetify?.Player?.addEventListener?.("onplaypause", this.handlePlayerUpdate);
+      if (document.body && typeof MutationObserver !== "undefined") {
+        this.observer = new MutationObserver((records) => {
+          if (this.syncRafPending) return;
+          let relevant = false;
+          for (const r of records) {
+            const target = r.target;
+            if (!target) continue;
+            if (r.type === "attributes") {
+              if (target.classList && (target.classList.contains("J4_kkGYm5hjbZlztykxr") || target.classList.contains("u42Yq3ZaAiFZXbkvIpwy") || target.classList.contains("wYWhVPZoG93lR7ogMIug") || target.classList.contains("Root__cinema-view"))) {
+                relevant = true;
+                break;
+              }
+            } else if (r.type === "childList") {
+              if (target.id === VINYL_HOST_ID || target.id === "cronotofy-npb-telemetry" || target.id === "cronotofy-global-wall" || target.classList && target.classList.contains("cronotofy-nl-stage") || target.closest && target.closest("#cronotofy-lyrics-vinyl, #cronotofy-npb-telemetry, #cronotofy-global-wall")) {
+                continue;
+              }
+              relevant = true;
+              break;
+            }
+          }
+          if (!relevant) return;
+          this.syncRafPending = true;
+          requestAnimationFrame(() => {
+            this.syncRafPending = false;
+            this.sync();
+          });
+        });
+        this.observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class"]
+        });
+      }
+    }
+    clearKeyTimer(key) {
+      const timer = this.keyTimers.get(key);
+      if (timer !== void 0) {
+        window.clearTimeout(timer);
+        this.keyTimers.delete(key);
+      }
+    }
+    clearBrowseReveal() {
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+        this.browseTimer = null;
+      }
+      if (typeof document !== "undefined") {
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }
+    }
+    triggerBrowseReveal() {
+      if (typeof document === "undefined") return;
+      document.documentElement.classList.add("cronotofy-nl-browsing");
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+      }
+      this.browseTimer = window.setTimeout(() => {
+        this.browseTimer = null;
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }, BROWSE_TIMEOUT_MS);
+    }
+    resetSongState() {
+      for (const timer of this.keyTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      this.keyTimers.clear();
+      this.activeLineKeys.clear();
+      this.disintegratingKeys.clear();
+      this.disintegratedKeys.clear();
+    }
+    ensureScrollBindings(container) {
+      const targets = [container];
+      const wrapper = container.closest(".wYWhVPZoG93lR7ogMIug");
+      if (wrapper) targets.push(wrapper);
+      const scrollParent = findScrollParent(container);
+      if (scrollParent) targets.push(scrollParent);
+      for (const target of targets) {
+        if (this.boundScrollTargets.has(target)) continue;
+        this.boundScrollTargets.add(target);
+        const onManualInteract = () => this.triggerBrowseReveal();
+        target.addEventListener("wheel", onManualInteract, { passive: true });
+        target.addEventListener("touchmove", onManualInteract, { passive: true });
+        target.addEventListener("pointerdown", onManualInteract, { passive: true });
+      }
+    }
+    getOrCreateVinylHost() {
+      if (this.vinylHost) return this.vinylHost;
+      const host = document.createElement("div");
+      host.id = VINYL_HOST_ID;
+      host.setAttribute("aria-hidden", "true");
+      const stage = document.createElement("div");
+      stage.className = "cronotofy-vinyl-stage";
+      const disc = document.createElement("div");
+      disc.className = "cronotofy-vinyl-disc";
+      const cover = document.createElement("img");
+      cover.className = "cronotofy-vinyl-cover";
+      cover.alt = "";
+      const spindle = document.createElement("div");
+      spindle.className = "cronotofy-vinyl-spindle";
+      const sheen = document.createElement("div");
+      sheen.className = "cronotofy-vinyl-sheen";
+      disc.append(cover, spindle);
+      stage.append(disc, sheen);
+      const meta = document.createElement("div");
+      meta.className = "cronotofy-vinyl-meta";
+      const title = document.createElement("div");
+      title.className = "cronotofy-vinyl-title";
+      const artist = document.createElement("div");
+      artist.className = "cronotofy-vinyl-artist";
+      meta.append(title, artist);
+      host.append(stage, meta);
+      this.vinylHost = host;
+      this.vinylImg = cover;
+      this.vinylTitleEl = title;
+      this.vinylArtistEl = artist;
+      return host;
+    }
+    syncVinyl(container) {
+      if (!container) {
+        document.getElementById(VINYL_HOST_ID)?.remove();
+        this.vinylHost?.remove();
+        return;
+      }
+      const cinemaView = container.closest(".Root__cinema-view");
+      const mainView = container.closest(".Root__main-view");
+      const mountTarget = cinemaView || mainView || document.body;
+      if (!mountTarget) return;
+      const host = this.getOrCreateVinylHost();
+      host.classList.toggle("is-fixed", !mainView);
+      const orphan = document.getElementById(VINYL_HOST_ID);
+      if (orphan && orphan !== host) orphan.remove();
+      if (host.parentElement !== mountTarget) {
+        mountTarget.appendChild(host);
+      }
+      const item = Spicetify?.Player?.data?.item;
+      const meta = item?.metadata || {};
+      const rawImg = meta.image_xlarge_url || meta.image_large_url || meta.image_url || item?.album?.images?.[0]?.url || "";
+      const coverUrl = normalizeSpotifyImage(rawImg);
+      const title = (meta.title || item?.name || "").trim();
+      const artist = (meta.artist_name || (Array.isArray(item?.artists) ? item.artists.map((a) => a?.name).filter(Boolean).join(", ") : "") || "").trim();
+      if (this.vinylImg) {
+        if (!coverUrl) {
+          if (this.lastVinylCover !== "") {
+            this.lastVinylCover = "";
+            this.vinylImg.removeAttribute("src");
+          }
+          this.vinylImg.style.visibility = "hidden";
+        } else {
+          this.vinylImg.style.visibility = "";
+          if (this.lastVinylCover !== coverUrl) {
+            this.lastVinylCover = coverUrl;
+            this.vinylImg.src = coverUrl;
+          }
+        }
+      }
+      if (this.vinylTitleEl && this.lastVinylTitle !== title) {
+        this.lastVinylTitle = title;
+        this.vinylTitleEl.textContent = title;
+      }
+      if (this.vinylArtistEl && this.lastVinylArtist !== artist) {
+        this.lastVinylArtist = artist;
+        this.vinylArtistEl.textContent = artist;
+      }
+      const isPlaying = Spicetify?.Player?.isPlaying?.();
+      host.classList.toggle("is-paused", isPlaying === false);
+    }
+    ensureEnhancedLine(line, textNode, text) {
+      if (line.dataset.cronotofyNlText === text && line.querySelector(".cronotofy-nl-stage")) {
+        return Number(line.dataset.cronotofyNlCount || "0");
+      }
+      line.querySelectorAll(":scope > .cronotofy-nl-stage").forEach((el) => el.remove());
+      const stage = document.createElement("span");
+      stage.className = "cronotofy-nl-stage";
+      stage.setAttribute("aria-hidden", "true");
+      const tokens = text.split(/(\s+)/);
+      let charIdx = 0;
+      for (const token of tokens) {
+        if (!token) continue;
+        if (/^\s+$/.test(token)) {
+          const space = document.createElement("span");
+          space.className = "cronotofy-nl-space";
+          space.textContent = "\xA0";
+          stage.appendChild(space);
+          continue;
+        }
+        const wordEl = document.createElement("span");
+        wordEl.className = "cronotofy-nl-word";
+        for (const ch of Array.from(token)) {
+          const span = document.createElement("span");
+          span.className = "cronotofy-nl-ch";
+          const vec = computeCharDisintegration(charIdx, ch.codePointAt(0) ?? 0);
+          if (vec.spark) span.classList.add("is-spark");
+          span.style.setProperty("--i", String(charIdx));
+          span.style.setProperty("--dx", `${vec.dx}px`);
+          span.style.setProperty("--dy", `${vec.dy}px`);
+          span.style.setProperty("--rot", `${vec.rot}deg`);
+          span.textContent = ch;
+          wordEl.appendChild(span);
+          charIdx++;
+        }
+        stage.appendChild(wordEl);
+      }
+      const inStep = Math.max(12, Math.min(24, Math.round(620 / Math.max(1, charIdx))));
+      const outStep = Math.max(8, Math.min(15, Math.round(320 / Math.max(1, charIdx))));
+      stage.style.setProperty("--in-step", `${inStep}ms`);
+      stage.style.setProperty("--out-step", `${outStep}ms`);
+      textNode.insertAdjacentElement("afterend", stage);
+      line.dataset.cronotofyNlText = text;
+      line.dataset.cronotofyNlCount = String(charIdx);
+      line.dataset.cronotofyNlOutStep = String(outStep);
+      line.classList.add("cronotofy-nl-enhanced");
+      return charIdx;
+    }
+    sync() {
+      const container = findFullLyricsContainer();
+      if (!container) {
+        document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+        this.clearBrowseReveal();
+        this.syncVinyl(null);
+        return;
+      }
+      const inCinema = Boolean(container.closest(".Root__cinema-view"));
+      document.documentElement.classList.add("cronotofy-lyrics-open");
+      document.documentElement.classList.toggle("cronotofy-cinema-lyrics", inCinema);
+      this.ensureScrollBindings(container);
+      this.syncVinyl(container);
+      const lines = container.querySelectorAll(".J4_kkGYm5hjbZlztykxr");
+      const sigParts = [];
+      lines.forEach((line) => {
+        if (sigParts.length >= 3) return;
+        const t = line.querySelector(":scope > .lyrics-lyricsContent-text")?.textContent?.trim();
+        if (t) sigParts.push(t);
+      });
+      const songSig = sigParts.join("\n");
+      if (songSig && songSig !== this.lastSongSignature) {
+        this.lastSongSignature = songSig;
+        this.resetSongState();
+      }
+      lines.forEach((line, idx) => {
+        if (line.classList.contains("tTJvSBNfeQLp4kyD7ULO") || line.classList.contains("YtTJm1ld5AeUmuu75urR")) {
+          return;
+        }
+        const textNode = line.querySelector(":scope > .lyrics-lyricsContent-text");
+        const text = textNode?.textContent?.trim() || "";
+        if (!textNode || !text) return;
+        const totalChars = this.ensureEnhancedLine(line, textNode, text);
+        const outStep = Number(line.dataset.cronotofyNlOutStep || "16");
+        const key = `${idx}:${text}`;
+        if (line.classList.contains("SOT5gG00YqnGQ4uR7PwQ")) {
+          this.clearKeyTimer(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          this.activeLineKeys.add(key);
+          line.classList.remove("cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+          line.classList.add("cronotofy-nl-active");
+        } else if (line.classList.contains("l_p6nU70V4sJ7XaycCp3")) {
+          if (this.activeLineKeys.has(key)) {
+            this.activeLineKeys.delete(key);
+            this.clearKeyTimer(key);
+            this.disintegratedKeys.delete(key);
+            this.disintegratingKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+            const duration = Math.min(1400, totalChars * outStep + 780);
+            const timer = window.setTimeout(() => {
+              this.keyTimers.delete(key);
+              this.disintegratingKeys.delete(key);
+              if (!this.activeLineKeys.has(key)) {
+                this.disintegratedKeys.add(key);
+              }
+              if (line.isConnected && !line.classList.contains("cronotofy-nl-active")) {
+                line.classList.remove("cronotofy-nl-disintegrating");
+                line.classList.add("cronotofy-nl-gone");
+              }
+            }, duration);
+            this.keyTimers.set(key, timer);
+          } else if (this.disintegratingKeys.has(key)) {
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+          } else {
+            this.disintegratedKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating");
+            line.classList.add("cronotofy-nl-gone");
+          }
+        } else {
+          this.clearKeyTimer(key);
+          this.activeLineKeys.delete(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+        }
+      });
+    }
+    destroy() {
+      this.observer?.disconnect();
+      this.observer = null;
+      if (typeof window !== "undefined") {
+        window.removeEventListener("keydown", this.handleKeydown);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("click", this.handleDocumentClick, true);
+        document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+      }
+      Spicetify?.Player?.removeEventListener?.("songchange", this.handlePlayerUpdate);
+      Spicetify?.Player?.removeEventListener?.("onplaypause", this.handlePlayerUpdate);
+      this.clearBrowseReveal();
+      this.resetSongState();
+      this.syncVinyl(null);
+      this.initialized = false;
+    }
+  };
+
+  // spicetify-cronotofy/src/bootstrap.ts
+  function bootstrapCronotofy(options = {}) {
+    let remainingAttempts = 200;
+    const reportStartupError = (err) => console.warn("[Cronotofy] startup error:", err);
+    const tryStart = () => {
+      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform || !document.body) {
+        if (--remainingAttempts > 0) setTimeout(tryStart, 300);
+        return;
+      }
+      if (window.__CRONOTOFY_MOD__) {
+        return;
+      }
+      try {
+        const tracker = new ListeningTracker();
+        const themeController = new DynamicThemeController();
+        const globalWall = new GlobalAlbumWallController();
+        ensureGlobalWallStyle();
+        const setVisualPreset = (preset) => {
+          document.documentElement.dataset.cronotofyPreset = preset;
+          if (preset !== "focus") void globalWall.init().catch(reportStartupError);
+        };
+        const chromeWidgets = new CronotofyChromeWidgets(tracker, {
+          onOpen: options.onOpen,
+          isOpen: options.isOpen
+        });
+        const neonLyrics = new NeonLyricsController();
+        let lastThemeKey = "";
+        const syncThemeFromPlayer = () => {
+          const live = tracker.getLiveTrack();
+          if (!live || !live.albumImageUrl) return;
+          const key = `${live.uri}|${live.albumImageUrl}`;
+          if (key === lastThemeKey) return;
+          lastThemeKey = key;
+          void themeController.updateFromLiveTrack(live);
+        };
+        const seedThemeIfNeeded = async () => {
+          if (themeController.getPalette().isDynamic) return;
+          const snap = tracker.getSnapshot();
+          const localCover = snap.recentPlays.find((p) => p.albumImageUrl) || snap.tracks.find((t) => t.albumImageUrl);
+          if (localCover?.albumImageUrl) {
+            await themeController.seedFromCoverIfNeeded(localCover.albumImageUrl, localCover.uri);
+            if (themeController.getPalette().isDynamic) return;
+          }
+          try {
+            const desktopTop = await fetchTopContentFromDesktop("short_term", 3).catch(() => ({
+              tracks: [],
+              artists: []
+            }));
+            const topTrack = desktopTop.tracks?.[0];
+            const topImg = normalizeSpotifyImage(topTrack?.album?.images?.[0]?.url);
+            if (topImg) {
+              await themeController.seedFromCoverIfNeeded(topImg, topTrack?.uri);
+            }
+          } catch {
+          }
+        };
+        window.__CRONOTOFY_MOD__ = {
+          version: CRONOTOFY_MOD_CONFIG.version,
+          getUser: () => resolveCurrentSpotifyUser(),
+          getTrackerSnapshot: () => tracker.getSnapshot(),
+          getLiveTrack: () => tracker.getLiveTrack(),
+          syncNow: () => tracker.syncNow(),
+          subscribe: (fn) => {
+            const unsubTracker = tracker.subscribe(fn);
+            const unsubTheme = themeController.subscribe(fn);
+            return () => {
+              unsubTracker();
+              unsubTheme();
+            };
+          },
+          clearLocalHistory: () => tracker.clearLocalHistory(),
+          getDynamicPalette: () => themeController.getPalette(),
+          setVisualPreset,
+          isDynamicThemeEnabled: () => themeController.isEnabled(),
+          setDynamicThemeEnabled: (enabled) => {
+            themeController.setEnabled(enabled);
+            lastThemeKey = "";
+            syncThemeFromPlayer();
+          },
+          setGeminiApiKey: (apiKey) => {
+            setGeminiApiKey(apiKey);
+            lastThemeKey = "";
+            const live = tracker.getLiveTrack();
+            if (live) {
+              void themeController.updateFromLiveTrack(live);
+            }
+          },
+          hasGeminiApiKey: () => Boolean(getConfiguredGeminiApiKey()),
+          updateWallCovers: (covers) => {
+            globalWall.updateCovers(covers);
+            if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
+              void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
+            }
+          }
+        };
+        void tracker.init().then(async () => {
+          syncThemeFromPlayer();
+          await seedThemeIfNeeded();
+        }).catch(reportStartupError);
+        setVisualPreset(readVisualPreset());
+        chromeWidgets.init();
+        options.onChromeReady?.(chromeWidgets);
+        tracker.subscribe(syncThemeFromPlayer);
+        Spicetify.Player.addEventListener?.("songchange", () => {
+          tracker.onSongChange();
+          syncThemeFromPlayer();
+        });
+        Spicetify.Player.addEventListener?.("onplaypause", () => {
+          tracker.onPlayPause();
+          syncThemeFromPlayer();
+        });
+        syncThemeFromPlayer();
+        try {
+          neonLyrics.init();
+        } catch (err) {
+          reportStartupError(err);
+        }
+      } catch (err) {
+        reportStartupError(err);
+      }
+    };
+    tryStart();
+  }
+
+  // spicetify-cronotofy/src/marketplaceEntry.ts
+  var EXT_HOST_ID = "cronotofy-ext-host";
+  (function initCronotofyMarketplaceExtension() {
+    let hostEl = null;
+    let reactRoot = null;
+    let isOpen = false;
+    let widgetsRef = null;
+    const setOpenClasses = (open) => {
+      document.documentElement.classList.toggle("cronotofy-ext-open", open);
+      document.documentElement.classList.toggle("cronotofy-route-active", open);
+    };
+    const closeView = () => {
+      if (!isOpen && !hostEl) return;
+      isOpen = false;
+      setOpenClasses(false);
+      try {
+        if (reactRoot && typeof reactRoot.unmount === "function") {
+          reactRoot.unmount();
+        } else if (hostEl && typeof Spicetify !== "undefined") {
+          Spicetify?.ReactDOM?.unmountComponentAtNode?.(hostEl);
+        }
+      } catch {
+      }
+      reactRoot = null;
+      hostEl?.parentElement?.classList.remove("cronotofy-panel-anchor");
+      hostEl?.remove();
+      hostEl = null;
+      widgetsRef?.syncActiveRoute();
+    };
+    const mountView = () => {
+      const mainView = findCronotofyMainView();
+      if (!mainView) return;
+      const createRoot = Spicetify?.ReactDOM?.createRoot || Spicetify?.ReactDOMClient?.createRoot;
+      const legacyRender = Spicetify?.ReactDOM?.render;
+      if (!Spicetify?.React || (typeof createRoot !== "function" && typeof legacyRender !== "function")) {
+        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
+        return;
+      }
+      if (hostEl && !mainView.contains(hostEl)) closeView();
+      if (!hostEl || !mainView.contains(hostEl)) {
+        document.getElementById(EXT_HOST_ID)?.remove();
+        hostEl = document.createElement("div");
+        hostEl.id = EXT_HOST_ID;
+        mainView.appendChild(hostEl);
+      }
+      try {
+        const appElement = render();
+        if (typeof createRoot === "function") {
+          reactRoot ??= createRoot(hostEl);
+          reactRoot.render(appElement);
+        } else {
+          Spicetify.ReactDOM.render(appElement, hostEl);
+        }
+        isOpen = true;
+        mainView.classList.add("cronotofy-panel-anchor");
+        setOpenClasses(true);
+        widgetsRef?.syncActiveRoute();
+      } catch (err) {
+        closeView();
+        console.warn("[Cronotofy] panel error:", err);
+        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
+      }
+    };
+    const handleOpenOrToggle = () => {
+      if (isOpen && !hostEl?.isConnected) closeView();
+      if (isOpen) {
+        if (hostEl && hostEl.scrollTop > 12) {
+          hostEl.scrollTo({ top: 0, behavior: "smooth" });
+        } else {
+          closeView();
+        }
+        return;
+      }
+      mountView();
+    };
+    bootstrapCronotofy({
+      onOpen: handleOpenOrToggle,
+      isOpen: () => isOpen,
+      onChromeReady: (widgets) => {
+        widgetsRef = widgets;
+        Spicetify?.Platform?.History?.listen?.(() => {
+          if (isOpen) {
+            closeView();
+          }
+        });
+        if (typeof window !== "undefined") {
+          window.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && isOpen && !e.defaultPrevented) {
+              closeView();
+            }
+          });
+        }
+      }
+    });
+  })();
+})();
