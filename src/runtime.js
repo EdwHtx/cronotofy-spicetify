@@ -2,7 +2,7 @@
 (() => {
   // spicetify-cronotofy/src/config.ts
   var CRONOTOFY_MOD_CONFIG = {
-    version: "2.0.0",
+    version: "2.1.0",
     tracking: {
       storagePrefix: "cronotofy_spicetify_tracker_v1",
       minPlaySeconds: 25,
