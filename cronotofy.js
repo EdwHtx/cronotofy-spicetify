@@ -2,7 +2,7 @@
 (() => {
   // spicetify-cronotofy/src/config.ts
   var CRONOTOFY_MOD_CONFIG = {
-    version: "2.1.0",
+    version: "2.1.1",
     tracking: {
       storagePrefix: "cronotofy_spicetify_tracker_v1",
       minPlaySeconds: 25,
@@ -23,1978 +23,6 @@
       enableAlbumWall: true
     }
   };
-
-  // spicetify-cronotofy/src/spotifyData.ts
-  var USER_TOP_CONTENT_HASH = "61b7353d3625780022dbc63d459eb64cd609e7e5e2a820f9160d65030efe2e15";
-  var ARTIST_DISCOGRAPHY_HASH = "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599";
-  var ARTIST_OVERVIEW_HASH = "eafb1620d783ece118e72fbfede2b0064483e029d3c1aafafa1c2de0e25a89e7";
-  var GQL_RANGE = {
-    short_term: "SHORT_TERM",
-    medium_term: "MID_TERM",
-    long_term: "LONG_TERM"
-  };
-  var artistOverviewCache = /* @__PURE__ */ new Map();
-  function idFromUri(uri) {
-    return String(uri || "").split(":").pop() || "";
-  }
-  function normalizeArtistKey(name) {
-    return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  }
-  function firstSourceUrl(sources) {
-    if (!Array.isArray(sources) || sources.length === 0) return "";
-    const best = sources[sources.length - 1] || sources[0];
-    return best?.url ? String(best.url) : sources[0]?.url ? String(sources[0].url) : "";
-  }
-  function buildDefinition(gql, opName, sha256Hash) {
-    const defs = gql?.Definitions || {};
-    if (defs[opName]) return defs[opName];
-    const sample = Object.values(defs).find((d) => d && typeof d === "object");
-    if (!sample) {
-      return { name: opName, operation: "query", sha256Hash, value: null };
-    }
-    const clone = Object.assign(Object.create(Object.getPrototypeOf(sample)), sample);
-    const sampleName = Object.keys(defs).find((k) => defs[k] === sample);
-    for (const key of Object.keys(clone)) {
-      const val = clone[key];
-      if (typeof val !== "string") continue;
-      if (/^[a-f0-9]{64}$/.test(val)) clone[key] = sha256Hash;
-      else if (val === sampleName) clone[key] = opName;
-    }
-    return clone;
-  }
-  async function requestDesktopGraphQL(opName, sha256Hash, variables) {
-    const gql = Spicetify?.GraphQL;
-    try {
-      const def = buildDefinition(gql, opName, sha256Hash);
-      if (def && typeof gql?.Request === "function") {
-        const res = await gql.Request(def, variables);
-        if (res?.data) return res.data;
-      }
-    } catch {
-    }
-    try {
-      const token = Spicetify?.Platform?.Session?.accessToken || Spicetify?.Platform?.AuthorizationAPI?.getState?.()?.token?.accessToken;
-      if (!token) return null;
-      const res = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          operationName: opName,
-          variables,
-          extensions: { persistedQuery: { version: 1, sha256Hash } }
-        })
-      });
-      if (!res.ok) return null;
-      const json = await res.json();
-      return json?.data ?? null;
-    } catch {
-      return null;
-    }
-  }
-  function mapTopContentResponse(data) {
-    const profile = data?.me?.profile;
-    const tracks = (profile?.topTracks?.items || []).map((it) => it?.data).filter((t) => t?.__typename === "Track" && t.uri).map((t) => ({
-      id: idFromUri(t.uri),
-      uri: t.uri,
-      name: t.name,
-      duration_ms: Number(t.duration?.totalMilliseconds || 0),
-      popularity: 0,
-      artists: (t.artists?.items || []).map((a) => ({
-        id: idFromUri(a?.uri),
-        name: a?.profile?.name || ""
-      })),
-      album: {
-        id: idFromUri(t.albumOfTrack?.uri),
-        name: t.albumOfTrack?.name || "",
-        images: [{ url: firstSourceUrl(t.albumOfTrack?.coverArt?.sources) }]
-      }
-    }));
-    const artists = (profile?.topArtists?.items || []).map((it) => it?.data).filter((a) => a?.__typename === "Artist" && a.uri).map((a) => ({
-      id: idFromUri(a.uri),
-      uri: a.uri,
-      name: a.profile?.name || "",
-      images: [{ url: firstSourceUrl(a.visuals?.avatarImage?.sources) }],
-      genres: [],
-      popularity: 0,
-      followers: { total: 0 }
-    }));
-    return { tracks, artists };
-  }
-  async function fetchTopContentFromDesktop(range, limit = 50) {
-    const runRange = async (gqlRange) => {
-      const input = { offset: 0, limit, sortBy: "AFFINITY", timeRange: gqlRange };
-      const data = await requestDesktopGraphQL("userTopContent", USER_TOP_CONTENT_HASH, {
-        includeTopArtists: true,
-        topArtistsInput: input,
-        includeTopTracks: true,
-        topTracksInput: input
-      });
-      return mapTopContentResponse(data);
-    };
-    let result = await runRange(GQL_RANGE[range]);
-    if (result.tracks.length === 0 && result.artists.length === 0 && range !== "short_term") {
-      result = await runRange("SHORT_TERM");
-    }
-    return result;
-  }
-  async function fetchLibraryTracksFromDesktop(limit = 50) {
-    try {
-      const libApi = Spicetify?.Platform?.LibraryAPI;
-      if (!libApi || typeof libApi.getTracks !== "function") return [];
-      const res = await libApi.getTracks({ offset: 0, limit });
-      const items = Array.isArray(res?.items) ? res.items : [];
-      return items.filter((tr) => tr && (tr.uri || tr.id)).map((tr) => {
-        const uri = String(tr.uri || `spotify:track:${tr.id}`);
-        const id = tr.id ? String(tr.id) : idFromUri(uri);
-        const imgUrl = tr.album?.images?.[0]?.url || firstSourceUrl(tr.album?.coverArt?.sources) || tr.images?.[0]?.url || "";
-        return {
-          id,
-          uri,
-          name: String(tr.name || ""),
-          duration_ms: Number(tr.duration?.milliseconds ?? tr.duration_ms ?? tr.duration ?? 0),
-          popularity: 0,
-          artists: Array.isArray(tr.artists) ? tr.artists.map((a) => ({
-            id: a?.id ? String(a.id) : idFromUri(a?.uri),
-            name: String(a?.name || "")
-          })) : [],
-          album: {
-            id: tr.album?.id ? String(tr.album.id) : idFromUri(tr.album?.uri),
-            name: String(tr.album?.name || ""),
-            images: imgUrl ? [{ url: String(imgUrl) }] : []
-          }
-        };
-      });
-    } catch {
-      return [];
-    }
-  }
-  async function fetchLibraryArtistsFromDesktop(limit = 100) {
-    try {
-      const libApi = Spicetify?.Platform?.LibraryAPI;
-      if (!libApi) return [];
-      let items = [];
-      if (typeof libApi.getArtists === "function") {
-        const res = await libApi.getArtists({ offset: 0, limit });
-        items = Array.isArray(res?.items) ? res.items : [];
-      } else if (typeof libApi.getContents === "function") {
-        const res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
-        items = Array.isArray(res?.items) ? res.items : [];
-      }
-      return items.filter((a) => {
-        if (!a || !a.name) return false;
-        const uri = String(a.uri || "");
-        return a.type === "artist" || uri.startsWith("spotify:artist:");
-      }).slice(0, limit).map((a) => {
-        const uri = String(a.uri || `spotify:artist:${a.id}`);
-        const id = a.id ? String(a.id) : idFromUri(uri);
-        const imgUrl = a.images?.[0]?.url || firstSourceUrl(a.visuals?.avatarImage?.sources) || "";
-        return {
-          id,
-          uri,
-          name: String(a.name),
-          images: imgUrl ? [{ url: String(imgUrl) }] : [],
-          genres: [],
-          popularity: 0,
-          followers: { total: 0 }
-        };
-      });
-    } catch {
-      return [];
-    }
-  }
-  async function fetchLibraryAlbumsFromDesktop(limit = 100) {
-    try {
-      const libApi = Spicetify?.Platform?.LibraryAPI;
-      if (!libApi || typeof libApi.getContents !== "function") return [];
-      let res = await libApi.getContents({ filters: ["0"], offset: 0, limit });
-      let items = Array.isArray(res?.items) ? res.items : [];
-      if (items.length === 0) {
-        res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
-        items = Array.isArray(res?.items) ? res.items : [];
-      }
-      return items.filter((a) => {
-        if (!a || !a.name) return false;
-        const uri = String(a.uri || "");
-        return a.type === "album" || uri.startsWith("spotify:album:");
-      }).slice(0, limit).map((a) => {
-        const uri = String(a.uri || `spotify:album:${a.id}`);
-        const id = a.id ? String(a.id) : idFromUri(uri);
-        const imageUrl = String(
-          a.images?.[0]?.url || firstSourceUrl(a.coverArt?.sources) || ""
-        );
-        const artistName = Array.isArray(a.artists) ? a.artists.map((art) => art?.name).filter(Boolean).join(", ") : String(a.artist?.name || "");
-        return {
-          id,
-          uri,
-          name: String(a.name),
-          artistName,
-          imageUrl
-        };
-      });
-    } catch {
-      return [];
-    }
-  }
-  async function fetchArtistAvatarFromDesktop(artistId) {
-    if (!artistId || artistId.startsWith("local:")) return null;
-    if (artistOverviewCache.has(artistId)) {
-      return artistOverviewCache.get(artistId) ?? null;
-    }
-    try {
-      const data = await requestDesktopGraphQL("queryArtistOverview", ARTIST_OVERVIEW_HASH, {
-        uri: `spotify:artist:${artistId}`,
-        locale: ""
-      });
-      const union = data?.artistUnion;
-      const imageUrl = firstSourceUrl(union?.visuals?.avatarImage?.sources) || firstSourceUrl(union?.visuals?.headerImage?.sources) || "";
-      const monthlyListeners = Number(union?.stats?.monthlyListeners || 0);
-      const result = imageUrl || monthlyListeners > 0 ? { imageUrl, monthlyListeners } : null;
-      artistOverviewCache.set(artistId, result);
-      return result;
-    } catch {
-      artistOverviewCache.set(artistId, null);
-      return null;
-    }
-  }
-  function reconcileTopArtists(params) {
-    const {
-      rawTopArtists,
-      periodTracks,
-      likedTracks = [],
-      savedAlbums = [],
-      followedArtists = [],
-      trackedTracks = [],
-      minTargetCount = 15,
-      getGenresForName
-    } = params;
-    const byKey = /* @__PURE__ */ new Map();
-    const idToKey = /* @__PURE__ */ new Map();
-    const nameToKey = /* @__PURE__ */ new Map();
-    const ensureEvidence = (id, name) => {
-      const cleanName = (name || "").trim();
-      const norm = normalizeArtistKey(cleanName);
-      const cleanId = id && !id.startsWith("local:") ? id.trim() : void 0;
-      if (!cleanName && !cleanId) return null;
-      let key = (cleanId ? idToKey.get(cleanId) : void 0) || (norm ? nameToKey.get(norm) : void 0);
-      if (!key) {
-        key = cleanId || `name:${norm}`;
-        byKey.set(key, {
-          key,
-          id: cleanId,
-          name: cleanName || cleanId || "",
-          periodTrackCount: 0,
-          periodTrackScore: 0,
-          likedCount: 0,
-          savedAlbumCount: 0,
-          isFollowed: false,
-          trackedSeconds: 0,
-          fallbackImageUrl: ""
-        });
-      }
-      const ev = byKey.get(key);
-      if (cleanId && !ev.id) ev.id = cleanId;
-      if (cleanName && (!ev.name || ev.name === ev.id)) ev.name = cleanName;
-      if (cleanId) idToKey.set(cleanId, key);
-      if (norm) nameToKey.set(norm, key);
-      return ev;
-    };
-    const lookupEvidence = (id, name) => {
-      const norm = normalizeArtistKey(name);
-      const key = (id ? idToKey.get(id) : void 0) || (norm ? nameToKey.get(norm) : void 0);
-      return key ? byKey.get(key) : void 0;
-    };
-    periodTracks.forEach((tr, idx) => {
-      const baseWeight = Math.max(1, periodTracks.length - idx);
-      const artists = tr.artistNamesList && tr.artistNamesList.length > 0 ? tr.artistNamesList : tr.artistName.split(",").map((s, artIdx) => ({ id: artIdx === 0 ? tr.artistId : void 0, name: s.trim() })).filter((x) => Boolean(x.name));
-      artists.forEach((art, artIdx) => {
-        const ev = ensureEvidence(art.id, art.name);
-        if (!ev) return;
-        ev.periodTrackCount += 1;
-        ev.periodTrackScore += artIdx === 0 ? baseWeight : Math.max(1, Math.round(baseWeight * 0.45));
-        if (!ev.fallbackImageUrl && tr.albumImageUrl) {
-          ev.fallbackImageUrl = tr.albumImageUrl;
-        }
-      });
-    });
-    for (const tr of likedTracks) {
-      const artists = Array.isArray(tr?.artists) ? tr.artists : [];
-      const img = String(tr?.album?.images?.[0]?.url || "");
-      for (const a of artists) {
-        if (!a?.name) continue;
-        const ev = ensureEvidence(a.id ? String(a.id) : void 0, String(a.name));
-        if (!ev) continue;
-        ev.likedCount += 1;
-        if (!ev.fallbackImageUrl && img) ev.fallbackImageUrl = img;
-      }
-    }
-    for (const alb of savedAlbums) {
-      if (!alb?.artistName) continue;
-      for (const part of alb.artistName.split(",")) {
-        const ev = ensureEvidence(void 0, part);
-        if (!ev) continue;
-        ev.savedAlbumCount += 1;
-        if (!ev.fallbackImageUrl && alb.imageUrl) ev.fallbackImageUrl = alb.imageUrl;
-      }
-    }
-    for (const fa of followedArtists) {
-      if (!fa?.name) continue;
-      const ev = ensureEvidence(fa.id ? String(fa.id) : void 0, String(fa.name));
-      if (!ev) continue;
-      ev.isFollowed = true;
-      const img = String(fa.images?.[0]?.url || "");
-      if (img) ev.fallbackImageUrl = img;
-    }
-    for (const tr of trackedTracks) {
-      if (!tr?.artistName || !(tr.totalSeconds > 0)) continue;
-      const parts = tr.artistName.split(",").map((s) => s.trim()).filter(Boolean);
-      parts.forEach((namePart, idx) => {
-        const ev = ensureEvidence(idx === 0 ? tr.artistId : void 0, namePart);
-        if (!ev) return;
-        ev.trackedSeconds += idx === 0 ? tr.totalSeconds : Math.round(tr.totalSeconds * 0.5);
-        if (!ev.fallbackImageUrl && tr.albumImageUrl) ev.fallbackImageUrl = tr.albumImageUrl;
-      });
-    }
-    const hasUserEvidence = periodTracks.length > 0 || likedTracks.length > 0 || savedAlbums.length > 0 || trackedTracks.length > 0;
-    const isVerified = (ev) => Boolean(
-      ev && (ev.periodTrackCount > 0 || ev.likedCount > 0 || ev.savedAlbumCount > 0 || ev.isFollowed || ev.trackedSeconds > 0)
-    );
-    const verifiedRaw = hasUserEvidence ? rawTopArtists.filter((raw) => isVerified(lookupEvidence(raw.id, raw.name))) : rawTopArtists;
-    const baseRaw = verifiedRaw.length > 0 ? verifiedRaw : rawTopArtists;
-    const combined = [];
-    const usedEvidenceKeys = /* @__PURE__ */ new Set();
-    baseRaw.forEach((raw, idx) => {
-      const ev = lookupEvidence(raw.id, raw.name);
-      if (ev) usedEvidenceKeys.add(ev.key);
-      const rankBoost = Math.max(24, 100 - idx * 3);
-      const evidenceBoost = ev ? ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120) : 0;
-      combined.push({
-        artist: raw,
-        ev,
-        rawScore: rankBoost * 3 + evidenceBoost
-      });
-    });
-    if (combined.length < minTargetCount) {
-      const candidates = Array.from(byKey.values()).filter(
-        (ev) => !usedEvidenceKeys.has(ev.key) && (ev.periodTrackCount > 0 || periodTracks.length === 0 && (ev.trackedSeconds >= 60 || ev.likedCount > 0))
-      ).sort((a, b) => {
-        const scoreA = a.periodTrackScore * 10 + Math.min(25, a.likedCount * 3) + Math.min(20, a.savedAlbumCount * 5) + Math.min(30, a.trackedSeconds / 90);
-        const scoreB = b.periodTrackScore * 10 + Math.min(25, b.likedCount * 3) + Math.min(20, b.savedAlbumCount * 5) + Math.min(30, b.trackedSeconds / 90);
-        return scoreB - scoreA;
-      });
-      for (const ev of candidates) {
-        if (combined.length >= minTargetCount) break;
-        usedEvidenceKeys.add(ev.key);
-        const id = ev.id || `local:${normalizeArtistKey(ev.name)}`;
-        const score = ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120);
-        combined.push({
-          artist: {
-            id,
-            uri: ev.id ? `spotify:artist:${ev.id}` : "",
-            name: ev.name,
-            imageUrl: ev.fallbackImageUrl,
-            genres: getGenresForName ? getGenresForName(ev.name) : [],
-            popularity: 0,
-            followers: 0
-          },
-          ev,
-          rawScore: score
-        });
-      }
-    }
-    const maxScore = combined.reduce((m, c) => Math.max(m, c.rawScore), 1);
-    return combined.map((entry, idx) => {
-      const fallbackScore = Math.max(24, Math.round(98 - idx * 3.2));
-      const scaled = maxScore > 0 ? Math.round(entry.rawScore / maxScore * 98) : fallbackScore;
-      const affinityScore = Math.min(99, Math.max(24, scaled));
-      return {
-        ...entry.artist,
-        affinityScore,
-        periodTrackCount: entry.ev?.periodTrackCount ?? 0,
-        trackedSeconds: entry.ev?.trackedSeconds ?? 0
-      };
-    });
-  }
-  async function fetchArtistDiscographyFromDesktop(artistId, limit = 12) {
-    if (!artistId) return [];
-    const data = await requestDesktopGraphQL("queryArtistDiscographyAll", ARTIST_DISCOGRAPHY_HASH, {
-      uri: `spotify:artist:${artistId}`,
-      offset: 0,
-      limit,
-      order: "DATE_DESC"
-    });
-    const groups = data?.artistUnion?.discography?.all?.items;
-    if (!Array.isArray(groups)) return [];
-    const out = [];
-    for (const group of groups) {
-      const releases = group?.releases?.items;
-      if (!Array.isArray(releases)) continue;
-      for (const rel of releases) {
-        const url = firstSourceUrl(rel?.coverArt?.sources);
-        if (!url) continue;
-        out.push({
-          id: String(rel.id || idFromUri(rel.uri) || rel.name || url),
-          name: String(rel.name || ""),
-          imageUrl: url,
-          releaseType: String(rel.type || "album").toLowerCase()
-        });
-      }
-    }
-    return out;
-  }
-
-  // spicetify-cronotofy/src/i18n.ts
-  var TRANSLATIONS = {
-    de: {
-      brandSubtitle: "Native Musik-Analyse \xB7 Echtzeit-Telemetrie",
-      tabs: {
-        overview: "\xDCbersicht",
-        artists: "K\xFCnstler",
-        tracks: "Songs",
-        albums: "Alben",
-        live: "Live-Aktivit\xE4t"
-      },
-      periods: {
-        short_term: "1 Monat",
-        medium_term: "6 Monate",
-        long_term: "Gesamt"
-      },
-      nowPlaying: "L\xE4uft gerade",
-      paused: "Pausiert",
-      currentSession: "Aktuelle Sitzung",
-      today: "Heute",
-      idleHint: "Spiele einen Song auf Spotify ab, um Live-Telemetrie zu erfassen.",
-      loadingAnalytics: "Spotify-Statistiken werden geladen...",
-      kpis: {
-        recordedTime: "Erfasste Zeit",
-        todayLabel: "Heute",
-        annualInCronotofy: (h) => `${h} j\xE4hrlich in Cronotofy`,
-        totalMod: (h) => `Gesamt: ${h}`,
-        topArtist: (period) => `Top-K\xFCnstler (${period})`,
-        artistsAnalyzed: (n) => `${n} K\xFCnstler analysiert`,
-        topTrack: (period) => `Top-Song (${period})`,
-        noData: "Keine Daten",
-        favoriteGenre: "Lieblingsgenre",
-        varied: "Gemischt",
-        affinityAndRecent: (pct, n) => `${pct}% Anteil \xB7 ${n} k\xFCrzliche Plays`,
-        tracksInRanking: (n) => `${n} Songs im Ranking`
-      },
-      sections: {
-        top5Artists: "Top 5 K\xFCnstler",
-        top5Tracks: "Top 5 Songs",
-        top4Albums: "Top 4 Alben",
-        genreDna: "Genre-DNA",
-        mainGenresBadge: (n) => `${n} Top-Genres`,
-        viewAll: (n) => `Alle ansehen (${n}) \u2192`,
-        tracksRanking: (period) => `Song-Ranking \xB7 ${period}`,
-        tracksBadge: (n) => `${n} Songs`,
-        tracksListenedToday: "Heute geh\xF6rt",
-        accumulatedDesktop: "Desktop gesamt",
-        exactSecondBySecond: "Sekundengenaue Erfassung",
-        capturedTracks: "Erfasste Songs",
-        completedPlays: (n) => `${n} vollst\xE4ndige Plays`,
-        lastSync: "Lokaler Speicher",
-        pending: "Aktiv",
-        topRealTimeTracks: "Songs nach echter H\xF6rzeit",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Echte K\xFCnstler & Verlauf",
-        clearLocalHistory: "Lokalen Verlauf l\xF6schen",
-        recordedPlays: (n) => `${n} erfasste Plays`,
-        latestCapturedPlays: "Zuletzt erfasste Plays",
-        localDateLabel: (d) => `Lokales Datum: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Spotify-K\xFCnstler",
-        untitled: "Ohne Titel",
-        unknownArtist: "Unbekannter K\xFCnstler",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} Top-Songs`,
-        songSingular: "Song",
-        songPlural: "Songs",
-        playSingular: "Play",
-        playPlural: "Plays"
-      },
-      empty: {
-        noArtistsPeriod: "Keine K\xFCnstler f\xFCr diesen Zeitraum verf\xFCgbar.",
-        noTracksPeriod: "Keine Songs f\xFCr diesen Zeitraum verf\xFCgbar.",
-        noAlbumsPeriod: "Keine Alben vorhanden.",
-        noGenres: "Keine Genre-Daten auf Spotify verf\xFCgbar.",
-        noArtistsFound: "Keine Top-K\xFCnstler f\xFCr diesen Zeitraum gefunden.",
-        noTrackedTimeYet: "Noch keine H\xF6rzeit erfasst. Spiele einfach einen Song auf Spotify ab.",
-        noRecentPlaysYet: "Songs mit \u2265 25s H\xF6rzeit erscheinen hier chronologisch."
-      },
-      actions: {
-        play: "Abspielen",
-        pause: "Pause",
-        addToQueue: "In die Warteschlange",
-        playingNowToast: (title) => `Spielt: ${title}`,
-        playbackErrorToast: "Wiedergabe konnte nicht gestartet werden",
-        queuedToast: (title) => `Zur Warteschlange hinzugef\xFCgt: ${title}`,
-        queueErrorToast: "Konnte nicht zur Warteschlange hinzugef\xFCgt werden",
-        historyClearedToast: "Lokaler Verlauf gel\xF6scht",
-        confirmClearHistory: "Wirklich l\xF6schen?",
-        copiedTrackToast: (title) => `Kopiert: ${title}`,
-        copyErrorToast: "Song konnte nicht kopiert werden",
-        noTrackPlayingToast: "Gerade l\xE4uft kein Song"
-      },
-      search: {
-        placeholder: "Nach Song, K\xFCnstler oder Album filtern...",
-        clear: "Filter l\xF6schen",
-        noResults: "Keine passenden Treffer gefunden."
-      },
-      streak: {
-        daysBadge: (n) => `${n}T Serie`,
-        last7Days: (h) => `7T: ${h}`
-      },
-      sleepTimer: {
-        label: "Sleep-Timer",
-        offToast: "Sleep-Timer aus",
-        endOfTrackShort: "Ende",
-        endOfTrackToast: "Sleep-Timer: Pause am Titelende",
-        minutesToast: (m) => `Sleep-Timer: ${m} Min.`,
-        triggeredToast: "Sleep-Timer abgelaufen \u2014 Wiedergabe pausiert",
-        tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
-        tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
-      },
-      time: {
-        justNow: "Gerade eben",
-        secondsAgo: (s) => `Vor ${s}s`,
-        minutesAgo: (m) => `Vor ${m}m`,
-        hoursAgo: (h) => `Vor ${h}h`
-      },
-      errorBoundary: {
-        title: "Fehler in Cronotofy",
-        fallbackMsg: "Beim Anzeigen dieser Ansicht ist ein unerwarteter Fehler aufgetreten.",
-        retry: "Erneut versuchen"
-      }
-    },
-    en: {
-      brandSubtitle: "Native music analytics \xB7 Real-time telemetry",
-      tabs: {
-        overview: "Overview",
-        artists: "Artists",
-        tracks: "Tracks",
-        albums: "Albums",
-        live: "Live Activity"
-      },
-      periods: {
-        short_term: "1 Month",
-        medium_term: "6 Months",
-        long_term: "All Time"
-      },
-      nowPlaying: "Now Playing",
-      paused: "Paused",
-      currentSession: "Current session",
-      today: "Today",
-      idleHint: "Play any song on Spotify to start live telemetry.",
-      loadingAnalytics: "Loading your Spotify stats...",
-      kpis: {
-        recordedTime: "Recorded Time",
-        todayLabel: "Today",
-        annualInCronotofy: (h) => `${h} annual in Cronotofy`,
-        totalMod: (h) => `Total: ${h}`,
-        topArtist: (period) => `Top Artist (${period})`,
-        artistsAnalyzed: (n) => `${n} artists analyzed`,
-        topTrack: (period) => `Top Track (${period})`,
-        noData: "No data",
-        favoriteGenre: "Favorite Genre",
-        varied: "Varied",
-        affinityAndRecent: (pct, n) => `${pct}% affinity \xB7 ${n} recent plays`,
-        tracksInRanking: (n) => `${n} tracks in ranking`
-      },
-      sections: {
-        top5Artists: "Top 5 Artists",
-        top5Tracks: "Top 5 Tracks",
-        top4Albums: "Top 4 Albums",
-        genreDna: "Genre DNA",
-        mainGenresBadge: (n) => `${n} top genres`,
-        viewAll: (n) => `View all (${n}) \u2192`,
-        tracksRanking: (period) => `Track Ranking \xB7 ${period}`,
-        tracksBadge: (n) => `${n} tracks`,
-        tracksListenedToday: "Listened Today",
-        accumulatedDesktop: "Desktop Total",
-        exactSecondBySecond: "Exact second-by-second tracking",
-        capturedTracks: "Captured Tracks",
-        completedPlays: (n) => `${n} completed plays`,
-        lastSync: "Local Storage",
-        pending: "Active",
-        topRealTimeTracks: "Tracks by Real Listening Time",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Real Artists & Recent History",
-        clearLocalHistory: "Clear local history",
-        recordedPlays: (n) => `${n} recorded plays`,
-        latestCapturedPlays: "Latest Captured Plays",
-        localDateLabel: (d) => `Local date: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Spotify Artist",
-        untitled: "Untitled",
-        unknownArtist: "Unknown Artist",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} ${n === 1 ? "top track" : "top tracks"}`,
-        songSingular: "track",
-        songPlural: "tracks",
-        playSingular: "play",
-        playPlural: "plays"
-      },
-      empty: {
-        noArtistsPeriod: "No artists available for this period.",
-        noTracksPeriod: "No tracks available for this period.",
-        noAlbumsPeriod: "No albums to display.",
-        noGenres: "No genre tags available on Spotify.",
-        noArtistsFound: "No top artists found for this period.",
-        noTrackedTimeYet: "No accumulated time yet. Play any track on Spotify and it will appear live here.",
-        noRecentPlaysYet: "Tracks played \u2265 25s will appear in this chronological timeline."
-      },
-      actions: {
-        play: "Play",
-        pause: "Pause",
-        addToQueue: "Add to queue",
-        playingNowToast: (title) => `Playing: ${title}`,
-        playbackErrorToast: "Could not start playback",
-        queuedToast: (title) => `Added to queue: ${title}`,
-        queueErrorToast: "Could not add to queue",
-        historyClearedToast: "Local history cleared",
-        confirmClearHistory: "Confirm clear?",
-        copiedTrackToast: (title) => `Copied: ${title}`,
-        copyErrorToast: "Could not copy track info",
-        noTrackPlayingToast: "No track playing right now"
-      },
-      search: {
-        placeholder: "Filter by song, artist or album...",
-        clear: "Clear filter",
-        noResults: "No matching results for your filter."
-      },
-      streak: {
-        daysBadge: (n) => `${n}d streak`,
-        last7Days: (h) => `7d: ${h}`
-      },
-      sleepTimer: {
-        label: "Sleep timer",
-        offToast: "Sleep timer off",
-        endOfTrackShort: "End",
-        endOfTrackToast: "Sleep timer: pause at end of track",
-        minutesToast: (m) => `Sleep timer: ${m} min`,
-        triggeredToast: "Sleep timer finished \u2014 playback paused",
-        tooltipIdle: "Sleep timer (Alt+Shift+S)",
-        tooltipActive: (detail) => `Sleep timer: ${detail} (right-click to cancel)`
-      },
-      time: {
-        justNow: "Just now",
-        secondsAgo: (s) => `${s}s ago`,
-        minutesAgo: (m) => `${m}m ago`,
-        hoursAgo: (h) => `${h}h ago`
-      },
-      errorBoundary: {
-        title: "Something went wrong in Cronotofy",
-        fallbackMsg: "An unexpected error occurred while rendering this view.",
-        retry: "Retry"
-      }
-    },
-    es: {
-      brandSubtitle: "Anal\xEDtica musical nativa \xB7 Telemetr\xEDa en tiempo real",
-      tabs: {
-        overview: "Resumen",
-        artists: "Artistas",
-        tracks: "Canciones",
-        albums: "\xC1lbumes",
-        live: "Actividad en Vivo"
-      },
-      periods: {
-        short_term: "1 Mes",
-        medium_term: "6 Meses",
-        long_term: "General"
-      },
-      nowPlaying: "Reproduciendo ahora",
-      paused: "En pausa",
-      currentSession: "Sesi\xF3n actual",
-      today: "Hoy",
-      idleHint: "Reproduce cualquier canci\xF3n en Spotify para capturar telemetr\xEDa en vivo.",
-      loadingAnalytics: "Cargando tus estad\xEDsticas de Spotify...",
-      kpis: {
-        recordedTime: "Tiempo Registrado",
-        todayLabel: "Hoy",
-        annualInCronotofy: (h) => `${h} anual en Cronotofy`,
-        totalMod: (h) => `Total: ${h}`,
-        topArtist: (period) => `Top Artista (${period})`,
-        artistsAnalyzed: (n) => `${n} artistas analizados`,
-        topTrack: (period) => `Top Canci\xF3n (${period})`,
-        noData: "Sin datos",
-        favoriteGenre: "G\xE9nero Favorito",
-        varied: "Variado",
-        affinityAndRecent: (pct, n) => `${pct}% de afinidad \xB7 ${n} escuchas recientes`,
-        tracksInRanking: (n) => `${n} canciones en ranking`
-      },
-      sections: {
-        top5Artists: "Top 5 Artistas",
-        top5Tracks: "Top 5 Canciones",
-        top4Albums: "Top 4 \xC1lbumes",
-        genreDna: "ADN de G\xE9neros",
-        mainGenresBadge: (n) => `${n} principales`,
-        viewAll: (n) => `Ver todos (${n}) \u2192`,
-        tracksRanking: (period) => `Ranking de Canciones \xB7 ${period}`,
-        tracksBadge: (n) => `${n} canciones`,
-        tracksListenedToday: "Escuchado Hoy",
-        accumulatedDesktop: "Acumulado en Escritorio",
-        exactSecondBySecond: "Medici\xF3n exacta segundo a segundo",
-        capturedTracks: "Pistas Capturadas",
-        completedPlays: (n) => `${n} reproducciones completas`,
-        lastSync: "Almacenamiento Local",
-        pending: "Activo",
-        topRealTimeTracks: "Canciones por Tiempo Real Escuchado",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Artistas Reales e Historial Reciente",
-        clearLocalHistory: "Limpiar historial local",
-        recordedPlays: (n) => `${n} reproducciones registradas`,
-        latestCapturedPlays: "\xDAltimas Reproducciones Capturadas",
-        localDateLabel: (d) => `Fecha local: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artista de Spotify",
-        untitled: "Sin t\xEDtulo",
-        unknownArtist: "Artista desconocido",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} ${n === 1 ? "top canci\xF3n" : "top canciones"}`,
-        songSingular: "canci\xF3n",
-        songPlural: "canciones",
-        playSingular: "play",
-        playPlural: "plays"
-      },
-      empty: {
-        noArtistsPeriod: "Sin artistas disponibles para este per\xEDodo.",
-        noTracksPeriod: "Sin canciones disponibles para este per\xEDodo.",
-        noAlbumsPeriod: "Sin \xE1lbumes para mostrar.",
-        noGenres: "Sin etiquetas de g\xE9nero disponibles en Spotify.",
-        noArtistsFound: "No se encontraron artistas principales para este per\xEDodo.",
-        noTrackedTimeYet: "A\xFAn no hay tiempo acumulado. Dale play a cualquier canci\xF3n en Spotify y aparecer\xE1 aqu\xED en vivo.",
-        noRecentPlaysYet: "Las canciones reproducidas \u2265 25s aparecer\xE1n en esta l\xEDnea de tiempo cronol\xF3gica."
-      },
-      actions: {
-        play: "Reproducir",
-        pause: "Pausar",
-        addToQueue: "A\xF1adir a la cola",
-        playingNowToast: (title) => `Reproduciendo: ${title}`,
-        playbackErrorToast: "No se pudo iniciar la reproducci\xF3n",
-        queuedToast: (title) => `A\xF1adida a la cola: ${title}`,
-        queueErrorToast: "No se pudo a\xF1adir a la cola",
-        historyClearedToast: "Historial local reiniciado",
-        confirmClearHistory: "\xBFConfirmar borrado?",
-        copiedTrackToast: (title) => `Copiada: ${title}`,
-        copyErrorToast: "No se pudo copiar la canci\xF3n",
-        noTrackPlayingToast: "No hay ninguna canci\xF3n sonando"
-      },
-      search: {
-        placeholder: "Filtrar por canci\xF3n, artista o \xE1lbum...",
-        clear: "Limpiar filtro",
-        noResults: "Sin resultados para tu filtro."
-      },
-      streak: {
-        daysBadge: (n) => `${n}d racha`,
-        last7Days: (h) => `7d: ${h}`
-      },
-      sleepTimer: {
-        label: "Temporizador",
-        offToast: "Temporizador apagado",
-        endOfTrackShort: "Fin",
-        endOfTrackToast: "Temporizador: pausar al terminar la canci\xF3n",
-        minutesToast: (m) => `Temporizador: ${m} min`,
-        triggeredToast: "Temporizador finalizado \u2014 reproducci\xF3n pausada",
-        tooltipIdle: "Temporizador de sue\xF1o (Alt+Shift+S)",
-        tooltipActive: (detail) => `Temporizador: ${detail} (clic derecho para cancelar)`
-      },
-      time: {
-        justNow: "Hace un momento",
-        secondsAgo: (s) => `Hace ${s}s`,
-        minutesAgo: (m) => `Hace ${m}m`,
-        hoursAgo: (h) => `Hace ${h}h`
-      },
-      errorBoundary: {
-        title: "Ocurri\xF3 un error al mostrar Cronotofy",
-        fallbackMsg: "Ocurri\xF3 un problema inesperado al renderizar esta vista.",
-        retry: "Reintentar"
-      }
-    },
-    fr: {
-      brandSubtitle: "Analytique musicale native \xB7 T\xE9l\xE9m\xE9trie en temps r\xE9el",
-      tabs: {
-        overview: "Aper\xE7u",
-        artists: "Artistes",
-        tracks: "Titres",
-        albums: "Albums",
-        live: "Activit\xE9 en direct"
-      },
-      periods: {
-        short_term: "1 Mois",
-        medium_term: "6 Mois",
-        long_term: "Global"
-      },
-      nowPlaying: "Lecture en cours",
-      paused: "En pause",
-      currentSession: "Session actuelle",
-      today: "Aujourd'hui",
-      idleHint: "Lancez un titre sur Spotify pour activer la t\xE9l\xE9m\xE9trie en direct.",
-      loadingAnalytics: "Chargement de vos statistiques Spotify...",
-      kpis: {
-        recordedTime: "Temps enregistr\xE9",
-        todayLabel: "Aujourd'hui",
-        annualInCronotofy: (h) => `${h} annuel sur Cronotofy`,
-        totalMod: (h) => `Total : ${h}`,
-        topArtist: (period) => `Top Artiste (${period})`,
-        artistsAnalyzed: (n) => `${n} artistes analys\xE9s`,
-        topTrack: (period) => `Top Titre (${period})`,
-        noData: "Aucune donn\xE9e",
-        favoriteGenre: "Genre favori",
-        varied: "Vari\xE9",
-        affinityAndRecent: (pct, n) => `${pct}% d'affinit\xE9 \xB7 ${n} \xE9coutes r\xE9centes`,
-        tracksInRanking: (n) => `${n} titres class\xE9s`
-      },
-      sections: {
-        top5Artists: "Top 5 Artistes",
-        top5Tracks: "Top 5 Titres",
-        top4Albums: "Top 4 Albums",
-        genreDna: "ADN des genres",
-        mainGenresBadge: (n) => `${n} principaux`,
-        viewAll: (n) => `Tout voir (${n}) \u2192`,
-        tracksRanking: (period) => `Classement des titres \xB7 ${period}`,
-        tracksBadge: (n) => `${n} titres`,
-        tracksListenedToday: "\xC9cout\xE9 aujourd'hui",
-        accumulatedDesktop: "Total sur ordinateur",
-        exactSecondBySecond: "Mesure exacte seconde par seconde",
-        capturedTracks: "Titres captur\xE9s",
-        completedPlays: (n) => `${n} lectures compl\xE8tes`,
-        lastSync: "Stockage local",
-        pending: "Actif",
-        topRealTimeTracks: "Titres par temps d'\xE9coute r\xE9el",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Artistes r\xE9els & historique r\xE9cent",
-        clearLocalHistory: "Effacer l'historique local",
-        recordedPlays: (n) => `${n} \xE9coutes enregistr\xE9es`,
-        latestCapturedPlays: "Derni\xE8res lectures captur\xE9es",
-        localDateLabel: (d) => `Date locale : ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artiste Spotify",
-        untitled: "Sans titre",
-        unknownArtist: "Artiste inconnu",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top titres`,
-        songSingular: "titre",
-        songPlural: "titres",
-        playSingular: "\xE9coute",
-        playPlural: "\xE9coutes"
-      },
-      empty: {
-        noArtistsPeriod: "Aucun artiste disponible pour cette p\xE9riode.",
-        noTracksPeriod: "Aucun titre disponible pour cette p\xE9riode.",
-        noAlbumsPeriod: "Aucun album \xE0 afficher.",
-        noGenres: "Aucun genre disponible sur Spotify.",
-        noArtistsFound: "Aucun artiste principal trouv\xE9 pour cette p\xE9riode.",
-        noTrackedTimeYet: "Aucun temps cumul\xE9. Lancez n'importe quel titre sur Spotify.",
-        noRecentPlaysYet: "Les titres \xE9cout\xE9s \u2265 25s appara\xEEtront ici."
-      },
-      actions: {
-        play: "Lire",
-        pause: "Pause",
-        addToQueue: "Ajouter \xE0 la file d'attente",
-        playingNowToast: (title) => `Lecture : ${title}`,
-        playbackErrorToast: "Impossible de lancer la lecture",
-        queuedToast: (title) => `Ajout\xE9 \xE0 la file : ${title}`,
-        queueErrorToast: "Impossible d'ajouter \xE0 la file",
-        historyClearedToast: "Historique local effac\xE9",
-        confirmClearHistory: "Confirmer la suppression ?",
-        copiedTrackToast: (title) => `Copi\xE9 : ${title}`,
-        copyErrorToast: "Impossible de copier le titre",
-        noTrackPlayingToast: "Aucun titre en cours de lecture"
-      },
-      search: {
-        placeholder: "Filtrer par titre, artiste ou album...",
-        clear: "Effacer le filtre",
-        noResults: "Aucun r\xE9sultat pour ce filtre."
-      },
-      streak: {
-        daysBadge: (n) => `${n}j de suite`,
-        last7Days: (h) => `7j : ${h}`
-      },
-      sleepTimer: {
-        label: "Minuteur",
-        offToast: "Minuteur d\xE9sactiv\xE9",
-        endOfTrackShort: "Fin",
-        endOfTrackToast: "Minuteur : pause en fin de titre",
-        minutesToast: (m) => `Minuteur : ${m} min`,
-        triggeredToast: "Minuteur termin\xE9 \u2014 lecture en pause",
-        tooltipIdle: "Minuteur de veille (Alt+Shift+S)",
-        tooltipActive: (detail) => `Minuteur : ${detail} (clic droit pour annuler)`
-      },
-      time: {
-        justNow: "\xC0 l'instant",
-        secondsAgo: (s) => `Il y a ${s}s`,
-        minutesAgo: (m) => `Il y a ${m}m`,
-        hoursAgo: (h) => `Il y a ${h}h`
-      },
-      errorBoundary: {
-        title: "Une erreur est survenue dans Cronotofy",
-        fallbackMsg: "Une erreur inattendue s'est produite lors de l'affichage.",
-        retry: "R\xE9essayer"
-      }
-    },
-    id: {
-      brandSubtitle: "Statistik musik · Aktivitas langsung",
-      tabs: { overview: "Ringkasan", artists: "Artis", tracks: "Lagu", albums: "Album", live: "Aktivitas langsung" },
-      periods: { short_term: "1 Bulan", medium_term: "6 Bulan", long_term: "Sepanjang Waktu" },
-      nowPlaying: "Sedang Diputar",
-      paused: "Dijeda",
-      currentSession: "Sesi saat ini",
-      today: "Hari ini",
-      idleHint: "Putar lagu di Spotify untuk mulai mencatat aktivitas.",
-      loadingAnalytics: "Memuat statistik Spotify...",
-      kpis: {
-        recordedTime: "Durasi Tercatat", todayLabel: "Hari ini",
-        annualInCronotofy: (h) => `${h} per tahun di Cronotofy`,
-        totalMod: (h) => `Total: ${h}`,
-        topArtist: (period) => `Artis Teratas (${period})`,
-        artistsAnalyzed: (n) => `${n} artis dianalisis`,
-        topTrack: (period) => `Lagu Teratas (${period})`,
-        noData: "Belum ada data", favoriteGenre: "Genre Favorit", varied: "Beragam",
-        affinityAndRecent: (pct, n) => `${pct}% kecocokan · ${n} pemutaran terbaru`,
-        tracksInRanking: (n) => `${n} lagu dalam peringkat`
-      },
-      sections: {
-        top5Artists: "5 Artis Teratas", top5Tracks: "5 Lagu Teratas", top4Albums: "4 Album Teratas",
-        genreDna: "Profil Genre", mainGenresBadge: (n) => `${n} genre teratas`,
-        viewAll: (n) => `Lihat semua (${n}) →`,
-        tracksRanking: (period) => `Peringkat Lagu · ${period}`,
-        tracksBadge: (n) => `${n} lagu`,
-        tracksListenedToday: "Didengarkan Hari Ini", accumulatedDesktop: "Total di Desktop",
-        exactSecondBySecond: "Pencatatan setiap detik", capturedTracks: "Lagu Tercatat",
-        completedPlays: (n) => `${n} pemutaran tercatat`,
-        lastSync: "Penyimpanan Lokal", pending: "Aktif",
-        topRealTimeTracks: "Lagu Berdasarkan Durasi Mendengarkan",
-        topNBadge: (n) => `${n} teratas`,
-        realArtistsAndRecent: "Artis dan Riwayat Terbaru",
-        clearLocalHistory: "Hapus riwayat lokal",
-        recordedPlays: (n) => `${n} pemutaran tercatat`,
-        latestCapturedPlays: "Pemutaran Terbaru",
-        localDateLabel: (d) => `Tanggal lokal: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artis Spotify", untitled: "Tanpa Judul", unknownArtist: "Artis Tidak Dikenal",
-        popularityLabel: (p) => `Popularitas ${p}`,
-        topTracksCount: (n) => `${n} lagu teratas`,
-        songSingular: "lagu", songPlural: "lagu", playSingular: "pemutaran", playPlural: "pemutaran"
-      },
-      empty: {
-        noArtistsPeriod: "Tidak ada artis untuk periode ini.",
-        noTracksPeriod: "Tidak ada lagu untuk periode ini.",
-        noAlbumsPeriod: "Tidak ada album untuk ditampilkan.",
-        noGenres: "Tidak ada tag genre di Spotify.",
-        noArtistsFound: "Tidak ada artis teratas untuk periode ini.",
-        noTrackedTimeYet: "Belum ada durasi tercatat. Putar lagu di Spotify untuk melihatnya di sini.",
-        noRecentPlaysYet: "Lagu yang diputar minimal 25 detik akan muncul di riwayat ini."
-      },
-      actions: {
-        play: "Putar", pause: "Jeda", addToQueue: "Tambahkan ke antrean",
-        playingNowToast: (title) => `Memutar: ${title}`,
-        playbackErrorToast: "Pemutaran tidak dapat dimulai",
-        queuedToast: (title) => `Ditambahkan ke antrean: ${title}`,
-        queueErrorToast: "Tidak dapat menambahkan ke antrean",
-        historyClearedToast: "Riwayat lokal dihapus", confirmClearHistory: "Hapus riwayat?",
-        copiedTrackToast: (title) => `Disalin: ${title}`,
-        copyErrorToast: "Tidak dapat menyalin info lagu",
-        noTrackPlayingToast: "Tidak ada lagu yang sedang diputar"
-      },
-      search: { placeholder: "Filter berdasarkan lagu, artis, atau album...", clear: "Hapus filter", noResults: "Tidak ada hasil yang cocok." },
-      streak: { daysBadge: (n) => `${n} hari berturut-turut`, last7Days: (h) => `7 hari: ${h}` },
-      sleepTimer: {
-        label: "Timer tidur", offToast: "Timer tidur nonaktif", endOfTrackShort: "Akhir lagu",
-        endOfTrackToast: "Timer tidur: jeda di akhir lagu",
-        minutesToast: (m) => `Timer tidur: ${m} menit`,
-        triggeredToast: "Timer tidur selesai. Pemutaran dijeda.",
-        tooltipIdle: "Timer tidur (Alt+Shift+S)",
-        tooltipActive: (detail) => `Timer tidur: ${detail} (klik kanan untuk membatalkan)`
-      },
-      time: {
-        justNow: "Baru saja", secondsAgo: (s) => `${s} detik lalu`,
-        minutesAgo: (m) => `${m} menit lalu`, hoursAgo: (h) => `${h} jam lalu`
-      },
-      errorBoundary: { title: "Terjadi masalah di Cronotofy", fallbackMsg: "Tampilan ini tidak dapat dimuat.", retry: "Coba lagi" }
-    },
-    it: {
-      brandSubtitle: "Analisi musicale nativa \xB7 Telemetria in tempo reale",
-      tabs: {
-        overview: "Panoramica",
-        artists: "Artisti",
-        tracks: "Brani",
-        albums: "Album",
-        live: "Attivit\xE0 Live"
-      },
-      periods: {
-        short_term: "1 Mese",
-        medium_term: "6 Mesi",
-        long_term: "Sempre"
-      },
-      nowPlaying: "In riproduzione",
-      paused: "In pausa",
-      currentSession: "Sessione attuale",
-      today: "Oggi",
-      idleHint: "Riproduci qualsiasi brano su Spotify per avviare la telemetria live.",
-      loadingAnalytics: "Caricamento statistiche Spotify...",
-      kpis: {
-        recordedTime: "Tempo registrato",
-        todayLabel: "Oggi",
-        annualInCronotofy: (h) => `${h} annuale su Cronotofy`,
-        totalMod: (h) => `Totale: ${h}`,
-        topArtist: (period) => `Top Artista (${period})`,
-        artistsAnalyzed: (n) => `${n} artisti analizzati`,
-        topTrack: (period) => `Top Brano (${period})`,
-        noData: "Nessun dato",
-        favoriteGenre: "Genere preferito",
-        varied: "Vario",
-        affinityAndRecent: (pct, n) => `${pct}% affinit\xE0 \xB7 ${n} recenti`,
-        tracksInRanking: (n) => `${n} brani in classifica`
-      },
-      sections: {
-        top5Artists: "Top 5 Artisti",
-        top5Tracks: "Top 5 Brani",
-        top4Albums: "Top 4 Album",
-        genreDna: "DNA dei Generi",
-        mainGenresBadge: (n) => `${n} principali`,
-        viewAll: (n) => `Vedi tutti (${n}) \u2192`,
-        tracksRanking: (period) => `Classifica Brani \xB7 ${period}`,
-        tracksBadge: (n) => `${n} brani`,
-        tracksListenedToday: "Ascoltato oggi",
-        accumulatedDesktop: "Totale su Desktop",
-        exactSecondBySecond: "Misurazione esatta secondo per secondo",
-        capturedTracks: "Brani acquisiti",
-        completedPlays: (n) => `${n} ascolti completi`,
-        lastSync: "Archivio locale",
-        pending: "Attivo",
-        topRealTimeTracks: "Brani per tempo reale di ascolto",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Artisti reali e cronologia",
-        clearLocalHistory: "Cancella cronologia locale",
-        recordedPlays: (n) => `${n} ascolti registrati`,
-        latestCapturedPlays: "Ultimi ascolti acquisiti",
-        localDateLabel: (d) => `Data locale: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artista Spotify",
-        untitled: "Senza titolo",
-        unknownArtist: "Artista sconosciuto",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top brani`,
-        songSingular: "brano",
-        songPlural: "brani",
-        playSingular: "riproduzione",
-        playPlural: "riproduzioni"
-      },
-      empty: {
-        noArtistsPeriod: "Nessun artista disponibile per questo periodo.",
-        noTracksPeriod: "Nessun brano disponibile per questo periodo.",
-        noAlbumsPeriod: "Nessun album da mostrare.",
-        noGenres: "Nessun tag di genere disponibile su Spotify.",
-        noArtistsFound: "Nessun artista principale trovato per questo periodo.",
-        noTrackedTimeYet: "Nessun tempo registrato. Riproduci un brano su Spotify per iniziare.",
-        noRecentPlaysYet: "I brani ascoltati \u2265 25s appariranno in questa cronologia."
-      },
-      actions: {
-        play: "Riproduci",
-        pause: "Pausa",
-        addToQueue: "Aggiungi in coda",
-        playingNowToast: (title) => `In riproduzione: ${title}`,
-        playbackErrorToast: "Impossibile avviare la riproduzione",
-        queuedToast: (title) => `Aggiunto in coda: ${title}`,
-        queueErrorToast: "Impossibile aggiungere in coda",
-        historyClearedToast: "Cronologia locale cancellata",
-        confirmClearHistory: "Confermare?",
-        copiedTrackToast: (title) => `Copiato: ${title}`,
-        copyErrorToast: "Impossibile copiare il brano",
-        noTrackPlayingToast: "Nessun brano in riproduzione"
-      },
-      search: {
-        placeholder: "Filtra per brano, artista o album...",
-        clear: "Cancella filtro",
-        noResults: "Nessun risultato trovato per il filtro."
-      },
-      streak: {
-        daysBadge: (n) => `${n}g di fila`,
-        last7Days: (h) => `7g: ${h}`
-      },
-      sleepTimer: {
-        label: "Timer spegnimento",
-        offToast: "Timer disattivato",
-        endOfTrackShort: "Fine",
-        endOfTrackToast: "Timer: pausa a fine brano",
-        minutesToast: (m) => `Timer: ${m} min`,
-        triggeredToast: "Timer scaduto \u2014 riproduzione in pausa",
-        tooltipIdle: "Timer spegnimento (Alt+Shift+S)",
-        tooltipActive: (detail) => `Timer: ${detail} (tasto destro per annullare)`
-      },
-      time: {
-        justNow: "Proprio ora",
-        secondsAgo: (s) => `${s}s fa`,
-        minutesAgo: (m) => `${m}m fa`,
-        hoursAgo: (h) => `${h}h fa`
-      },
-      errorBoundary: {
-        title: "Si \xE8 verificato un errore in Cronotofy",
-        fallbackMsg: "Errore imprevisto durante il rendering della vista.",
-        retry: "Riprova"
-      }
-    },
-    pt: {
-      brandSubtitle: "An\xE1lise musical nativa \xB7 Telemetria em tempo real",
-      tabs: {
-        overview: "Resumo",
-        artists: "Artistas",
-        tracks: "M\xFAsicas",
-        albums: "\xC1lbuns",
-        live: "Atividade ao Vivo"
-      },
-      periods: {
-        short_term: "1 M\xEAs",
-        medium_term: "6 Meses",
-        long_term: "Geral"
-      },
-      nowPlaying: "Tocando agora",
-      paused: "Pausado",
-      currentSession: "Sess\xE3o atual",
-      today: "Hoje",
-      idleHint: "Reproduza qualquer m\xFAsica no Spotify para iniciar a telemetria ao vivo.",
-      loadingAnalytics: "Carregando suas estat\xEDsticas do Spotify...",
-      kpis: {
-        recordedTime: "Tempo Registrado",
-        todayLabel: "Hoje",
-        annualInCronotofy: (h) => `${h} anual no Cronotofy`,
-        totalMod: (h) => `Total: ${h}`,
-        topArtist: (period) => `Top Artista (${period})`,
-        artistsAnalyzed: (n) => `${n} artistas analisados`,
-        topTrack: (period) => `Top M\xFAsica (${period})`,
-        noData: "Sem dados",
-        favoriteGenre: "G\xEAnero Favorito",
-        varied: "Variado",
-        affinityAndRecent: (pct, n) => `${pct}% afinidade \xB7 ${n} recentes`,
-        tracksInRanking: (n) => `${n} m\xFAsicas no ranking`
-      },
-      sections: {
-        top5Artists: "Top 5 Artistas",
-        top5Tracks: "Top 5 M\xFAsicas",
-        top4Albums: "Top 4 \xC1lbuns",
-        genreDna: "DNA de G\xEAneros",
-        mainGenresBadge: (n) => `${n} principais`,
-        viewAll: (n) => `Ver todos (${n}) \u2192`,
-        tracksRanking: (period) => `Ranking de M\xFAsicas \xB7 ${period}`,
-        tracksBadge: (n) => `${n} m\xFAsicas`,
-        tracksListenedToday: "Ouvido Hoje",
-        accumulatedDesktop: "Acumulado no Desktop",
-        exactSecondBySecond: "Medi\xE7\xE3o exata segundo a segundo",
-        capturedTracks: "Faixas Capturadas",
-        completedPlays: (n) => `${n} reprodu\xE7\xF5es completas`,
-        lastSync: "Armazenamento Local",
-        pending: "Ativo",
-        topRealTimeTracks: "M\xFAsicas por Tempo Real Ouvido",
-        topNBadge: (n) => `Top ${n}`,
-        realArtistsAndRecent: "Artistas Reais e Hist\xF3rico Recente",
-        clearLocalHistory: "Limpar hist\xF3rico local",
-        recordedPlays: (n) => `${n} reprodu\xE7\xF5es registradas`,
-        latestCapturedPlays: "\xDAltimas Reprodu\xE7\xF5es Capturadas",
-        localDateLabel: (d) => `Data local: ${d}`
-      },
-      entities: {
-        spotifyArtist: "Artista do Spotify",
-        untitled: "Sem t\xEDtulo",
-        unknownArtist: "Artista desconhecido",
-        popularityLabel: (p) => `Pop ${p}`,
-        topTracksCount: (n) => `${n} top m\xFAsicas`,
-        songSingular: "m\xFAsica",
-        songPlural: "m\xFAsicas",
-        playSingular: "play",
-        playPlural: "plays"
-      },
-      empty: {
-        noArtistsPeriod: "Sem artistas dispon\xEDveis para este per\xEDodo.",
-        noTracksPeriod: "Sem m\xFAsicas dispon\xEDveis para este per\xEDodo.",
-        noAlbumsPeriod: "Sem \xE1lbuns para mostrar.",
-        noGenres: "Sem tags de g\xEAnero dispon\xEDveis no Spotify.",
-        noArtistsFound: "Nenhum artista principal encontrado para este per\xEDodo.",
-        noTrackedTimeYet: "Ainda n\xE3o h\xE1 tempo acumulado. D\xEA play em qualquer m\xFAsica no Spotify.",
-        noRecentPlaysYet: "M\xFAsicas tocadas \u2265 25s aparecer\xE3o nesta linha do tempo."
-      },
-      actions: {
-        play: "Reproduzir",
-        pause: "Pausar",
-        addToQueue: "Adicionar \xE0 fila",
-        playingNowToast: (title) => `Tocando: ${title}`,
-        playbackErrorToast: "N\xE3o foi poss\xEDvel iniciar a reprodu\xE7\xE3o",
-        queuedToast: (title) => `Adicionada \xE0 fila: ${title}`,
-        queueErrorToast: "N\xE3o foi poss\xEDvel adicionar \xE0 fila",
-        historyClearedToast: "Hist\xF3rico local limpo",
-        confirmClearHistory: "Confirmar limpeza?",
-        copiedTrackToast: (title) => `Copiada: ${title}`,
-        copyErrorToast: "N\xE3o foi poss\xEDvel copiar a m\xFAsica",
-        noTrackPlayingToast: "Nenhuma m\xFAsica tocando agora"
-      },
-      search: {
-        placeholder: "Filtrar por m\xFAsica, artista ou \xE1lbum...",
-        clear: "Limpar filtro",
-        noResults: "Nenhum resultado encontrado para o filtro."
-      },
-      streak: {
-        daysBadge: (n) => `${n}d sequ\xEAncia`,
-        last7Days: (h) => `7d: ${h}`
-      },
-      sleepTimer: {
-        label: "Temporizador",
-        offToast: "Temporizador desligado",
-        endOfTrackShort: "Fim",
-        endOfTrackToast: "Temporizador: pausar ao fim da faixa",
-        minutesToast: (m) => `Temporizador: ${m} min`,
-        triggeredToast: "Temporizador encerrado \u2014 reprodu\xE7\xE3o pausada",
-        tooltipIdle: "Temporizador (Alt+Shift+S)",
-        tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
-      },
-      time: {
-        justNow: "Agora mesmo",
-        secondsAgo: (s) => `H\xE1 ${s}s`,
-        minutesAgo: (m) => `H\xE1 ${m}m`,
-        hoursAgo: (h) => `H\xE1 ${h}h`
-      },
-      errorBoundary: {
-        title: "Algo deu errado no Cronotofy",
-        fallbackMsg: "Ocorreu um erro inesperado ao renderizar esta visualiza\xE7\xE3o.",
-        retry: "Tentar novamente"
-      }
-    },
-  };
-  function detectSpotifyLocale() {
-    try {
-      const spicetifyLoc = typeof Spicetify !== "undefined" ? Spicetify.Locale?.getLocale?.() : "";
-      if (spicetifyLoc && typeof spicetifyLoc === "string") return spicetifyLoc;
-    } catch {
-    }
-    if (typeof document !== "undefined" && document.documentElement?.lang) {
-      return document.documentElement.lang;
-    }
-    if (typeof navigator !== "undefined" && navigator.language) {
-      return navigator.language;
-    }
-    return "en";
-  }
-  function resolveLangCode(rawLocale) {
-    const language = String(rawLocale || "").trim().toLowerCase().split(/[-_]/, 1)[0];
-    return Object.hasOwn(TRANSLATIONS, language) ? language : "en";
-  }
-  const LANGUAGE_STORAGE_KEY = "cronotofy_language";
-  const VISUAL_PRESET_KEY = "cronotofy_visual_preset";
-  const VISUAL_PRESETS = ["full", "still", "focus"];
-  const PREFERENCE_LABELS = {
-    en: ["Preferences", "Visual preset", "Animated", "Still", "Focus", "Copy settings", "Apply settings", "Invalid settings", "Open the panel from the playback bar to see your listening time.", "Dismiss"],
-    es: ["Preferencias", "Estilo visual", "Animado", "Estático", "Enfoque", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abre el panel desde la barra de reproducción para ver tu tiempo de escucha.", "Cerrar"],
-    pt: ["Preferências", "Estilo visual", "Animado", "Estático", "Foco", "Copiar ajustes", "Aplicar ajustes", "Ajustes inválidos", "Abra o painel na barra de reprodução para ver seu tempo de escuta.", "Dispensar"],
-    fr: ["Préférences", "Style visuel", "Animé", "Fixe", "Concentration", "Copier les réglages", "Appliquer les réglages", "Réglages invalides", "Ouvrez le panneau depuis la barre de lecture pour voir votre temps d’écoute.", "Fermer"],
-    de: ["Einstellungen", "Darstellung", "Animiert", "Statisch", "Fokus", "Einstellungen kopieren", "Einstellungen anwenden", "Ungültige Einstellungen", "Öffne das Panel über die Wiedergabeleiste, um deine Hörzeit zu sehen.", "Schließen"],
-    it: ["Preferenze", "Stile visivo", "Animato", "Statico", "Concentrazione", "Copia impostazioni", "Applica impostazioni", "Impostazioni non valide", "Apri il pannello dalla barra di riproduzione per vedere il tuo tempo di ascolto.", "Chiudi"],
-    id: ["Preferensi", "Tampilan", "Animasi", "Statis", "Fokus", "Salin pengaturan", "Terapkan pengaturan", "Pengaturan tidak valid", "Buka panel dari bilah pemutaran untuk melihat durasi mendengarkan.", "Tutup"]
-  };
-  function readStoredPreference(key) {
-    try {
-      return localStorage.getItem(key) || "";
-    } catch {
-      return "";
-    }
-  }
-  function saveStoredPreference(key, value) {
-    try {
-      if (value) localStorage.setItem(key, value);
-      else localStorage.removeItem(key);
-    } catch {
-    }
-  }
-  function readVisualPreset() {
-    const preset = readStoredPreference(VISUAL_PRESET_KEY);
-    if (VISUAL_PRESETS.includes(preset)) return preset;
-    const hardware = typeof navigator === "undefined" ? {} : navigator;
-    const limitedMemory = hardware.deviceMemory > 0 && hardware.deviceMemory <= 4;
-    const limitedCpu = hardware.hardwareConcurrency > 0 && hardware.hardwareConcurrency <= 4;
-    return limitedMemory || limitedCpu ? "focus" : "full";
-  }
-  function parseSharedPreferences(text) {
-    if (typeof text !== "string" || text.length > 1024) return null;
-    try {
-      const settings = JSON.parse(text);
-      if (!settings || Object.keys(settings).length !== 3 || settings.version !== 1 ||
-          !VISUAL_PRESETS.includes(settings.preset) ||
-          typeof settings.language !== "string" ||
-          !(settings.language === "" || Object.hasOwn(LANGUAGE_OPTIONS, settings.language))) return null;
-      return { language: settings.language, preset: settings.preset };
-    } catch {
-      return null;
-    }
-  }
-  const LANGUAGE_OPTIONS = {
-    en: ["English", "Language", "Spotify language"],
-    es: ["Español", "Idioma", "Idioma de Spotify"],
-    pt: ["Português", "Idioma", "Idioma do Spotify"],
-    fr: ["Français", "Langue", "Langue de Spotify"],
-    de: ["Deutsch", "Sprache", "Spotify-Sprache"],
-    it: ["Italiano", "Lingua", "Lingua di Spotify"],
-    id: ["Bahasa Indonesia", "Bahasa", "Bahasa Spotify"]
-  };
-  function readLanguagePreference() {
-    const language = readStoredPreference(LANGUAGE_STORAGE_KEY);
-    return Object.hasOwn(LANGUAGE_OPTIONS, language) ? language : "";
-  }
-  function getTranslations(language = readLanguagePreference()) {
-    const rawLocale = language || detectSpotifyLocale();
-    const lang = resolveLangCode(rawLocale);
-    return {
-      lang,
-      rawLocale,
-      t: TRANSLATIONS[lang]
-    };
-  }
-  function formatRelativeTimeLocalized(iso, t, rawLocale) {
-    if (!iso) return t.time.justNow;
-    const ts = Date.parse(iso);
-    if (!Number.isFinite(ts)) return t.time.justNow;
-    const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1e3));
-    if (diffSec < 60) return t.time.secondsAgo(diffSec);
-    const diffMin = Math.floor(diffSec / 60);
-    if (diffMin < 60) return t.time.minutesAgo(diffMin);
-    const diffHrs = Math.floor(diffMin / 60);
-    if (diffHrs < 24) return t.time.hoursAgo(diffHrs);
-    let locale = resolveLangCode(rawLocale);
-    try {
-      const canonical = Intl.getCanonicalLocales(String(rawLocale || "").replaceAll("_", "-"))[0];
-      if (canonical && Object.hasOwn(TRANSLATIONS, canonical.split("-", 1)[0])) locale = canonical;
-    } catch {
-    }
-    return new Date(ts).toLocaleDateString(locale, { day: "2-digit", month: "short" });
-  }
-
-  // spicetify-cronotofy/src/tracker.ts
-  var STORAGE_PREFIX = CRONOTOFY_MOD_CONFIG.tracking.storagePrefix;
-  var MAX_RECENT_PLAYS = CRONOTOFY_MOD_CONFIG.tracking.maxRecentPlays;
-  var MIN_PLAY_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.minPlaySeconds;
-  var SAVE_INTERVAL_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.saveIntervalSeconds;
-  function normalizeSpotifyImage(url) {
-    if (!url || typeof url !== "string") return "";
-    const clean = url.trim();
-    if (!clean) return "";
-    if (clean.startsWith("spotify:image:")) {
-      const hash = clean.slice("spotify:image:".length);
-      return hash ? `https://i.scdn.co/image/${hash}` : "";
-    }
-    if (clean.startsWith("http://") || clean.startsWith("https://")) {
-      return clean;
-    }
-    return "";
-  }
-  function formatSecondsHuman(totalSec) {
-    const sec = Math.max(0, Math.floor(totalSec || 0));
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor(sec % 3600 / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}h ${m}m`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
-  }
-  function getTodayKey() {
-    const d = /* @__PURE__ */ new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
-    return `${y}-${m}-${day}`;
-  }
-  function computeListeningStreak(dailySeconds, todayKey = getTodayKey()) {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(todayKey);
-    const baseDate = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : /* @__PURE__ */ new Date();
-    const baseYear = baseDate.getFullYear();
-    const baseMonth = baseDate.getMonth();
-    const baseDay = baseDate.getDate();
-    const keyAt = (offsetDays) => {
-      const d = new Date(baseYear, baseMonth, baseDay - offsetDays);
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, "0");
-      const day = String(d.getDate()).padStart(2, "0");
-      return `${y}-${m}-${day}`;
-    };
-    let last7DaysSeconds = 0;
-    for (let i = 0; i < 7; i++) {
-      const val = Number(dailySeconds[keyAt(i)] || 0);
-      if (Number.isFinite(val) && val > 0) {
-        last7DaysSeconds += Math.floor(val);
-      }
-    }
-    const todaySec = Number(dailySeconds[keyAt(0)] || 0);
-    let offset = Number.isFinite(todaySec) && todaySec > 0 ? 0 : 1;
-    let streakDays = 0;
-    for (let guard = 0; guard < 3650; guard++) {
-      const sec = Number(dailySeconds[keyAt(offset)] || 0);
-      if (!Number.isFinite(sec) || sec <= 0) break;
-      streakDays += 1;
-      offset += 1;
-    }
-    return { streakDays, last7DaysSeconds };
-  }
-  async function copyLiveTrackToClipboard(track) {
-    if (!track) return "empty";
-    const text = `${track.name} \u2014 ${track.artistName}
-${track.externalUrl}`;
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        return "copied";
-      }
-      if (typeof document !== "undefined" && document.body) {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.setAttribute("readonly", "");
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        const ok = document.execCommand?.("copy");
-        ta.remove();
-        return ok ? "copied" : "error";
-      }
-      return "error";
-    } catch {
-      return "error";
-    }
-  }
-  function extractLiveTrackFromPlayer() {
-    try {
-      const item = Spicetify?.Player?.data?.item || Spicetify?.Player?.data?.track;
-      if (!item || typeof item !== "object") return null;
-      const uri = String(item.uri || "");
-      if (!uri.startsWith("spotify:track:")) return null;
-      const id = uri.replace("spotify:track:", "");
-      if (!id) return null;
-      const { t } = getTranslations();
-      const metadata = item.metadata || {};
-      const name = item.name || metadata.title || t.entities.untitled;
-      let artistName = t.entities.unknownArtist;
-      let artistId;
-      if (Array.isArray(item.artists) && item.artists.length > 0) {
-        artistName = item.artists.map((a) => a?.name).filter(Boolean).join(", ") || artistName;
-        const firstArtistUri = String(item.artists[0]?.uri || "");
-        if (firstArtistUri.startsWith("spotify:artist:")) {
-          artistId = firstArtistUri.replace("spotify:artist:", "");
-        }
-      } else if (metadata.artist_name) {
-        artistName = String(metadata.artist_name);
-      }
-      const albumObj = item.album || {};
-      const albumName = albumObj.name || metadata.album_title || "";
-      const albumUri = albumObj.uri || metadata.album_uri || void 0;
-      let rawImageUrl = "";
-      if (Array.isArray(albumObj.images) && albumObj.images.length > 0) {
-        rawImageUrl = albumObj.images[0]?.url || "";
-      } else if (metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url) {
-        rawImageUrl = metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url;
-      }
-      const albumImageUrl = normalizeSpotifyImage(rawImageUrl);
-      const durationMs = Number(
-        item.duration?.milliseconds ?? item.duration_ms ?? Spicetify?.Player?.getDuration?.() ?? 0
-      );
-      const progressMs = Number(Spicetify?.Player?.getProgress?.() ?? 0);
-      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
-      return {
-        id,
-        uri,
-        name,
-        artistName,
-        artistId,
-        albumName,
-        albumUri,
-        albumImageUrl,
-        durationMs: Number.isFinite(durationMs) ? durationMs : 0,
-        progressMs: Number.isFinite(progressMs) ? progressMs : 0,
-        isPlaying,
-        externalUrl: `https://open.spotify.com/track/${id}`,
-        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-      };
-    } catch {
-      return null;
-    }
-  }
-  var cachedUser = null;
-  var resolvingUserPromise = null;
-  async function resolveCurrentSpotifyUser(forceRefresh = false) {
-    if (cachedUser && !forceRefresh) return cachedUser;
-    if (resolvingUserPromise && !forceRefresh) return resolvingUserPromise;
-    resolvingUserPromise = (async () => {
-      try {
-        const apiUser = await Spicetify?.Platform?.UserAPI?.getUser?.();
-        if (apiUser) {
-          const rawUri = String(apiUser.uri || "");
-          const id = String(
-            apiUser.username || (rawUri.startsWith("spotify:user:") ? rawUri.replace("spotify:user:", "") : "")
-          ).trim();
-          if (id) {
-            const avatarUrl = normalizeSpotifyImage(apiUser.images?.[0]?.url || apiUser.avatar);
-            const user = {
-              id,
-              displayName: String(apiUser.displayName || apiUser.name || id),
-              avatarUrl: avatarUrl || void 0,
-              profileUrl: `https://open.spotify.com/user/${encodeURIComponent(id)}`
-            };
-            cachedUser = user;
-            return user;
-          }
-        }
-      } catch {
-      }
-      try {
-        if (Spicetify?.CosmosAsync?.get) {
-          const me = await Spicetify.CosmosAsync.get("https://api.spotify.com/v1/me");
-          if (me && me.id) {
-            const avatarUrl = normalizeSpotifyImage(me.images?.[0]?.url);
-            const user = {
-              id: String(me.id),
-              displayName: String(me.display_name || me.id),
-              email: me.email ? String(me.email) : void 0,
-              country: me.country ? String(me.country) : void 0,
-              avatarUrl: avatarUrl || void 0,
-              profileUrl: me.external_urls?.spotify || `https://open.spotify.com/user/${encodeURIComponent(me.id)}`
-            };
-            cachedUser = user;
-            return user;
-          }
-        }
-      } catch {
-      }
-      return cachedUser;
-    })();
-    try {
-      return await resolvingUserPromise;
-    } finally {
-      resolvingUserPromise = null;
-    }
-  }
-  function createEmptyStore(userId) {
-    return {
-      version: 1,
-      userId,
-      totalSeconds: 0,
-      dailySeconds: {},
-      tracks: {},
-      recentPlays: []
-    };
-  }
-  function storageKeyFor(userId) {
-    return userId ? `${STORAGE_PREFIX}_${userId}` : `${STORAGE_PREFIX}:anonymous`;
-  }
-  function loadStore(userId) {
-    try {
-      const key = storageKeyFor(userId);
-      const profileData = localStorage.getItem(key);
-      const raw = profileData || localStorage.getItem(STORAGE_PREFIX);
-      if (!raw) return createEmptyStore(userId);
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && parsed.version === 1) {
-        const storedOwner = typeof parsed.userId === "string" ? parsed.userId : "";
-        if ((storedOwner && storedOwner !== userId) ||
-            (!profileData && storedOwner !== userId)) return createEmptyStore(userId);
-        return {
-          version: 1,
-          userId,
-          totalSeconds: Number(parsed.totalSeconds) || 0,
-          dailySeconds: parsed.dailySeconds && typeof parsed.dailySeconds === "object" ? parsed.dailySeconds : {},
-          tracks: parsed.tracks && typeof parsed.tracks === "object" ? parsed.tracks : {},
-          recentPlays: Array.isArray(parsed.recentPlays) ? parsed.recentPlays.slice(0, MAX_RECENT_PLAYS) : [],
-          lastSyncedAt: parsed.lastSyncedAt
-        };
-      }
-    } catch {
-    }
-    return createEmptyStore(userId);
-  }
-  function saveStore(store) {
-    try {
-      store.lastSyncedAt = (/* @__PURE__ */ new Date()).toISOString();
-      localStorage.setItem(storageKeyFor(store.userId), JSON.stringify(store));
-    } catch {
-    }
-  }
-  var ListeningTracker = class {
-    constructor() {
-      this.userId = "";
-      this.store = createEmptyStore("");
-      this.currentTrack = null;
-      this.currentSessionSeconds = 0;
-      this.currentPlayRecorded = false;
-      this.lastProgressMs = 0;
-      this.tickCounter = 0;
-      this.tickTimer = null;
-      this.listeners = /* @__PURE__ */ new Set();
-      this.initialized = false;
-      this.handleBeforeUnload = () => {
-        saveStore(this.store);
-      };
-    }
-    async init() {
-      if (this.initialized) return;
-      this.initialized = true;
-      const user = await resolveCurrentSpotifyUser();
-      this.userId = user?.id || "";
-      this.store = loadStore(this.userId);
-      this.currentTrack = extractLiveTrackFromPlayer();
-      this.lastProgressMs = this.currentTrack?.progressMs ?? 0;
-      this.currentSessionSeconds = 0;
-      this.currentPlayRecorded = false;
-      if (typeof window !== "undefined") {
-        window.addEventListener("beforeunload", this.handleBeforeUnload);
-      }
-      this.tickTimer = setInterval(() => this.onSecondTick(), 1e3);
-      this.notify();
-    }
-    notify() {
-      for (const fn of this.listeners) {
-        try {
-          fn();
-        } catch {
-        }
-      }
-    }
-    subscribe(fn) {
-      this.listeners.add(fn);
-      return () => {
-        this.listeners.delete(fn);
-      };
-    }
-    finalizeCurrentTrackSession(nextTrack) {
-      if (this.currentTrack && this.currentSessionSeconds >= MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
-        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
-      }
-      this.currentTrack = nextTrack;
-      this.lastProgressMs = nextTrack?.progressMs ?? 0;
-      this.currentSessionSeconds = 0;
-      this.currentPlayRecorded = false;
-    }
-    recordPlay(track, listenedSeconds) {
-      const existing = this.store.tracks[track.id];
-      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-      if (existing) {
-        existing.playCount += 1;
-        existing.lastPlayedAt = nowIso;
-      } else {
-        this.store.tracks[track.id] = {
-          id: track.id,
-          uri: track.uri,
-          name: track.name,
-          artistName: track.artistName,
-          artistId: track.artistId,
-          albumName: track.albumName,
-          albumUri: track.albumUri,
-          albumImageUrl: track.albumImageUrl,
-          durationMs: track.durationMs,
-          totalSeconds: listenedSeconds,
-          playCount: 1,
-          lastPlayedAt: nowIso
-        };
-      }
-      const playEvent = {
-        id: track.id,
-        uri: track.uri,
-        name: track.name,
-        artistName: track.artistName,
-        albumName: track.albumName,
-        albumImageUrl: track.albumImageUrl,
-        listenedSeconds,
-        playedAt: nowIso
-      };
-      this.store.recentPlays = [playEvent, ...this.store.recentPlays].slice(0, MAX_RECENT_PLAYS);
-      this.currentPlayRecorded = true;
-    }
-    onSecondTick() {
-      const live = extractLiveTrackFromPlayer();
-      if (live && this.currentTrack && live.id !== this.currentTrack.id) {
-        this.finalizeCurrentTrackSession(live);
-      } else if (live && this.currentTrack && live.id === this.currentTrack.id && this.currentPlayRecorded && this.lastProgressMs > 15e3 && live.progressMs < 5e3) {
-        this.finalizeCurrentTrackSession(live);
-      } else if (live) {
-        this.currentTrack = live;
-      }
-      if (live) {
-        this.lastProgressMs = live.progressMs;
-      }
-      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
-      if (!isPlaying || !live) {
-        return;
-      }
-      const today = getTodayKey();
-      this.store.totalSeconds += 1;
-      this.store.dailySeconds[today] = (this.store.dailySeconds[today] || 0) + 1;
-      this.currentSessionSeconds += 1;
-      const existing = this.store.tracks[this.currentTrack.id];
-      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-      if (existing) {
-        existing.totalSeconds += 1;
-        existing.lastPlayedAt = nowIso;
-        if (this.currentTrack.albumImageUrl && !existing.albumImageUrl) {
-          existing.albumImageUrl = this.currentTrack.albumImageUrl;
-        }
-      } else {
-        this.store.tracks[this.currentTrack.id] = {
-          id: this.currentTrack.id,
-          uri: this.currentTrack.uri,
-          name: this.currentTrack.name,
-          artistName: this.currentTrack.artistName,
-          artistId: this.currentTrack.artistId,
-          albumName: this.currentTrack.albumName,
-          albumUri: this.currentTrack.albumUri,
-          albumImageUrl: this.currentTrack.albumImageUrl,
-          durationMs: this.currentTrack.durationMs,
-          totalSeconds: 1,
-          playCount: 0,
-          lastPlayedAt: nowIso
-        };
-      }
-      if (this.currentSessionSeconds === MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
-        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
-      } else if (this.currentPlayRecorded && this.store.recentPlays[0]?.id === this.currentTrack.id) {
-        this.store.recentPlays[0].listenedSeconds = this.currentSessionSeconds;
-      }
-      this.tickCounter += 1;
-      if (this.tickCounter >= SAVE_INTERVAL_SECONDS) {
-        this.tickCounter = 0;
-        saveStore(this.store);
-      }
-      this.notify();
-    }
-    onSongChange() {
-      const next = extractLiveTrackFromPlayer();
-      this.finalizeCurrentTrackSession(next);
-      saveStore(this.store);
-      this.notify();
-    }
-    onPlayPause() {
-      const live = extractLiveTrackFromPlayer();
-      if (live && this.currentTrack?.id !== live.id) {
-        this.finalizeCurrentTrackSession(live);
-      } else if (live) {
-        this.currentTrack = live;
-        this.lastProgressMs = live.progressMs;
-      }
-      saveStore(this.store);
-      this.notify();
-    }
-    async syncNow() {
-      saveStore(this.store);
-      this.notify();
-      return true;
-    }
-    getLiveTrack() {
-      return extractLiveTrackFromPlayer();
-    }
-    getCounters() {
-      const today = getTodayKey();
-      const { streakDays, last7DaysSeconds } = computeListeningStreak(this.store.dailySeconds, today);
-      return {
-        totalSeconds: this.store.totalSeconds,
-        todaySeconds: this.store.dailySeconds[today] || 0,
-        todayDate: today,
-        currentTrackSeconds: this.currentSessionSeconds,
-        streakDays,
-        last7DaysSeconds
-      };
-    }
-    getSnapshot() {
-      const tracks = Object.values(this.store.tracks).sort((a, b) => b.totalSeconds - a.totalSeconds);
-      return {
-        ...this.getCounters(),
-        userId: this.userId,
-        tracks,
-        recentPlays: this.store.recentPlays,
-        lastSyncedAt: this.store.lastSyncedAt
-      };
-    }
-    clearLocalHistory() {
-      this.store = createEmptyStore(this.userId);
-      this.currentSessionSeconds = 0;
-      this.currentPlayRecorded = false;
-      this.lastProgressMs = 0;
-      saveStore(this.store);
-      this.notify();
-    }
-  };
-
-  // spicetify-cronotofy/src/albumWall.ts
-  function normalizeImageKey(url) {
-    const clean = (url || "").trim().split("?")[0];
-    const scdnMatch = clean.match(/i\.scdn\.co\/image\/([a-zA-Z0-9]+)/);
-    if (scdnMatch) return scdnMatch[1];
-    return clean;
-  }
-  function normalizeAlbumTitleKey(title, artistName) {
-    let cleanTitle = (title || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    if (!cleanTitle) return "";
-    cleanTitle = cleanTitle.replace(
-      /\s*[\(\[]\s*(?:instrumental|deluxe|super deluxe|explicit|clean|bonus|expanded|remaster(?:ed)?|remix(?:es)?|live|acoustic|acustico|version|edition|edicion|from\s+[^)\]]*|anniversary|mono|stereo)[^)\]]*[\)\]]/gi,
-      ""
-    ).replace(/\s*-\s*(?:single|ep|deluxe|instrumental|explicit|clean|remastered).*$/i, "").replace(/[^a-z0-9]+/g, " ").trim();
-    if (!cleanTitle) return "";
-    const primaryArtist = (artistName || "").split(",")[0].toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
-    return primaryArtist ? `${cleanTitle}::${primaryArtist}` : cleanTitle;
-  }
-  function deduplicateWallCovers(covers) {
-    const seenImages = /* @__PURE__ */ new Set();
-    const seenTitles = /* @__PURE__ */ new Set();
-    const unique = [];
-    for (const cover of covers) {
-      if (!cover) continue;
-      const url = normalizeSpotifyImage(cover.imageUrl);
-      if (!url) continue;
-      const imgKey = normalizeImageKey(url);
-      if (!imgKey || seenImages.has(imgKey)) continue;
-      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
-      if (titleKey && seenTitles.has(titleKey)) continue;
-      seenImages.add(imgKey);
-      if (titleKey) seenTitles.add(titleKey);
-      unique.push({ ...cover, imageUrl: url });
-    }
-    return unique;
-  }
-  function deterministicShuffle(items, seedStr) {
-    const arr = [...items];
-    let s = seedStr.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 9876);
-    const rand = () => {
-      s = (s * 9301 + 49297) % 233280;
-      return s / 233280;
-    };
-    let m = arr.length;
-    while (m > 0) {
-      const i = Math.floor(rand() * m--);
-      const tmp = arr[m];
-      arr[m] = arr[i];
-      arr[i] = tmp;
-    }
-    return arr;
-  }
-  function readWallCache(userId) {
-    try {
-      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
-      const raw = localStorage.getItem(key);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.savedAt === "number" && Array.isArray(parsed.covers) && Date.now() - parsed.savedAt < CRONOTOFY_MOD_CONFIG.albumWall.cacheTtlMs && parsed.covers.length > 0) {
-        return parsed.covers;
-      }
-    } catch {
-    }
-    return null;
-  }
-  function writeWallCache(userId, covers) {
-    try {
-      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
-      const payload = { savedAt: Date.now(), covers };
-      localStorage.setItem(key, JSON.stringify(payload));
-    } catch {
-    }
-  }
-  async function collectFavoriteArtistCovers(params) {
-    const { userId, artistCandidates, seedTrackCovers } = params;
-    const collected = [];
-    const seenImages = /* @__PURE__ */ new Set();
-    const seenTitles = /* @__PURE__ */ new Set();
-    const addCover = (cover) => {
-      const url = normalizeSpotifyImage(cover.imageUrl);
-      if (!url) return;
-      const imgKey = normalizeImageKey(url);
-      if (!imgKey || seenImages.has(imgKey)) return;
-      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
-      if (titleKey && seenTitles.has(titleKey)) return;
-      seenImages.add(imgKey);
-      if (titleKey) seenTitles.add(titleKey);
-      collected.push({ ...cover, imageUrl: url });
-    };
-    for (const c of seedTrackCovers) {
-      addCover(c);
-    }
-    const cached = readWallCache(userId);
-    if (cached) {
-      for (const c of cached) {
-        addCover(c);
-      }
-      if (collected.length >= 130) {
-        return collected;
-      }
-    }
-    const artistsWithId = [];
-    const seenArtistIds = /* @__PURE__ */ new Set();
-    for (const a of artistCandidates) {
-      if (a.id && !a.id.startsWith("local:") && !seenArtistIds.has(a.id)) {
-        seenArtistIds.add(a.id);
-        artistsWithId.push({ id: a.id, name: a.name });
-        if (artistsWithId.length >= CRONOTOFY_MOD_CONFIG.albumWall.maxArtistsToFetch) break;
-      }
-    }
-    const maxPerArtist = CRONOTOFY_MOD_CONFIG.albumWall.maxCoversPerArtist;
-    const batchSize = 4;
-    for (let i = 0; i < artistsWithId.length; i += batchSize) {
-      const batch = artistsWithId.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map(async (artist) => {
-          try {
-            const gqlAlbums = await fetchArtistDiscographyFromDesktop(artist.id, maxPerArtist);
-            for (const alb of gqlAlbums) {
-              addCover({
-                id: alb.id,
-                title: alb.name,
-                artistName: artist.name,
-                imageUrl: alb.imageUrl,
-                releaseType: alb.releaseType
-              });
-            }
-          } catch {
-          }
-        })
-      );
-    }
-    if (collected.length > 0) {
-      writeWallCache(userId, collected);
-    }
-    return collected;
-  }
-  function buildAlbumWallLanes(covers, seedKey, laneCount, minPerLane) {
-    const unique = deduplicateWallCovers(covers);
-    if (unique.length === 0 || laneCount <= 0) return [];
-    const shuffled = deterministicShuffle(unique, seedKey || "cronotofy");
-    const lanes = Array.from({ length: laneCount }, () => []);
-    shuffled.forEach((cover, idx) => {
-      lanes[idx % laneCount].push(cover);
-    });
-    if (minPerLane <= 0) return lanes;
-    const target = Math.min(minPerLane, shuffled.length);
-    return lanes.map((lane, lIdx) => {
-      if (lane.length >= target) return lane;
-      const filled = [...lane];
-      const usedInLane = new Set(filled.map((c) => normalizeImageKey(c.imageUrl)));
-      const nearby = /* @__PURE__ */ new Set();
-      for (const offset of [-2, -1, 1, 2]) {
-        const neighbor = lanes[lIdx + offset];
-        if (!neighbor) continue;
-        for (const c of neighbor) nearby.add(normalizeImageKey(c.imageUrl));
-      }
-      const startOffset = (lIdx * 7 + Math.floor(shuffled.length / 2)) % shuffled.length;
-      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
-        const candidate = shuffled[(startOffset + step) % shuffled.length];
-        const key = normalizeImageKey(candidate.imageUrl);
-        if (usedInLane.has(key)) continue;
-        if (nearby.has(key) && shuffled.length > filled.length + nearby.size) continue;
-        usedInLane.add(key);
-        filled.push(candidate);
-      }
-      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
-        const candidate = shuffled[(startOffset + step) % shuffled.length];
-        const key = normalizeImageKey(candidate.imageUrl);
-        if (usedInLane.has(key)) continue;
-        usedInLane.add(key);
-        filled.push(candidate);
-      }
-      return filled;
-    });
-  }
 
   // spicetify-cronotofy/src/aiColorEngine.ts
   var AI_PALETTE_CACHE_KEY = "cronotofy_ai_palettes_v4";
@@ -2535,12 +563,12 @@ ${track.externalUrl}`;
     const apiKey = getConfiguredGeminiApiKey();
     if (!apiKey || !jpegBase64) return null;
     try {
-      const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
       const trackContext = trackMeta.title ? `Track: "${trackMeta.title}"${trackMeta.artist ? ` by ${trackMeta.artist}` : ""}.` : "";
       const prompt = `You are a music app art director extracting an Apple Liquid Glass UI color palette from this album cover. ${trackContext} Choose 3 exact #RRGGBB hex colors based on the dominant visual area and overall mood (NEVER let a tiny bright accent spot covering under 15% of the artwork hijack accentHex or ambientHex): 1) accentHex: the dominant iconic color representing the main mood/surface of the cover (balanced for dark glass; preserve cool slate/steel blues or monochrome silver when dominant). 2) accent2Hex: a harmonious secondary color clearly present in the artwork. 3) ambientHex: the deep atmospheric background mood color for frosted glass tinting. Respond ONLY with valid JSON: {"accentHex":"#......","accent2Hex":"#......","ambientHex":"#......"}.`;
       const res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [
             {
@@ -2617,6 +645,9 @@ ${track.externalUrl}`;
     bgCard: "#111722",
     bgCardRgb: "17, 23, 34"
   };
+  function shouldSeedFallbackCover(palette, liveTrack) {
+    return !palette.isDynamic && !liveTrack?.albumImageUrl?.trim();
+  }
   function loadPersistedPalette() {
     try {
       const raw = localStorage.getItem(LAST_PALETTE_STORAGE_KEY);
@@ -2701,25 +732,6 @@ html.cronotofy-playing-theme {
   --spice-rgb-button-active: var(--cronotofy-accent-2-rgb) !important;
 }
 
-html.cronotofy-playing-theme .encore-dark-theme,
-html.cronotofy-playing-theme .encore-dark-theme .encore-base-set {
-  --background-base: rgba(var(--cronotofy-bg-main-rgb), 0.18) !important;
-  --background-elevated-base: rgba(var(--cronotofy-bg-card-rgb), 0.24) !important;
-  --background-elevated-highlight: rgba(var(--cronotofy-bg-card-rgb), 0.36) !important;
-  --background-highlight: rgba(255, 255, 255, 0.08) !important;
-  --background-tinted-base: rgba(var(--cronotofy-accent-rgb), 0.12) !important;
-  --section-background-base: rgba(var(--cronotofy-bg-card-rgb), 0.22) !important;
-  --text-bright-accent: var(--cronotofy-accent) !important;
-  --essential-bright-accent: var(--cronotofy-accent) !important;
-}
-
-html.cronotofy-playing-theme .encore-dark-theme .encore-bright-accent-set {
-  --background-base: var(--cronotofy-accent) !important;
-  --background-highlight: var(--cronotofy-accent-2) !important;
-  --text-bright-accent: var(--cronotofy-accent-contrast) !important;
-  --essential-base: var(--cronotofy-accent-contrast) !important;
-}
-
 html.cronotofy-playing-theme .Root__main-view {
   background-color: rgba(var(--cronotofy-bg-main-rgb), 0.12) !important;
   background-image:
@@ -2732,10 +744,8 @@ html.cronotofy-playing-theme.cronotofy-route-active .Root__main-view {
 }
 
 html.cronotofy-playing-theme .Root__nav-bar,
-html.cronotofy-playing-theme .Root__right-sidebar,
-html.cronotofy-playing-theme .Root__right-sidebar-peek,
-html.cronotofy-playing-theme .Root__globalNav::before {
-  background-color: rgba(var(--cronotofy-bg-sidebar-rgb), 0.26) !important;
+html.cronotofy-playing-theme .Root__right-sidebar:not(:empty):not(:has(.Root__right-sidebar-collapsed)) {
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb), 0.22) !important;
 }
 
 html.cronotofy-playing-theme .Root__now-playing-bar {
@@ -2747,7 +757,7 @@ html.cronotofy-playing-theme .Root__now-playing-bar {
 html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar {
   background: linear-gradient(
     180deg,
-    rgba(var(--cronotofy-bg-card-rgb), 0.56) 0%,
+    rgba(var(--cronotofy-bg-card-rgb), 0.58) 0%,
     rgba(var(--cronotofy-bg-sidebar-rgb), 0.66) 100%
   ) !important;
   border: 1px solid rgba(var(--cronotofy-accent-rgb), 0.22) !important;
@@ -2759,7 +769,7 @@ html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar {
 }
 
 html.cronotofy-playing-theme .main-nowPlayingBar-nowPlayingBar .main-nowPlayingBar-left {
-  background: rgba(var(--cronotofy-bg-main-rgb), 0.46) !important;
+  background: rgba(var(--cronotofy-bg-main-rgb), 0.33) !important;
   border-color: rgba(var(--cronotofy-accent-rgb), 0.16) !important;
 }
 
@@ -2919,12 +929,15 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       }
     }
     async seedFromCoverIfNeeded(imageUrl, trackUri) {
-      if (!this.enabled || this.currentPalette.isDynamic || !imageUrl) return;
+      if (!this.enabled || !shouldSeedFallbackCover(this.currentPalette, this.lastTrackSnapshot) || !imageUrl) {
+        return;
+      }
       const reqId = ++this.requestSeq;
       await this.runCoverAnalysis(imageUrl, trackUri, {}, reqId);
     }
     async updateFromLiveTrack(track) {
       this.lastTrackSnapshot = track;
+      const reqId = ++this.requestSeq;
       ensureDynamicThemeStyle();
       if (!this.enabled || !track || !track.albumImageUrl) {
         return;
@@ -2937,7 +950,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
         return;
       }
-      const reqId = ++this.requestSeq;
       await this.runCoverAnalysis(
         track.albumImageUrl,
         track.uri,
@@ -2946,6 +958,1213 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       );
     }
   };
+
+  // spicetify-cronotofy/src/i18n.ts
+  var TRANSLATIONS = {
+    en: {
+      brandSubtitle: "Native music analytics \xB7 Real-time telemetry",
+      tabs: {
+        overview: "Overview",
+        artists: "Artists",
+        tracks: "Tracks",
+        albums: "Albums",
+        live: "Live Activity"
+      },
+      periods: {
+        short_term: "1 Month",
+        medium_term: "6 Months",
+        long_term: "All Time"
+      },
+      nowPlaying: "Now Playing",
+      paused: "Paused",
+      currentSession: "Current session",
+      today: "Today",
+      idleHint: "Play any song on Spotify to start live telemetry.",
+      loadingAnalytics: "Loading your Spotify stats...",
+      kpis: {
+        recordedTime: "Recorded Time",
+        todayLabel: "Today",
+        annualInCronotofy: (h) => `${h} annual in Cronotofy`,
+        totalMod: (h) => `Total: ${h}`,
+        topArtist: (period) => `Top Artist (${period})`,
+        artistsAnalyzed: (n) => `${n} artists analyzed`,
+        topTrack: (period) => `Top Track (${period})`,
+        noData: "No data",
+        favoriteGenre: "Favorite Genre",
+        varied: "Varied",
+        affinityAndRecent: (pct, n) => `${pct}% affinity \xB7 ${n} recent plays`,
+        tracksInRanking: (n) => `${n} tracks in ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 Artists",
+        top5Tracks: "Top 5 Tracks",
+        top4Albums: "Top 4 Albums",
+        genreDna: "Genre DNA",
+        mainGenresBadge: (n) => `${n} top genres`,
+        viewAll: (n) => `View all (${n}) \u2192`,
+        tracksRanking: (period) => `Track Ranking \xB7 ${period}`,
+        tracksBadge: (n) => `${n} tracks`,
+        tracksListenedToday: "Listened Today",
+        accumulatedDesktop: "Desktop Total",
+        exactSecondBySecond: "Exact second-by-second tracking",
+        capturedTracks: "Captured Tracks",
+        completedPlays: (n) => `${n} completed plays`,
+        lastSync: "Local Storage",
+        pending: "Active",
+        topRealTimeTracks: "Tracks by Real Listening Time",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Real Artists & Recent History",
+        clearLocalHistory: "Clear local history",
+        recordedPlays: (n) => `${n} recorded plays`,
+        latestCapturedPlays: "Latest Captured Plays",
+        localDateLabel: (d) => `Local date: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Spotify Artist",
+        untitled: "Untitled",
+        unknownArtist: "Unknown Artist",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} ${n === 1 ? "top track" : "top tracks"}`,
+        songSingular: "track",
+        songPlural: "tracks",
+        playSingular: "play",
+        playPlural: "plays"
+      },
+      empty: {
+        noArtistsPeriod: "No artists available for this period.",
+        noTracksPeriod: "No tracks available for this period.",
+        noAlbumsPeriod: "No albums to display.",
+        noGenres: "No genre tags available on Spotify.",
+        noArtistsFound: "No top artists found for this period.",
+        noTrackedTimeYet: "No accumulated time yet. Play any track on Spotify and it will appear live here.",
+        noRecentPlaysYet: "Tracks played \u2265 25s will appear in this chronological timeline."
+      },
+      actions: {
+        play: "Play",
+        pause: "Pause",
+        addToQueue: "Add to queue",
+        playingNowToast: (title) => `Playing: ${title}`,
+        playbackErrorToast: "Could not start playback",
+        queuedToast: (title) => `Added to queue: ${title}`,
+        queueErrorToast: "Could not add to queue",
+        historyClearedToast: "Local history cleared",
+        confirmClearHistory: "Confirm clear?",
+        copiedTrackToast: (title) => `Copied: ${title}`,
+        copyErrorToast: "Could not copy track info",
+        noTrackPlayingToast: "No track playing right now"
+      },
+      search: {
+        placeholder: "Filter by song, artist or album...",
+        clear: "Clear filter",
+        noResults: "No matching results for your filter."
+      },
+      streak: {
+        daysBadge: (n) => `${n}d streak`,
+        last7Days: (h) => `7d: ${h}`
+      },
+      sleepTimer: {
+        label: "Sleep timer",
+        offToast: "Sleep timer off",
+        endOfTrackShort: "End",
+        endOfTrackToast: "Sleep timer: pause at end of track",
+        minutesToast: (m) => `Sleep timer: ${m} min`,
+        triggeredToast: "Sleep timer finished \u2014 playback paused",
+        tooltipIdle: "Sleep timer (Alt+Shift+S)",
+        tooltipActive: (detail) => `Sleep timer: ${detail} (right-click to cancel)`
+      },
+      time: {
+        justNow: "Just now",
+        secondsAgo: (s) => `${s}s ago`,
+        minutesAgo: (m) => `${m}m ago`,
+        hoursAgo: (h) => `${h}h ago`
+      },
+      errorBoundary: {
+        title: "Something went wrong in Cronotofy",
+        fallbackMsg: "An unexpected error occurred while rendering this view.",
+        retry: "Retry"
+      }
+    },
+    es: {
+      brandSubtitle: "Anal\xEDtica musical nativa \xB7 Telemetr\xEDa en tiempo real",
+      tabs: {
+        overview: "Resumen",
+        artists: "Artistas",
+        tracks: "Canciones",
+        albums: "\xC1lbumes",
+        live: "Actividad en Vivo"
+      },
+      periods: {
+        short_term: "1 Mes",
+        medium_term: "6 Meses",
+        long_term: "General"
+      },
+      nowPlaying: "Reproduciendo ahora",
+      paused: "En pausa",
+      currentSession: "Sesi\xF3n actual",
+      today: "Hoy",
+      idleHint: "Reproduce cualquier canci\xF3n en Spotify para capturar telemetr\xEDa en vivo.",
+      loadingAnalytics: "Cargando tus estad\xEDsticas de Spotify...",
+      kpis: {
+        recordedTime: "Tiempo Registrado",
+        todayLabel: "Hoy",
+        annualInCronotofy: (h) => `${h} anual en Cronotofy`,
+        totalMod: (h) => `Total: ${h}`,
+        topArtist: (period) => `Top Artista (${period})`,
+        artistsAnalyzed: (n) => `${n} artistas analizados`,
+        topTrack: (period) => `Top Canci\xF3n (${period})`,
+        noData: "Sin datos",
+        favoriteGenre: "G\xE9nero Favorito",
+        varied: "Variado",
+        affinityAndRecent: (pct, n) => `${pct}% de afinidad \xB7 ${n} escuchas recientes`,
+        tracksInRanking: (n) => `${n} canciones en ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 Artistas",
+        top5Tracks: "Top 5 Canciones",
+        top4Albums: "Top 4 \xC1lbumes",
+        genreDna: "ADN de G\xE9neros",
+        mainGenresBadge: (n) => `${n} principales`,
+        viewAll: (n) => `Ver todos (${n}) \u2192`,
+        tracksRanking: (period) => `Ranking de Canciones \xB7 ${period}`,
+        tracksBadge: (n) => `${n} canciones`,
+        tracksListenedToday: "Escuchado Hoy",
+        accumulatedDesktop: "Acumulado en Escritorio",
+        exactSecondBySecond: "Medici\xF3n exacta segundo a segundo",
+        capturedTracks: "Pistas Capturadas",
+        completedPlays: (n) => `${n} reproducciones completas`,
+        lastSync: "Almacenamiento Local",
+        pending: "Activo",
+        topRealTimeTracks: "Canciones por Tiempo Real Escuchado",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Artistas Reales e Historial Reciente",
+        clearLocalHistory: "Limpiar historial local",
+        recordedPlays: (n) => `${n} reproducciones registradas`,
+        latestCapturedPlays: "\xDAltimas Reproducciones Capturadas",
+        localDateLabel: (d) => `Fecha local: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Artista de Spotify",
+        untitled: "Sin t\xEDtulo",
+        unknownArtist: "Artista desconocido",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} ${n === 1 ? "top canci\xF3n" : "top canciones"}`,
+        songSingular: "canci\xF3n",
+        songPlural: "canciones",
+        playSingular: "play",
+        playPlural: "plays"
+      },
+      empty: {
+        noArtistsPeriod: "Sin artistas disponibles para este per\xEDodo.",
+        noTracksPeriod: "Sin canciones disponibles para este per\xEDodo.",
+        noAlbumsPeriod: "Sin \xE1lbumes para mostrar.",
+        noGenres: "Sin etiquetas de g\xE9nero disponibles en Spotify.",
+        noArtistsFound: "No se encontraron artistas principales para este per\xEDodo.",
+        noTrackedTimeYet: "A\xFAn no hay tiempo acumulado. Dale play a cualquier canci\xF3n en Spotify y aparecer\xE1 aqu\xED en vivo.",
+        noRecentPlaysYet: "Las canciones reproducidas \u2265 25s aparecer\xE1n en esta l\xEDnea de tiempo cronol\xF3gica."
+      },
+      actions: {
+        play: "Reproducir",
+        pause: "Pausar",
+        addToQueue: "A\xF1adir a la cola",
+        playingNowToast: (title) => `Reproduciendo: ${title}`,
+        playbackErrorToast: "No se pudo iniciar la reproducci\xF3n",
+        queuedToast: (title) => `A\xF1adida a la cola: ${title}`,
+        queueErrorToast: "No se pudo a\xF1adir a la cola",
+        historyClearedToast: "Historial local reiniciado",
+        confirmClearHistory: "\xBFConfirmar borrado?",
+        copiedTrackToast: (title) => `Copiada: ${title}`,
+        copyErrorToast: "No se pudo copiar la canci\xF3n",
+        noTrackPlayingToast: "No hay ninguna canci\xF3n sonando"
+      },
+      search: {
+        placeholder: "Filtrar por canci\xF3n, artista o \xE1lbum...",
+        clear: "Limpiar filtro",
+        noResults: "Sin resultados para tu filtro."
+      },
+      streak: {
+        daysBadge: (n) => `${n}d racha`,
+        last7Days: (h) => `7d: ${h}`
+      },
+      sleepTimer: {
+        label: "Temporizador",
+        offToast: "Temporizador apagado",
+        endOfTrackShort: "Fin",
+        endOfTrackToast: "Temporizador: pausar al terminar la canci\xF3n",
+        minutesToast: (m) => `Temporizador: ${m} min`,
+        triggeredToast: "Temporizador finalizado \u2014 reproducci\xF3n pausada",
+        tooltipIdle: "Temporizador de sue\xF1o (Alt+Shift+S)",
+        tooltipActive: (detail) => `Temporizador: ${detail} (clic derecho para cancelar)`
+      },
+      time: {
+        justNow: "Hace un momento",
+        secondsAgo: (s) => `Hace ${s}s`,
+        minutesAgo: (m) => `Hace ${m}m`,
+        hoursAgo: (h) => `Hace ${h}h`
+      },
+      errorBoundary: {
+        title: "Ocurri\xF3 un error al mostrar Cronotofy",
+        fallbackMsg: "Ocurri\xF3 un problema inesperado al renderizar esta vista.",
+        retry: "Reintentar"
+      }
+    },
+    pt: {
+      brandSubtitle: "An\xE1lise musical nativa \xB7 Telemetria em tempo real",
+      tabs: {
+        overview: "Resumo",
+        artists: "Artistas",
+        tracks: "M\xFAsicas",
+        albums: "\xC1lbuns",
+        live: "Atividade ao Vivo"
+      },
+      periods: {
+        short_term: "1 M\xEAs",
+        medium_term: "6 Meses",
+        long_term: "Geral"
+      },
+      nowPlaying: "Tocando agora",
+      paused: "Pausado",
+      currentSession: "Sess\xE3o atual",
+      today: "Hoje",
+      idleHint: "Reproduza qualquer m\xFAsica no Spotify para iniciar a telemetria ao vivo.",
+      loadingAnalytics: "Carregando suas estat\xEDsticas do Spotify...",
+      kpis: {
+        recordedTime: "Tempo Registrado",
+        todayLabel: "Hoje",
+        annualInCronotofy: (h) => `${h} anual no Cronotofy`,
+        totalMod: (h) => `Total: ${h}`,
+        topArtist: (period) => `Top Artista (${period})`,
+        artistsAnalyzed: (n) => `${n} artistas analisados`,
+        topTrack: (period) => `Top M\xFAsica (${period})`,
+        noData: "Sem dados",
+        favoriteGenre: "G\xEAnero Favorito",
+        varied: "Variado",
+        affinityAndRecent: (pct, n) => `${pct}% afinidade \xB7 ${n} recentes`,
+        tracksInRanking: (n) => `${n} m\xFAsicas no ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 Artistas",
+        top5Tracks: "Top 5 M\xFAsicas",
+        top4Albums: "Top 4 \xC1lbuns",
+        genreDna: "DNA de G\xEAneros",
+        mainGenresBadge: (n) => `${n} principais`,
+        viewAll: (n) => `Ver todos (${n}) \u2192`,
+        tracksRanking: (period) => `Ranking de M\xFAsicas \xB7 ${period}`,
+        tracksBadge: (n) => `${n} m\xFAsicas`,
+        tracksListenedToday: "Ouvido Hoje",
+        accumulatedDesktop: "Acumulado no Desktop",
+        exactSecondBySecond: "Medi\xE7\xE3o exata segundo a segundo",
+        capturedTracks: "Faixas Capturadas",
+        completedPlays: (n) => `${n} reprodu\xE7\xF5es completas`,
+        lastSync: "Armazenamento Local",
+        pending: "Ativo",
+        topRealTimeTracks: "M\xFAsicas por Tempo Real Ouvido",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Artistas Reais e Hist\xF3rico Recente",
+        clearLocalHistory: "Limpar hist\xF3rico local",
+        recordedPlays: (n) => `${n} reprodu\xE7\xF5es registradas`,
+        latestCapturedPlays: "\xDAltimas Reprodu\xE7\xF5es Capturadas",
+        localDateLabel: (d) => `Data local: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Artista do Spotify",
+        untitled: "Sem t\xEDtulo",
+        unknownArtist: "Artista desconhecido",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} top m\xFAsicas`,
+        songSingular: "m\xFAsica",
+        songPlural: "m\xFAsicas",
+        playSingular: "play",
+        playPlural: "plays"
+      },
+      empty: {
+        noArtistsPeriod: "Sem artistas dispon\xEDveis para este per\xEDodo.",
+        noTracksPeriod: "Sem m\xFAsicas dispon\xEDveis para este per\xEDodo.",
+        noAlbumsPeriod: "Sem \xE1lbuns para mostrar.",
+        noGenres: "Sem tags de g\xEAnero dispon\xEDveis no Spotify.",
+        noArtistsFound: "Nenhum artista principal encontrado para este per\xEDodo.",
+        noTrackedTimeYet: "Ainda n\xE3o h\xE1 tempo acumulado. D\xEA play em qualquer m\xFAsica no Spotify.",
+        noRecentPlaysYet: "M\xFAsicas tocadas \u2265 25s aparecer\xE3o nesta linha do tempo."
+      },
+      actions: {
+        play: "Reproduzir",
+        pause: "Pausar",
+        addToQueue: "Adicionar \xE0 fila",
+        playingNowToast: (title) => `Tocando: ${title}`,
+        playbackErrorToast: "N\xE3o foi poss\xEDvel iniciar a reprodu\xE7\xE3o",
+        queuedToast: (title) => `Adicionada \xE0 fila: ${title}`,
+        queueErrorToast: "N\xE3o foi poss\xEDvel adicionar \xE0 fila",
+        historyClearedToast: "Hist\xF3rico local limpo",
+        confirmClearHistory: "Confirmar limpeza?",
+        copiedTrackToast: (title) => `Copiada: ${title}`,
+        copyErrorToast: "N\xE3o foi poss\xEDvel copiar a m\xFAsica",
+        noTrackPlayingToast: "Nenhuma m\xFAsica tocando agora"
+      },
+      search: {
+        placeholder: "Filtrar por m\xFAsica, artista ou \xE1lbum...",
+        clear: "Limpar filtro",
+        noResults: "Nenhum resultado encontrado para o filtro."
+      },
+      streak: {
+        daysBadge: (n) => `${n}d sequ\xEAncia`,
+        last7Days: (h) => `7d: ${h}`
+      },
+      sleepTimer: {
+        label: "Temporizador",
+        offToast: "Temporizador desligado",
+        endOfTrackShort: "Fim",
+        endOfTrackToast: "Temporizador: pausar ao fim da faixa",
+        minutesToast: (m) => `Temporizador: ${m} min`,
+        triggeredToast: "Temporizador encerrado \u2014 reprodu\xE7\xE3o pausada",
+        tooltipIdle: "Temporizador (Alt+Shift+S)",
+        tooltipActive: (detail) => `Temporizador: ${detail} (clique direito para cancelar)`
+      },
+      time: {
+        justNow: "Agora mesmo",
+        secondsAgo: (s) => `H\xE1 ${s}s`,
+        minutesAgo: (m) => `H\xE1 ${m}m`,
+        hoursAgo: (h) => `H\xE1 ${h}h`
+      },
+      errorBoundary: {
+        title: "Algo deu errado no Cronotofy",
+        fallbackMsg: "Ocorreu um erro inesperado ao renderizar esta visualiza\xE7\xE3o.",
+        retry: "Tentar novamente"
+      }
+    },
+    fr: {
+      brandSubtitle: "Analytique musicale native \xB7 T\xE9l\xE9m\xE9trie en temps r\xE9el",
+      tabs: {
+        overview: "Aper\xE7u",
+        artists: "Artistes",
+        tracks: "Titres",
+        albums: "Albums",
+        live: "Activit\xE9 en direct"
+      },
+      periods: {
+        short_term: "1 Mois",
+        medium_term: "6 Mois",
+        long_term: "Global"
+      },
+      nowPlaying: "Lecture en cours",
+      paused: "En pause",
+      currentSession: "Session actuelle",
+      today: "Aujourd'hui",
+      idleHint: "Lancez un titre sur Spotify pour activer la t\xE9l\xE9m\xE9trie en direct.",
+      loadingAnalytics: "Chargement de vos statistiques Spotify...",
+      kpis: {
+        recordedTime: "Temps enregistr\xE9",
+        todayLabel: "Aujourd'hui",
+        annualInCronotofy: (h) => `${h} annuel sur Cronotofy`,
+        totalMod: (h) => `Total : ${h}`,
+        topArtist: (period) => `Top Artiste (${period})`,
+        artistsAnalyzed: (n) => `${n} artistes analys\xE9s`,
+        topTrack: (period) => `Top Titre (${period})`,
+        noData: "Aucune donn\xE9e",
+        favoriteGenre: "Genre favori",
+        varied: "Vari\xE9",
+        affinityAndRecent: (pct, n) => `${pct}% d'affinit\xE9 \xB7 ${n} \xE9coutes r\xE9centes`,
+        tracksInRanking: (n) => `${n} titres class\xE9s`
+      },
+      sections: {
+        top5Artists: "Top 5 Artistes",
+        top5Tracks: "Top 5 Titres",
+        top4Albums: "Top 4 Albums",
+        genreDna: "ADN des genres",
+        mainGenresBadge: (n) => `${n} principaux`,
+        viewAll: (n) => `Tout voir (${n}) \u2192`,
+        tracksRanking: (period) => `Classement des titres \xB7 ${period}`,
+        tracksBadge: (n) => `${n} titres`,
+        tracksListenedToday: "\xC9cout\xE9 aujourd'hui",
+        accumulatedDesktop: "Total sur ordinateur",
+        exactSecondBySecond: "Mesure exacte seconde par seconde",
+        capturedTracks: "Titres captur\xE9s",
+        completedPlays: (n) => `${n} lectures compl\xE8tes`,
+        lastSync: "Stockage local",
+        pending: "Actif",
+        topRealTimeTracks: "Titres par temps d'\xE9coute r\xE9el",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Artistes r\xE9els & historique r\xE9cent",
+        clearLocalHistory: "Effacer l'historique local",
+        recordedPlays: (n) => `${n} \xE9coutes enregistr\xE9es`,
+        latestCapturedPlays: "Derni\xE8res lectures captur\xE9es",
+        localDateLabel: (d) => `Date locale : ${d}`
+      },
+      entities: {
+        spotifyArtist: "Artiste Spotify",
+        untitled: "Sans titre",
+        unknownArtist: "Artiste inconnu",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} top titres`,
+        songSingular: "titre",
+        songPlural: "titres",
+        playSingular: "\xE9coute",
+        playPlural: "\xE9coutes"
+      },
+      empty: {
+        noArtistsPeriod: "Aucun artiste disponible pour cette p\xE9riode.",
+        noTracksPeriod: "Aucun titre disponible pour cette p\xE9riode.",
+        noAlbumsPeriod: "Aucun album \xE0 afficher.",
+        noGenres: "Aucun genre disponible sur Spotify.",
+        noArtistsFound: "Aucun artiste principal trouv\xE9 pour cette p\xE9riode.",
+        noTrackedTimeYet: "Aucun temps cumul\xE9. Lancez n'importe quel titre sur Spotify.",
+        noRecentPlaysYet: "Les titres \xE9cout\xE9s \u2265 25s appara\xEEtront ici."
+      },
+      actions: {
+        play: "Lire",
+        pause: "Pause",
+        addToQueue: "Ajouter \xE0 la file d'attente",
+        playingNowToast: (title) => `Lecture : ${title}`,
+        playbackErrorToast: "Impossible de lancer la lecture",
+        queuedToast: (title) => `Ajout\xE9 \xE0 la file : ${title}`,
+        queueErrorToast: "Impossible d'ajouter \xE0 la file",
+        historyClearedToast: "Historique local effac\xE9",
+        confirmClearHistory: "Confirmer la suppression ?",
+        copiedTrackToast: (title) => `Copi\xE9 : ${title}`,
+        copyErrorToast: "Impossible de copier le titre",
+        noTrackPlayingToast: "Aucun titre en cours de lecture"
+      },
+      search: {
+        placeholder: "Filtrer par titre, artiste ou album...",
+        clear: "Effacer le filtre",
+        noResults: "Aucun r\xE9sultat pour ce filtre."
+      },
+      streak: {
+        daysBadge: (n) => `${n}j de suite`,
+        last7Days: (h) => `7j : ${h}`
+      },
+      sleepTimer: {
+        label: "Minuteur",
+        offToast: "Minuteur d\xE9sactiv\xE9",
+        endOfTrackShort: "Fin",
+        endOfTrackToast: "Minuteur : pause en fin de titre",
+        minutesToast: (m) => `Minuteur : ${m} min`,
+        triggeredToast: "Minuteur termin\xE9 \u2014 lecture en pause",
+        tooltipIdle: "Minuteur de veille (Alt+Shift+S)",
+        tooltipActive: (detail) => `Minuteur : ${detail} (clic droit pour annuler)`
+      },
+      time: {
+        justNow: "\xC0 l'instant",
+        secondsAgo: (s) => `Il y a ${s}s`,
+        minutesAgo: (m) => `Il y a ${m}m`,
+        hoursAgo: (h) => `Il y a ${h}h`
+      },
+      errorBoundary: {
+        title: "Une erreur est survenue dans Cronotofy",
+        fallbackMsg: "Une erreur inattendue s'est produite lors de l'affichage.",
+        retry: "R\xE9essayer"
+      }
+    },
+    de: {
+      brandSubtitle: "Native Musik-Analyse \xB7 Echtzeit-Telemetrie",
+      tabs: {
+        overview: "\xDCbersicht",
+        artists: "K\xFCnstler",
+        tracks: "Songs",
+        albums: "Alben",
+        live: "Live-Aktivit\xE4t"
+      },
+      periods: {
+        short_term: "1 Monat",
+        medium_term: "6 Monate",
+        long_term: "Gesamt"
+      },
+      nowPlaying: "L\xE4uft gerade",
+      paused: "Pausiert",
+      currentSession: "Aktuelle Sitzung",
+      today: "Heute",
+      idleHint: "Spiele einen Song auf Spotify ab, um Live-Telemetrie zu erfassen.",
+      loadingAnalytics: "Spotify-Statistiken werden geladen...",
+      kpis: {
+        recordedTime: "Erfasste Zeit",
+        todayLabel: "Heute",
+        annualInCronotofy: (h) => `${h} j\xE4hrlich in Cronotofy`,
+        totalMod: (h) => `Gesamt: ${h}`,
+        topArtist: (period) => `Top-K\xFCnstler (${period})`,
+        artistsAnalyzed: (n) => `${n} K\xFCnstler analysiert`,
+        topTrack: (period) => `Top-Song (${period})`,
+        noData: "Keine Daten",
+        favoriteGenre: "Lieblingsgenre",
+        varied: "Gemischt",
+        affinityAndRecent: (pct, n) => `${pct}% Anteil \xB7 ${n} k\xFCrzliche Plays`,
+        tracksInRanking: (n) => `${n} Songs im Ranking`
+      },
+      sections: {
+        top5Artists: "Top 5 K\xFCnstler",
+        top5Tracks: "Top 5 Songs",
+        top4Albums: "Top 4 Alben",
+        genreDna: "Genre-DNA",
+        mainGenresBadge: (n) => `${n} Top-Genres`,
+        viewAll: (n) => `Alle ansehen (${n}) \u2192`,
+        tracksRanking: (period) => `Song-Ranking \xB7 ${period}`,
+        tracksBadge: (n) => `${n} Songs`,
+        tracksListenedToday: "Heute geh\xF6rt",
+        accumulatedDesktop: "Desktop gesamt",
+        exactSecondBySecond: "Sekundengenaue Erfassung",
+        capturedTracks: "Erfasste Songs",
+        completedPlays: (n) => `${n} vollst\xE4ndige Plays`,
+        lastSync: "Lokaler Speicher",
+        pending: "Aktiv",
+        topRealTimeTracks: "Songs nach echter H\xF6rzeit",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Echte K\xFCnstler & Verlauf",
+        clearLocalHistory: "Lokalen Verlauf l\xF6schen",
+        recordedPlays: (n) => `${n} erfasste Plays`,
+        latestCapturedPlays: "Zuletzt erfasste Plays",
+        localDateLabel: (d) => `Lokales Datum: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Spotify-K\xFCnstler",
+        untitled: "Ohne Titel",
+        unknownArtist: "Unbekannter K\xFCnstler",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} Top-Songs`,
+        songSingular: "Song",
+        songPlural: "Songs",
+        playSingular: "Play",
+        playPlural: "Plays"
+      },
+      empty: {
+        noArtistsPeriod: "Keine K\xFCnstler f\xFCr diesen Zeitraum verf\xFCgbar.",
+        noTracksPeriod: "Keine Songs f\xFCr diesen Zeitraum verf\xFCgbar.",
+        noAlbumsPeriod: "Keine Alben vorhanden.",
+        noGenres: "Keine Genre-Daten auf Spotify verf\xFCgbar.",
+        noArtistsFound: "Keine Top-K\xFCnstler f\xFCr diesen Zeitraum gefunden.",
+        noTrackedTimeYet: "Noch keine H\xF6rzeit erfasst. Spiele einfach einen Song auf Spotify ab.",
+        noRecentPlaysYet: "Songs mit \u2265 25s H\xF6rzeit erscheinen hier chronologisch."
+      },
+      actions: {
+        play: "Abspielen",
+        pause: "Pause",
+        addToQueue: "In die Warteschlange",
+        playingNowToast: (title) => `Spielt: ${title}`,
+        playbackErrorToast: "Wiedergabe konnte nicht gestartet werden",
+        queuedToast: (title) => `Zur Warteschlange hinzugef\xFCgt: ${title}`,
+        queueErrorToast: "Konnte nicht zur Warteschlange hinzugef\xFCgt werden",
+        historyClearedToast: "Lokaler Verlauf gel\xF6scht",
+        confirmClearHistory: "Wirklich l\xF6schen?",
+        copiedTrackToast: (title) => `Kopiert: ${title}`,
+        copyErrorToast: "Song konnte nicht kopiert werden",
+        noTrackPlayingToast: "Gerade l\xE4uft kein Song"
+      },
+      search: {
+        placeholder: "Nach Song, K\xFCnstler oder Album filtern...",
+        clear: "Filter l\xF6schen",
+        noResults: "Keine passenden Treffer gefunden."
+      },
+      streak: {
+        daysBadge: (n) => `${n}T Serie`,
+        last7Days: (h) => `7T: ${h}`
+      },
+      sleepTimer: {
+        label: "Sleep-Timer",
+        offToast: "Sleep-Timer aus",
+        endOfTrackShort: "Ende",
+        endOfTrackToast: "Sleep-Timer: Pause am Titelende",
+        minutesToast: (m) => `Sleep-Timer: ${m} Min.`,
+        triggeredToast: "Sleep-Timer abgelaufen \u2014 Wiedergabe pausiert",
+        tooltipIdle: "Sleep-Timer (Alt+Shift+S)",
+        tooltipActive: (detail) => `Sleep-Timer: ${detail} (Rechtsklick zum Abbrechen)`
+      },
+      time: {
+        justNow: "Gerade eben",
+        secondsAgo: (s) => `Vor ${s}s`,
+        minutesAgo: (m) => `Vor ${m}m`,
+        hoursAgo: (h) => `Vor ${h}h`
+      },
+      errorBoundary: {
+        title: "Fehler in Cronotofy",
+        fallbackMsg: "Beim Anzeigen dieser Ansicht ist ein unerwarteter Fehler aufgetreten.",
+        retry: "Erneut versuchen"
+      }
+    },
+    it: {
+      brandSubtitle: "Analisi musicale nativa \xB7 Telemetria in tempo reale",
+      tabs: {
+        overview: "Panoramica",
+        artists: "Artisti",
+        tracks: "Brani",
+        albums: "Album",
+        live: "Attivit\xE0 Live"
+      },
+      periods: {
+        short_term: "1 Mese",
+        medium_term: "6 Mesi",
+        long_term: "Sempre"
+      },
+      nowPlaying: "In riproduzione",
+      paused: "In pausa",
+      currentSession: "Sessione attuale",
+      today: "Oggi",
+      idleHint: "Riproduci qualsiasi brano su Spotify per avviare la telemetria live.",
+      loadingAnalytics: "Caricamento statistiche Spotify...",
+      kpis: {
+        recordedTime: "Tempo registrato",
+        todayLabel: "Oggi",
+        annualInCronotofy: (h) => `${h} annuale su Cronotofy`,
+        totalMod: (h) => `Totale: ${h}`,
+        topArtist: (period) => `Top Artista (${period})`,
+        artistsAnalyzed: (n) => `${n} artisti analizzati`,
+        topTrack: (period) => `Top Brano (${period})`,
+        noData: "Nessun dato",
+        favoriteGenre: "Genere preferito",
+        varied: "Vario",
+        affinityAndRecent: (pct, n) => `${pct}% affinit\xE0 \xB7 ${n} recenti`,
+        tracksInRanking: (n) => `${n} brani in classifica`
+      },
+      sections: {
+        top5Artists: "Top 5 Artisti",
+        top5Tracks: "Top 5 Brani",
+        top4Albums: "Top 4 Album",
+        genreDna: "DNA dei Generi",
+        mainGenresBadge: (n) => `${n} principali`,
+        viewAll: (n) => `Vedi tutti (${n}) \u2192`,
+        tracksRanking: (period) => `Classifica Brani \xB7 ${period}`,
+        tracksBadge: (n) => `${n} brani`,
+        tracksListenedToday: "Ascoltato oggi",
+        accumulatedDesktop: "Totale su Desktop",
+        exactSecondBySecond: "Misurazione esatta secondo per secondo",
+        capturedTracks: "Brani acquisiti",
+        completedPlays: (n) => `${n} ascolti completi`,
+        lastSync: "Archivio locale",
+        pending: "Attivo",
+        topRealTimeTracks: "Brani per tempo reale di ascolto",
+        topNBadge: (n) => `Top ${n}`,
+        realArtistsAndRecent: "Artisti reali e cronologia",
+        clearLocalHistory: "Cancella cronologia locale",
+        recordedPlays: (n) => `${n} ascolti registrati`,
+        latestCapturedPlays: "Ultimi ascolti acquisiti",
+        localDateLabel: (d) => `Data locale: ${d}`
+      },
+      entities: {
+        spotifyArtist: "Artista Spotify",
+        untitled: "Senza titolo",
+        unknownArtist: "Artista sconosciuto",
+        popularityLabel: (p) => `Pop ${p}`,
+        topTracksCount: (n) => `${n} top brani`,
+        songSingular: "brano",
+        songPlural: "brani",
+        playSingular: "riproduzione",
+        playPlural: "riproduzioni"
+      },
+      empty: {
+        noArtistsPeriod: "Nessun artista disponibile per questo periodo.",
+        noTracksPeriod: "Nessun brano disponibile per questo periodo.",
+        noAlbumsPeriod: "Nessun album da mostrare.",
+        noGenres: "Nessun tag di genere disponibile su Spotify.",
+        noArtistsFound: "Nessun artista principale trovato per questo periodo.",
+        noTrackedTimeYet: "Nessun tempo registrato. Riproduci un brano su Spotify per iniziare.",
+        noRecentPlaysYet: "I brani ascoltati \u2265 25s appariranno in questa cronologia."
+      },
+      actions: {
+        play: "Riproduci",
+        pause: "Pausa",
+        addToQueue: "Aggiungi in coda",
+        playingNowToast: (title) => `In riproduzione: ${title}`,
+        playbackErrorToast: "Impossibile avviare la riproduzione",
+        queuedToast: (title) => `Aggiunto in coda: ${title}`,
+        queueErrorToast: "Impossibile aggiungere in coda",
+        historyClearedToast: "Cronologia locale cancellata",
+        confirmClearHistory: "Confermare?",
+        copiedTrackToast: (title) => `Copiato: ${title}`,
+        copyErrorToast: "Impossibile copiare il brano",
+        noTrackPlayingToast: "Nessun brano in riproduzione"
+      },
+      search: {
+        placeholder: "Filtra per brano, artista o album...",
+        clear: "Cancella filtro",
+        noResults: "Nessun risultato trovato per il filtro."
+      },
+      streak: {
+        daysBadge: (n) => `${n}g di fila`,
+        last7Days: (h) => `7g: ${h}`
+      },
+      sleepTimer: {
+        label: "Timer spegnimento",
+        offToast: "Timer disattivato",
+        endOfTrackShort: "Fine",
+        endOfTrackToast: "Timer: pausa a fine brano",
+        minutesToast: (m) => `Timer: ${m} min`,
+        triggeredToast: "Timer scaduto \u2014 riproduzione in pausa",
+        tooltipIdle: "Timer spegnimento (Alt+Shift+S)",
+        tooltipActive: (detail) => `Timer: ${detail} (tasto destro per annullare)`
+      },
+      time: {
+        justNow: "Proprio ora",
+        secondsAgo: (s) => `${s}s fa`,
+        minutesAgo: (m) => `${m}m fa`,
+        hoursAgo: (h) => `${h}h fa`
+      },
+      errorBoundary: {
+        title: "Si \xE8 verificato un errore in Cronotofy",
+        fallbackMsg: "Errore imprevisto durante il rendering della vista.",
+        retry: "Riprova"
+      }
+    }
+  };
+  function detectSpotifyLocale() {
+    try {
+      const spicetifyLoc = typeof Spicetify !== "undefined" ? Spicetify.Locale?.getLocale?.() : "";
+      if (spicetifyLoc && typeof spicetifyLoc === "string") return spicetifyLoc;
+    } catch {
+    }
+    if (typeof document !== "undefined" && document.documentElement?.lang) {
+      return document.documentElement.lang;
+    }
+    if (typeof navigator !== "undefined" && navigator.language) {
+      return navigator.language;
+    }
+    return "en";
+  }
+  function resolveLangCode(rawLocale) {
+    const clean = (rawLocale || "").toLowerCase().trim();
+    if (clean.startsWith("es")) return "es";
+    if (clean.startsWith("pt")) return "pt";
+    if (clean.startsWith("fr")) return "fr";
+    if (clean.startsWith("de")) return "de";
+    if (clean.startsWith("it")) return "it";
+    return "en";
+  }
+  function getTranslations() {
+    const rawLocale = detectSpotifyLocale();
+    const lang = resolveLangCode(rawLocale);
+    return {
+      lang,
+      rawLocale,
+      t: TRANSLATIONS[lang]
+    };
+  }
+  function formatRelativeTimeLocalized(iso, t, rawLocale) {
+    if (!iso) return t.time.justNow;
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) return t.time.justNow;
+    const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1e3));
+    if (diffSec < 60) return t.time.secondsAgo(diffSec);
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return t.time.minutesAgo(diffMin);
+    const diffHrs = Math.floor(diffMin / 60);
+    if (diffHrs < 24) return t.time.hoursAgo(diffHrs);
+    return new Date(ts).toLocaleDateString(rawLocale || "en", {
+      day: "2-digit",
+      month: "short"
+    });
+  }
+
+  // spicetify-cronotofy/src/spotifyData.ts
+  var USER_TOP_CONTENT_HASH = "61b7353d3625780022dbc63d459eb64cd609e7e5e2a820f9160d65030efe2e15";
+  var ARTIST_DISCOGRAPHY_HASH = "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599";
+  var ARTIST_OVERVIEW_HASH = "eafb1620d783ece118e72fbfede2b0064483e029d3c1aafafa1c2de0e25a89e7";
+  var GQL_RANGE = {
+    short_term: "SHORT_TERM",
+    medium_term: "MID_TERM",
+    long_term: "LONG_TERM"
+  };
+  var artistOverviewCache = /* @__PURE__ */ new Map();
+  function idFromUri(uri) {
+    return String(uri || "").split(":").pop() || "";
+  }
+  function normalizeArtistKey(name) {
+    return (name || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+  function firstSourceUrl(sources) {
+    if (!Array.isArray(sources) || sources.length === 0) return "";
+    const best = sources[sources.length - 1] || sources[0];
+    return best?.url ? String(best.url) : sources[0]?.url ? String(sources[0].url) : "";
+  }
+  function buildDefinition(gql, opName, sha256Hash) {
+    const defs = gql?.Definitions || {};
+    if (defs[opName]) return defs[opName];
+    const sample = Object.values(defs).find((d) => d && typeof d === "object");
+    if (!sample) {
+      return { name: opName, operation: "query", sha256Hash, value: null };
+    }
+    const clone = Object.assign(Object.create(Object.getPrototypeOf(sample)), sample);
+    const sampleName = Object.keys(defs).find((k) => defs[k] === sample);
+    for (const key of Object.keys(clone)) {
+      const val = clone[key];
+      if (typeof val !== "string") continue;
+      if (/^[a-f0-9]{64}$/.test(val)) clone[key] = sha256Hash;
+      else if (val === sampleName) clone[key] = opName;
+    }
+    return clone;
+  }
+  async function requestDesktopGraphQL(opName, sha256Hash, variables) {
+    const gql = Spicetify?.GraphQL;
+    try {
+      const def = buildDefinition(gql, opName, sha256Hash);
+      if (def && typeof gql?.Request === "function") {
+        const res = await gql.Request(def, variables);
+        if (res?.data) return res.data;
+      }
+    } catch {
+    }
+    try {
+      const token = Spicetify?.Platform?.Session?.accessToken || Spicetify?.Platform?.AuthorizationAPI?.getState?.()?.token?.accessToken;
+      if (!token) return null;
+      const res = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operationName: opName,
+          variables,
+          extensions: { persistedQuery: { version: 1, sha256Hash } }
+        })
+      });
+      if (!res.ok) return null;
+      const json = await res.json();
+      return json?.data ?? null;
+    } catch {
+      return null;
+    }
+  }
+  function mapTopContentResponse(data) {
+    const profile = data?.me?.profile;
+    const tracks = (profile?.topTracks?.items || []).map((it) => it?.data).filter((t) => t?.__typename === "Track" && t.uri).map((t) => ({
+      id: idFromUri(t.uri),
+      uri: t.uri,
+      name: t.name,
+      duration_ms: Number(t.duration?.totalMilliseconds || 0),
+      popularity: 0,
+      artists: (t.artists?.items || []).map((a) => ({
+        id: idFromUri(a?.uri),
+        name: a?.profile?.name || ""
+      })),
+      album: {
+        id: idFromUri(t.albumOfTrack?.uri),
+        name: t.albumOfTrack?.name || "",
+        images: [{ url: firstSourceUrl(t.albumOfTrack?.coverArt?.sources) }]
+      }
+    }));
+    const artists = (profile?.topArtists?.items || []).map((it) => it?.data).filter((a) => a?.__typename === "Artist" && a.uri).map((a) => ({
+      id: idFromUri(a.uri),
+      uri: a.uri,
+      name: a.profile?.name || "",
+      images: [{ url: firstSourceUrl(a.visuals?.avatarImage?.sources) }],
+      genres: [],
+      popularity: 0,
+      followers: { total: 0 }
+    }));
+    return { tracks, artists };
+  }
+  async function fetchTopContentFromDesktop(range, limit = 50, allowShortTermFallback = true) {
+    const runRange = async (gqlRange) => {
+      const input = { offset: 0, limit, sortBy: "AFFINITY", timeRange: gqlRange };
+      const data = await requestDesktopGraphQL("userTopContent", USER_TOP_CONTENT_HASH, {
+        includeTopArtists: true,
+        topArtistsInput: input,
+        includeTopTracks: true,
+        topTracksInput: input
+      });
+      return mapTopContentResponse(data);
+    };
+    let result = await runRange(GQL_RANGE[range]);
+    if (allowShortTermFallback && result.tracks.length === 0 && result.artists.length === 0 && range !== "short_term") {
+      result = await runRange("SHORT_TERM");
+    }
+    return result;
+  }
+  async function fetchLibraryTracksFromDesktop(limit = 50) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi || typeof libApi.getTracks !== "function") return [];
+      const res = await libApi.getTracks({ offset: 0, limit });
+      const items = Array.isArray(res?.items) ? res.items : [];
+      return items.filter((tr) => tr && (tr.uri || tr.id)).map((tr) => {
+        const uri = String(tr.uri || `spotify:track:${tr.id}`);
+        const id = tr.id ? String(tr.id) : idFromUri(uri);
+        const imgUrl = tr.album?.images?.[0]?.url || firstSourceUrl(tr.album?.coverArt?.sources) || tr.images?.[0]?.url || "";
+        return {
+          id,
+          uri,
+          name: String(tr.name || ""),
+          duration_ms: Number(tr.duration?.milliseconds ?? tr.duration_ms ?? tr.duration ?? 0),
+          popularity: 0,
+          artists: Array.isArray(tr.artists) ? tr.artists.map((a) => ({
+            id: a?.id ? String(a.id) : idFromUri(a?.uri),
+            name: String(a?.name || "")
+          })) : [],
+          album: {
+            id: tr.album?.id ? String(tr.album.id) : idFromUri(tr.album?.uri),
+            name: String(tr.album?.name || ""),
+            images: imgUrl ? [{ url: String(imgUrl) }] : []
+          }
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchLibraryArtistsFromDesktop(limit = 100) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi) return [];
+      let items = [];
+      if (typeof libApi.getArtists === "function") {
+        const res = await libApi.getArtists({ offset: 0, limit });
+        items = Array.isArray(res?.items) ? res.items : [];
+      } else if (typeof libApi.getContents === "function") {
+        const res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
+        items = Array.isArray(res?.items) ? res.items : [];
+      }
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "artist" || uri.startsWith("spotify:artist:");
+      }).slice(0, limit).map((a) => {
+        const uri = String(a.uri || `spotify:artist:${a.id}`);
+        const id = a.id ? String(a.id) : idFromUri(uri);
+        const imgUrl = a.images?.[0]?.url || firstSourceUrl(a.visuals?.avatarImage?.sources) || "";
+        return {
+          id,
+          uri,
+          name: String(a.name),
+          images: imgUrl ? [{ url: String(imgUrl) }] : [],
+          genres: [],
+          popularity: 0,
+          followers: { total: 0 }
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchLibraryAlbumsFromDesktop(limit = 100) {
+    try {
+      const libApi = Spicetify?.Platform?.LibraryAPI;
+      if (!libApi || typeof libApi.getContents !== "function") return [];
+      let res = await libApi.getContents({ filters: ["0"], offset: 0, limit });
+      let items = Array.isArray(res?.items) ? res.items : [];
+      if (items.length === 0) {
+        res = await libApi.getContents({ offset: 0, limit: Math.max(limit, 200) });
+        items = Array.isArray(res?.items) ? res.items : [];
+      }
+      return items.filter((a) => {
+        if (!a || !a.name) return false;
+        const uri = String(a.uri || "");
+        return a.type === "album" || uri.startsWith("spotify:album:");
+      }).slice(0, limit).map((a) => {
+        const uri = String(a.uri || `spotify:album:${a.id}`);
+        const id = a.id ? String(a.id) : idFromUri(uri);
+        const imageUrl = String(
+          a.images?.[0]?.url || firstSourceUrl(a.coverArt?.sources) || ""
+        );
+        const artistName = Array.isArray(a.artists) ? a.artists.map((art) => art?.name).filter(Boolean).join(", ") : String(a.artist?.name || "");
+        return {
+          id,
+          uri,
+          name: String(a.name),
+          artistName,
+          imageUrl
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+  async function fetchArtistAvatarFromDesktop(artistId) {
+    if (!artistId || artistId.startsWith("local:")) return null;
+    if (artistOverviewCache.has(artistId)) {
+      return artistOverviewCache.get(artistId) ?? null;
+    }
+    try {
+      const data = await requestDesktopGraphQL("queryArtistOverview", ARTIST_OVERVIEW_HASH, {
+        uri: `spotify:artist:${artistId}`,
+        locale: ""
+      });
+      const union = data?.artistUnion;
+      const imageUrl = firstSourceUrl(union?.visuals?.avatarImage?.sources) || firstSourceUrl(union?.visuals?.headerImage?.sources) || "";
+      const monthlyListeners = Number(union?.stats?.monthlyListeners || 0);
+      const result = imageUrl || monthlyListeners > 0 ? { imageUrl, monthlyListeners } : null;
+      artistOverviewCache.set(artistId, result);
+      return result;
+    } catch {
+      artistOverviewCache.set(artistId, null);
+      return null;
+    }
+  }
+  function reconcileTopArtists(params) {
+    const {
+      rawTopArtists,
+      periodTracks,
+      likedTracks = [],
+      savedAlbums = [],
+      followedArtists = [],
+      trackedTracks = [],
+      minTargetCount = 15,
+      getGenresForName
+    } = params;
+    const byKey = /* @__PURE__ */ new Map();
+    const idToKey = /* @__PURE__ */ new Map();
+    const nameToKey = /* @__PURE__ */ new Map();
+    const ensureEvidence = (id, name) => {
+      const cleanName = (name || "").trim();
+      const norm = normalizeArtistKey(cleanName);
+      const cleanId = id && !id.startsWith("local:") ? id.trim() : void 0;
+      if (!cleanName && !cleanId) return null;
+      let key = (cleanId ? idToKey.get(cleanId) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      if (!key) {
+        key = cleanId || `name:${norm}`;
+        byKey.set(key, {
+          key,
+          id: cleanId,
+          name: cleanName || cleanId || "",
+          periodTrackCount: 0,
+          periodTrackScore: 0,
+          likedCount: 0,
+          savedAlbumCount: 0,
+          isFollowed: false,
+          trackedSeconds: 0,
+          fallbackImageUrl: ""
+        });
+      }
+      const ev = byKey.get(key);
+      if (cleanId && !ev.id) ev.id = cleanId;
+      if (cleanName && (!ev.name || ev.name === ev.id)) ev.name = cleanName;
+      if (cleanId) idToKey.set(cleanId, key);
+      if (norm) nameToKey.set(norm, key);
+      return ev;
+    };
+    const lookupEvidence = (id, name) => {
+      const norm = normalizeArtistKey(name);
+      const key = (id ? idToKey.get(id) : void 0) || (norm ? nameToKey.get(norm) : void 0);
+      return key ? byKey.get(key) : void 0;
+    };
+    periodTracks.forEach((tr, idx) => {
+      const baseWeight = Math.max(1, periodTracks.length - idx);
+      const artists = tr.artistNamesList && tr.artistNamesList.length > 0 ? tr.artistNamesList : tr.artistName.split(",").map((s, artIdx) => ({ id: artIdx === 0 ? tr.artistId : void 0, name: s.trim() })).filter((x) => Boolean(x.name));
+      artists.forEach((art, artIdx) => {
+        const ev = ensureEvidence(art.id, art.name);
+        if (!ev) return;
+        ev.periodTrackCount += 1;
+        ev.periodTrackScore += artIdx === 0 ? baseWeight : Math.max(1, Math.round(baseWeight * 0.45));
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) {
+          ev.fallbackImageUrl = tr.albumImageUrl;
+        }
+      });
+    });
+    for (const tr of likedTracks) {
+      const artists = Array.isArray(tr?.artists) ? tr.artists : [];
+      const img = String(tr?.album?.images?.[0]?.url || "");
+      for (const a of artists) {
+        if (!a?.name) continue;
+        const ev = ensureEvidence(a.id ? String(a.id) : void 0, String(a.name));
+        if (!ev) continue;
+        ev.likedCount += 1;
+        if (!ev.fallbackImageUrl && img) ev.fallbackImageUrl = img;
+      }
+    }
+    for (const alb of savedAlbums) {
+      if (!alb?.artistName) continue;
+      for (const part of alb.artistName.split(",")) {
+        const ev = ensureEvidence(void 0, part);
+        if (!ev) continue;
+        ev.savedAlbumCount += 1;
+        if (!ev.fallbackImageUrl && alb.imageUrl) ev.fallbackImageUrl = alb.imageUrl;
+      }
+    }
+    for (const fa of followedArtists) {
+      if (!fa?.name) continue;
+      const ev = ensureEvidence(fa.id ? String(fa.id) : void 0, String(fa.name));
+      if (!ev) continue;
+      ev.isFollowed = true;
+      const img = String(fa.images?.[0]?.url || "");
+      if (img) ev.fallbackImageUrl = img;
+    }
+    for (const tr of trackedTracks) {
+      if (!tr?.artistName || !(tr.totalSeconds > 0)) continue;
+      const parts = tr.artistName.split(",").map((s) => s.trim()).filter(Boolean);
+      parts.forEach((namePart, idx) => {
+        const ev = ensureEvidence(idx === 0 ? tr.artistId : void 0, namePart);
+        if (!ev) return;
+        ev.trackedSeconds += idx === 0 ? tr.totalSeconds : Math.round(tr.totalSeconds * 0.5);
+        if (!ev.fallbackImageUrl && tr.albumImageUrl) ev.fallbackImageUrl = tr.albumImageUrl;
+      });
+    }
+    const hasUserEvidence = periodTracks.length > 0 || likedTracks.length > 0 || savedAlbums.length > 0 || trackedTracks.length > 0;
+    const isVerified = (ev) => Boolean(
+      ev && (ev.periodTrackCount > 0 || ev.likedCount > 0 || ev.savedAlbumCount > 0 || ev.isFollowed || ev.trackedSeconds > 0)
+    );
+    const verifiedRaw = hasUserEvidence ? rawTopArtists.filter((raw) => isVerified(lookupEvidence(raw.id, raw.name))) : rawTopArtists;
+    const baseRaw = verifiedRaw.length > 0 ? verifiedRaw : rawTopArtists;
+    const combined = [];
+    const usedEvidenceKeys = /* @__PURE__ */ new Set();
+    baseRaw.forEach((raw, idx) => {
+      const ev = lookupEvidence(raw.id, raw.name);
+      if (ev) usedEvidenceKeys.add(ev.key);
+      const rankBoost = Math.max(24, 100 - idx * 3);
+      const evidenceBoost = ev ? ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120) : 0;
+      combined.push({
+        artist: raw,
+        ev,
+        rawScore: rankBoost * 3 + evidenceBoost
+      });
+    });
+    if (combined.length < minTargetCount) {
+      const candidates = Array.from(byKey.values()).filter(
+        (ev) => !usedEvidenceKeys.has(ev.key) && (ev.periodTrackCount > 0 || periodTracks.length === 0 && (ev.trackedSeconds >= 60 || ev.likedCount > 0))
+      ).sort((a, b) => {
+        const scoreA = a.periodTrackScore * 10 + Math.min(25, a.likedCount * 3) + Math.min(20, a.savedAlbumCount * 5) + Math.min(30, a.trackedSeconds / 90);
+        const scoreB = b.periodTrackScore * 10 + Math.min(25, b.likedCount * 3) + Math.min(20, b.savedAlbumCount * 5) + Math.min(30, b.trackedSeconds / 90);
+        return scoreB - scoreA;
+      });
+      for (const ev of candidates) {
+        if (combined.length >= minTargetCount) break;
+        usedEvidenceKeys.add(ev.key);
+        const id = ev.id || `local:${normalizeArtistKey(ev.name)}`;
+        const score = ev.periodTrackScore * 2 + Math.min(24, ev.likedCount * 3) + Math.min(20, ev.savedAlbumCount * 5) + Math.min(24, ev.trackedSeconds / 120);
+        combined.push({
+          artist: {
+            id,
+            uri: ev.id ? `spotify:artist:${ev.id}` : "",
+            name: ev.name,
+            imageUrl: ev.fallbackImageUrl,
+            genres: getGenresForName ? getGenresForName(ev.name) : [],
+            popularity: 0,
+            followers: 0
+          },
+          ev,
+          rawScore: score
+        });
+      }
+    }
+    const maxScore = combined.reduce((m, c) => Math.max(m, c.rawScore), 1);
+    return combined.map((entry, idx) => {
+      const fallbackScore = Math.max(24, Math.round(98 - idx * 3.2));
+      const scaled = maxScore > 0 ? Math.round(entry.rawScore / maxScore * 98) : fallbackScore;
+      const affinityScore = Math.min(99, Math.max(24, scaled));
+      return {
+        ...entry.artist,
+        affinityScore,
+        periodTrackCount: entry.ev?.periodTrackCount ?? 0,
+        trackedSeconds: entry.ev?.trackedSeconds ?? 0
+      };
+    });
+  }
+  async function fetchArtistDiscographyFromDesktop(artistId, limit = 12) {
+    if (!artistId) return [];
+    const data = await requestDesktopGraphQL("queryArtistDiscographyAll", ARTIST_DISCOGRAPHY_HASH, {
+      uri: `spotify:artist:${artistId}`,
+      offset: 0,
+      limit,
+      order: "DATE_DESC"
+    });
+    const groups = data?.artistUnion?.discography?.all?.items;
+    if (!Array.isArray(groups)) return [];
+    const out = [];
+    for (const group of groups) {
+      const releases = group?.releases?.items;
+      if (!Array.isArray(releases)) continue;
+      for (const rel of releases) {
+        const url = firstSourceUrl(rel?.coverArt?.sources);
+        if (!url) continue;
+        out.push({
+          id: String(rel.id || idFromUri(rel.uri) || rel.name || url),
+          name: String(rel.name || ""),
+          imageUrl: url,
+          releaseType: String(rel.type || "album").toLowerCase()
+        });
+      }
+    }
+    return out;
+  }
 
   // spicetify-cronotofy/src/styles.ts
   var STYLE_ID = "cronotofy-spicetify-styles";
@@ -2996,9 +2215,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   gap: 12px;
   padding: 6px 12px;
   border-radius: 9999px;
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.34);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow:
     0 14px 36px -10px rgba(0, 0, 0, 0.56),
@@ -3197,13 +2416,13 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   gap: 4px;
   padding: 4px;
   border-radius: 9999px;
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.19);
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow:
     0 10px 24px -8px rgba(0, 0, 0, 0.42),
     inset 0 1px 0 rgba(255, 255, 255, 0.26);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
 }
 
 .cronotofy-tabs::-webkit-scrollbar {
@@ -3250,9 +2469,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   padding: 8px 14px;
   border-radius: 9999px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.19);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   box-shadow:
     0 8px 20px -6px rgba(0, 0, 0, 0.40),
     inset 0 1px 0 rgba(255, 255, 255, 0.26);
@@ -3284,19 +2503,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   margin-bottom: 18px;
 }
 
-.cronotofy-preferences textarea {
-  display: block;
-  box-sizing: border-box;
-  width: 100%;
-  margin: 8px 0;
-  color: var(--spice-text, #fff);
-  background: var(--spice-main, #121212);
-}
-
-.cronotofy-preferences summary {
-  cursor: pointer;
-}
-
 .cronotofy-search-wrap {
   position: relative;
   display: inline-flex;
@@ -3319,9 +2525,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   padding: 0 32px 0 34px;
   border-radius: 9999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.34);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   color: #f8fafc;
   font-size: 12px;
   font-weight: 500;
@@ -3365,13 +2571,13 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
   gap: 4px;
   padding: 4px;
   border-radius: 14px;
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.26);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.19);
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow:
     0 8px 22px -6px rgba(0, 0, 0, 0.40),
     inset 0 1px 0 rgba(255, 255, 255, 0.26);
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.92);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
 }
 
 .cronotofy-kpi-head {
@@ -3412,12 +2618,12 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 .cronotofy-card {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) 100%);
+  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.16) 100%);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 20px;
   padding: 16px;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   box-shadow:
     0 12px 32px -10px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.26),
@@ -3692,12 +2898,12 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 .cronotofy-entity-card {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) 100%);
+  background: linear-gradient(155deg, rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.07) 0%, rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.16) 100%);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 20px;
   padding: 14px;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.92);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   box-shadow:
     0 12px 32px -10px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.26),
@@ -3979,6 +3185,444 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     document.head.appendChild(style);
   }
 
+  // spicetify-cronotofy/src/tracker.ts
+  var STORAGE_PREFIX = CRONOTOFY_MOD_CONFIG.tracking.storagePrefix;
+  var MAX_RECENT_PLAYS = CRONOTOFY_MOD_CONFIG.tracking.maxRecentPlays;
+  var MIN_PLAY_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.minPlaySeconds;
+  var SAVE_INTERVAL_SECONDS = CRONOTOFY_MOD_CONFIG.tracking.saveIntervalSeconds;
+  function normalizeSpotifyImage(url) {
+    if (!url || typeof url !== "string") return "";
+    const clean = url.trim();
+    if (!clean) return "";
+    if (clean.startsWith("spotify:image:")) {
+      const hash = clean.slice("spotify:image:".length);
+      return hash ? `https://i.scdn.co/image/${hash}` : "";
+    }
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+      return clean;
+    }
+    return "";
+  }
+  function formatSecondsHuman(totalSec) {
+    const sec = Math.max(0, Math.floor(totalSec || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor(sec % 3600 / 60);
+    const s = sec % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+  function getTodayKey() {
+    const d = /* @__PURE__ */ new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+  function computeListeningStreak(dailySeconds, todayKey = getTodayKey()) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(todayKey);
+    const baseDate = match ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : /* @__PURE__ */ new Date();
+    const baseYear = baseDate.getFullYear();
+    const baseMonth = baseDate.getMonth();
+    const baseDay = baseDate.getDate();
+    const keyAt = (offsetDays) => {
+      const d = new Date(baseYear, baseMonth, baseDay - offsetDays);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+    let last7DaysSeconds = 0;
+    for (let i = 0; i < 7; i++) {
+      const val = Number(dailySeconds[keyAt(i)] || 0);
+      if (Number.isFinite(val) && val > 0) {
+        last7DaysSeconds += Math.floor(val);
+      }
+    }
+    const todaySec = Number(dailySeconds[keyAt(0)] || 0);
+    let offset = Number.isFinite(todaySec) && todaySec > 0 ? 0 : 1;
+    let streakDays = 0;
+    for (let guard = 0; guard < 3650; guard++) {
+      const sec = Number(dailySeconds[keyAt(offset)] || 0);
+      if (!Number.isFinite(sec) || sec <= 0) break;
+      streakDays += 1;
+      offset += 1;
+    }
+    return { streakDays, last7DaysSeconds };
+  }
+  async function copyLiveTrackToClipboard(track) {
+    if (!track) return "empty";
+    const text = `${track.name} \u2014 ${track.artistName}
+${track.externalUrl}`;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return "copied";
+      }
+      if (typeof document !== "undefined" && document.body) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand?.("copy");
+        ta.remove();
+        return ok ? "copied" : "error";
+      }
+      return "error";
+    } catch {
+      return "error";
+    }
+  }
+  function extractLiveTrackFromPlayer() {
+    try {
+      const item = Spicetify?.Player?.data?.item || Spicetify?.Player?.data?.track;
+      if (!item || typeof item !== "object") return null;
+      const uri = String(item.uri || "");
+      if (!uri.startsWith("spotify:track:")) return null;
+      const id = uri.replace("spotify:track:", "");
+      if (!id) return null;
+      const { t } = getTranslations();
+      const metadata = item.metadata || {};
+      const name = item.name || metadata.title || t.entities.untitled;
+      let artistName = t.entities.unknownArtist;
+      let artistId;
+      if (Array.isArray(item.artists) && item.artists.length > 0) {
+        artistName = item.artists.map((a) => a?.name).filter(Boolean).join(", ") || artistName;
+        const firstArtistUri = String(item.artists[0]?.uri || "");
+        if (firstArtistUri.startsWith("spotify:artist:")) {
+          artistId = firstArtistUri.replace("spotify:artist:", "");
+        }
+      } else if (metadata.artist_name) {
+        artistName = String(metadata.artist_name);
+      }
+      const albumObj = item.album || {};
+      const albumName = albumObj.name || metadata.album_title || "";
+      const albumUri = albumObj.uri || metadata.album_uri || void 0;
+      let rawImageUrl = "";
+      if (Array.isArray(albumObj.images) && albumObj.images.length > 0) {
+        rawImageUrl = albumObj.images[0]?.url || "";
+      } else if (metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url) {
+        rawImageUrl = metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url;
+      }
+      const albumImageUrl = normalizeSpotifyImage(rawImageUrl);
+      const durationMs = Number(
+        item.duration?.milliseconds ?? item.duration_ms ?? Spicetify?.Player?.getDuration?.() ?? 0
+      );
+      const progressMs = Number(Spicetify?.Player?.getProgress?.() ?? 0);
+      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
+      return {
+        id,
+        uri,
+        name,
+        artistName,
+        artistId,
+        albumName,
+        albumUri,
+        albumImageUrl,
+        durationMs: Number.isFinite(durationMs) ? durationMs : 0,
+        progressMs: Number.isFinite(progressMs) ? progressMs : 0,
+        isPlaying,
+        externalUrl: `https://open.spotify.com/track/${id}`,
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+    } catch {
+      return null;
+    }
+  }
+  var cachedUser = null;
+  var resolvingUserPromise = null;
+  async function resolveCurrentSpotifyUser(forceRefresh = false) {
+    if (cachedUser && !forceRefresh) return cachedUser;
+    if (resolvingUserPromise && !forceRefresh) return resolvingUserPromise;
+    resolvingUserPromise = (async () => {
+      try {
+        const apiUser = await Spicetify?.Platform?.UserAPI?.getUser?.();
+        if (apiUser) {
+          const rawUri = String(apiUser.uri || "");
+          const id = String(
+            apiUser.username || (rawUri.startsWith("spotify:user:") ? rawUri.replace("spotify:user:", "") : "")
+          ).trim();
+          if (id) {
+            const avatarUrl = normalizeSpotifyImage(apiUser.images?.[0]?.url || apiUser.avatar);
+            const user = {
+              id,
+              displayName: String(apiUser.displayName || apiUser.name || id),
+              avatarUrl: avatarUrl || void 0,
+              profileUrl: `https://open.spotify.com/user/${encodeURIComponent(id)}`
+            };
+            cachedUser = user;
+            return user;
+          }
+        }
+      } catch {
+      }
+      try {
+        if (Spicetify?.CosmosAsync?.get) {
+          const me = await Spicetify.CosmosAsync.get("https://api.spotify.com/v1/me");
+          if (me && me.id) {
+            const avatarUrl = normalizeSpotifyImage(me.images?.[0]?.url);
+            const user = {
+              id: String(me.id),
+              displayName: String(me.display_name || me.id),
+              email: me.email ? String(me.email) : void 0,
+              country: me.country ? String(me.country) : void 0,
+              avatarUrl: avatarUrl || void 0,
+              profileUrl: me.external_urls?.spotify || `https://open.spotify.com/user/${encodeURIComponent(me.id)}`
+            };
+            cachedUser = user;
+            return user;
+          }
+        }
+      } catch {
+      }
+      return cachedUser;
+    })();
+    try {
+      return await resolvingUserPromise;
+    } finally {
+      resolvingUserPromise = null;
+    }
+  }
+  function createEmptyStore(userId) {
+    return {
+      version: 1,
+      userId,
+      totalSeconds: 0,
+      dailySeconds: {},
+      tracks: {},
+      recentPlays: []
+    };
+  }
+  function storageKeyFor(userId) {
+    return userId ? `${STORAGE_PREFIX}_${userId}` : STORAGE_PREFIX;
+  }
+  function loadStore(userId) {
+    try {
+      const key = storageKeyFor(userId);
+      const raw = localStorage.getItem(key) || (userId ? localStorage.getItem(STORAGE_PREFIX) : null);
+      if (!raw) return createEmptyStore(userId);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.version === 1) {
+        return {
+          version: 1,
+          userId: userId || String(parsed.userId || ""),
+          totalSeconds: Number(parsed.totalSeconds) || 0,
+          dailySeconds: parsed.dailySeconds && typeof parsed.dailySeconds === "object" ? parsed.dailySeconds : {},
+          tracks: parsed.tracks && typeof parsed.tracks === "object" ? parsed.tracks : {},
+          recentPlays: Array.isArray(parsed.recentPlays) ? parsed.recentPlays.slice(0, MAX_RECENT_PLAYS) : [],
+          lastSyncedAt: parsed.lastSyncedAt
+        };
+      }
+    } catch {
+    }
+    return createEmptyStore(userId);
+  }
+  function saveStore(store) {
+    try {
+      store.lastSyncedAt = (/* @__PURE__ */ new Date()).toISOString();
+      localStorage.setItem(storageKeyFor(store.userId), JSON.stringify(store));
+    } catch {
+    }
+  }
+  var ListeningTracker = class {
+    constructor() {
+      this.userId = "";
+      this.store = createEmptyStore("");
+      this.currentTrack = null;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      this.lastProgressMs = 0;
+      this.tickCounter = 0;
+      this.tickTimer = null;
+      this.listeners = /* @__PURE__ */ new Set();
+      this.initialized = false;
+      this.handleBeforeUnload = () => {
+        saveStore(this.store);
+      };
+    }
+    async init() {
+      if (this.initialized) return;
+      this.initialized = true;
+      const user = await resolveCurrentSpotifyUser();
+      this.userId = user?.id || "";
+      this.store = loadStore(this.userId);
+      this.currentTrack = extractLiveTrackFromPlayer();
+      this.lastProgressMs = this.currentTrack?.progressMs ?? 0;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      if (typeof window !== "undefined") {
+        window.addEventListener("beforeunload", this.handleBeforeUnload);
+      }
+      this.tickTimer = setInterval(() => this.onSecondTick(), 1e3);
+      this.notify();
+    }
+    notify() {
+      for (const fn of this.listeners) {
+        try {
+          fn();
+        } catch {
+        }
+      }
+    }
+    subscribe(fn) {
+      this.listeners.add(fn);
+      return () => {
+        this.listeners.delete(fn);
+      };
+    }
+    finalizeCurrentTrackSession(nextTrack) {
+      if (this.currentTrack && this.currentSessionSeconds >= MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
+        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
+      }
+      this.currentTrack = nextTrack;
+      this.lastProgressMs = nextTrack?.progressMs ?? 0;
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+    }
+    recordPlay(track, listenedSeconds) {
+      const existing = this.store.tracks[track.id];
+      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (existing) {
+        existing.playCount += 1;
+        existing.lastPlayedAt = nowIso;
+      } else {
+        this.store.tracks[track.id] = {
+          id: track.id,
+          uri: track.uri,
+          name: track.name,
+          artistName: track.artistName,
+          artistId: track.artistId,
+          albumName: track.albumName,
+          albumUri: track.albumUri,
+          albumImageUrl: track.albumImageUrl,
+          durationMs: track.durationMs,
+          totalSeconds: listenedSeconds,
+          playCount: 1,
+          lastPlayedAt: nowIso
+        };
+      }
+      const playEvent = {
+        id: track.id,
+        uri: track.uri,
+        name: track.name,
+        artistName: track.artistName,
+        albumName: track.albumName,
+        albumImageUrl: track.albumImageUrl,
+        listenedSeconds,
+        playedAt: nowIso
+      };
+      this.store.recentPlays = [playEvent, ...this.store.recentPlays].slice(0, MAX_RECENT_PLAYS);
+      this.currentPlayRecorded = true;
+    }
+    onSecondTick() {
+      const live = extractLiveTrackFromPlayer();
+      if (live && this.currentTrack && live.id !== this.currentTrack.id) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live && this.currentTrack && live.id === this.currentTrack.id && this.currentPlayRecorded && this.lastProgressMs > 15e3 && live.progressMs < 5e3) {
+        this.finalizeCurrentTrackSession(live);
+      } else if (live) {
+        this.currentTrack = live;
+      }
+      if (live) {
+        this.lastProgressMs = live.progressMs;
+      }
+      const isPlaying = Boolean(Spicetify?.Player?.isPlaying?.());
+      if (!isPlaying || !this.currentTrack) {
+        return;
+      }
+      const today = getTodayKey();
+      this.store.totalSeconds += 1;
+      this.store.dailySeconds[today] = (this.store.dailySeconds[today] || 0) + 1;
+      this.currentSessionSeconds += 1;
+      const existing = this.store.tracks[this.currentTrack.id];
+      const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+      if (existing) {
+        existing.totalSeconds += 1;
+        existing.lastPlayedAt = nowIso;
+        if (this.currentTrack.albumImageUrl && !existing.albumImageUrl) {
+          existing.albumImageUrl = this.currentTrack.albumImageUrl;
+        }
+      } else {
+        this.store.tracks[this.currentTrack.id] = {
+          id: this.currentTrack.id,
+          uri: this.currentTrack.uri,
+          name: this.currentTrack.name,
+          artistName: this.currentTrack.artistName,
+          artistId: this.currentTrack.artistId,
+          albumName: this.currentTrack.albumName,
+          albumUri: this.currentTrack.albumUri,
+          albumImageUrl: this.currentTrack.albumImageUrl,
+          durationMs: this.currentTrack.durationMs,
+          totalSeconds: 1,
+          playCount: 0,
+          lastPlayedAt: nowIso
+        };
+      }
+      if (this.currentSessionSeconds === MIN_PLAY_SECONDS && !this.currentPlayRecorded) {
+        this.recordPlay(this.currentTrack, this.currentSessionSeconds);
+      } else if (this.currentPlayRecorded && this.store.recentPlays[0]?.id === this.currentTrack.id) {
+        this.store.recentPlays[0].listenedSeconds = this.currentSessionSeconds;
+      }
+      this.tickCounter += 1;
+      if (this.tickCounter >= SAVE_INTERVAL_SECONDS) {
+        this.tickCounter = 0;
+        saveStore(this.store);
+      }
+      this.notify();
+    }
+    onSongChange() {
+      const next = extractLiveTrackFromPlayer();
+      this.finalizeCurrentTrackSession(next);
+      saveStore(this.store);
+      this.notify();
+    }
+    onPlayPause() {
+      const live = extractLiveTrackFromPlayer();
+      if (live) {
+        this.currentTrack = live;
+        this.lastProgressMs = live.progressMs;
+      }
+      saveStore(this.store);
+      this.notify();
+    }
+    async syncNow() {
+      saveStore(this.store);
+      this.notify();
+      return true;
+    }
+    getLiveTrack() {
+      return extractLiveTrackFromPlayer();
+    }
+    getSnapshot() {
+      const today = getTodayKey();
+      const tracks = Object.values(this.store.tracks).sort((a, b) => b.totalSeconds - a.totalSeconds);
+      const { streakDays, last7DaysSeconds } = computeListeningStreak(this.store.dailySeconds, today);
+      return {
+        userId: this.userId,
+        totalSeconds: this.store.totalSeconds,
+        todaySeconds: this.store.dailySeconds[today] || 0,
+        todayDate: today,
+        currentTrackSeconds: this.currentSessionSeconds,
+        streakDays,
+        last7DaysSeconds,
+        tracks,
+        recentPlays: this.store.recentPlays,
+        lastSyncedAt: this.store.lastSyncedAt
+      };
+    }
+    clearLocalHistory() {
+      this.store = createEmptyStore(this.userId);
+      this.currentSessionSeconds = 0;
+      this.currentPlayRecorded = false;
+      this.lastProgressMs = 0;
+      saveStore(this.store);
+      this.notify();
+    }
+  };
+
   // spicetify-cronotofy/src/app.tsx
   var FALLBACK_ARTIST_GENRES = {
     "rauw alejandro": ["reggaeton", "synth-pop", "urbano latino"],
@@ -4135,74 +3779,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     ensureCronotofyStyles();
     ensureDynamicThemeStyle();
     const { useState, useEffect, useMemo, useCallback, useRef } = Spicetify.React;
-    const [language, setLanguage] = useState(readLanguagePreference);
-    const { t, rawLocale, lang } = useMemo(() => getTranslations(language), [language]);
-    const [, languageLabel, automaticLabel] = LANGUAGE_OPTIONS[lang];
-    const [preset, setPreset] = useState(readVisualPreset);
-    const [sharedSettings, setSharedSettings] = useState("");
-    const [settingsError, setSettingsError] = useState(false);
-    const onboardingKey = "cronotofy_intro_dismissed";
-    const [showIntro, setShowIntro] = useState(() => !readStoredPreference(onboardingKey));
-    const [preferencesLabel, presetLabel, animatedLabel, stillLabel, focusLabel, copyLabel, applyLabel, invalidLabel, intro, dismissLabel] = PREFERENCE_LABELS[lang];
-    const el = Spicetify.React.createElement;
-    const applyPreset = (next) => {
-      saveStoredPreference(VISUAL_PRESET_KEY, next);
-      window.__CRONOTOFY_MOD__?.setVisualPreset?.(next);
-      setPreset(next);
-    };
-    const applyLanguage = (next) => {
-      saveStoredPreference(LANGUAGE_STORAGE_KEY, next);
-      setLanguage(next);
-    };
-    const languageControl = Spicetify.React.createElement("select", {
-      "aria-label": languageLabel,
-      title: languageLabel,
-      className: "cronotofy-tab",
-      value: language,
-      onChange: (event) => applyLanguage(event.currentTarget.value)
-    }, Spicetify.React.createElement("option", { value: "" }, automaticLabel),
-    ...Object.entries(LANGUAGE_OPTIONS).map(([code, [name]]) =>
-      Spicetify.React.createElement("option", { key: code, value: code, lang: code }, name)
-    ));
-    const preferences = el("details", { className: "cronotofy-preferences" },
-      el("summary", null, preferencesLabel),
-      el("label", null, presetLabel, el("select", {
-        className: "cronotofy-tab",
-        value: preset,
-        onChange: (event) => applyPreset(event.currentTarget.value)
-      }, ...[animatedLabel, stillLabel, focusLabel].map((label, index) =>
-        el("option", { key: VISUAL_PRESETS[index], value: VISUAL_PRESETS[index] }, label)
-      ))),
-      el("textarea", {
-        "aria-label": preferencesLabel, rows: 2, maxLength: 1024, value: sharedSettings,
-        onChange: (event) => {
-          setSettingsError(false);
-          setSharedSettings(event.currentTarget.value);
-        }
-      }),
-      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
-        const settings = JSON.stringify({ version: 1, language, preset });
-        setSharedSettings(settings);
-        setSettingsError(false);
-        void navigator.clipboard?.writeText(settings).catch(() => {});
-      } }, copyLabel),
-      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
-        const settings = parseSharedPreferences(sharedSettings);
-        setSettingsError(!settings);
-        if (settings) {
-          applyLanguage(settings.language);
-          applyPreset(settings.preset);
-        }
-      } }, applyLabel),
-      settingsError && el("p", { role: "alert" }, invalidLabel)
-    );
-    const onboarding = showIntro && el("div", { className: "cronotofy-controls-row" },
-      el("span", null, intro),
-      el("button", { type: "button", className: "cronotofy-tab", onClick: () => {
-        saveStoredPreference(onboardingKey, "1");
-        setShowIntro(false);
-      } }, dismissLabel)
-    );
+    const { t, rawLocale } = useMemo(() => getTranslations(), []);
     const [activeTab, setActiveTab] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTab);
     const [timeRange, setTimeRange] = useState(CRONOTOFY_MOD_CONFIG.ui.defaultTimeRange);
     const [searchQuery, setSearchQuery] = useState("");
@@ -4321,7 +3898,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       };
       syncBridgeState();
       const unsub = window.__CRONOTOFY_MOD__?.subscribe(syncBridgeState);
-      const fallbackTimer = typeof unsub === "function" ? null : setInterval(syncBridgeState, 2e3);
+      const fallbackTimer = setInterval(syncBridgeState, 2e3);
       return () => {
         if (unsub) unsub();
         clearInterval(fallbackTimer);
@@ -4478,56 +4055,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
               );
             }
           });
-        }
-        if (CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall && document.documentElement.dataset.cronotofyPreset !== "focus") {
-          const seedCovers = [];
-          for (const tr of mappedTracks) {
-            if (tr.albumImageUrl) {
-              seedCovers.push({
-                id: tr.albumId || tr.id,
-                title: tr.albumName || tr.name,
-                artistName: tr.artistName,
-                imageUrl: tr.albumImageUrl
-              });
-            }
-          }
-          for (const alb of libAlbums) {
-            if (alb.imageUrl) {
-              seedCovers.push({
-                id: alb.id,
-                title: alb.name,
-                artistName: alb.artistName,
-                imageUrl: alb.imageUrl
-              });
-            }
-          }
-          for (const tr of libTracks) {
-            const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
-            if (img) {
-              seedCovers.push({
-                id: String(tr.album?.id || tr.id || img),
-                title: String(tr.album?.name || tr.name || ""),
-                artistName: String(tr.artists?.[0]?.name || ""),
-                imageUrl: img
-              });
-            }
-          }
-          if (seedCovers.length > 0) {
-            window.__CRONOTOFY_MOD__?.updateWallCovers?.(seedCovers);
-          }
-          const artistCandidates = mappedArtists.slice(0, 16).map((a) => ({
-            id: a.id.startsWith("local:") ? void 0 : a.id,
-            name: a.name
-          }));
-          const enrichedWall = await collectFavoriteArtistCovers({
-            userId: bridgeUser?.id || "default",
-            artistCandidates,
-            seedTrackCovers: seedCovers
-          });
-          if (seq !== loadSeqRef.current) return;
-          if (enrichedWall.length > 0) {
-            window.__CRONOTOFY_MOD__?.updateWallCovers?.(enrichedWall);
-          }
         }
       } finally {
         if (seq === loadSeqRef.current) {
@@ -4742,7 +4269,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         }
       },
       tab.label
-    )))), onboarding, /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-row" }, languageControl, preferences, activeTab !== "overview" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-search-wrap" }, /* @__PURE__ */ Spicetify.React.createElement(
+    )))), /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-controls-row" }, activeTab !== "overview" && /* @__PURE__ */ Spicetify.React.createElement("div", { className: "cronotofy-search-wrap" }, /* @__PURE__ */ Spicetify.React.createElement(
       "svg",
       {
         className: "cronotofy-search-icon",
@@ -5088,12 +4615,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     if (mode === "60m") return 60 * 60;
     return 0;
   }
-  function formatRemainingBadge(remainingSeconds) {
-    const sec = Math.max(0, Math.floor(remainingSeconds || 0));
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  }
   var SleepTimerController = class {
     constructor(onExpire) {
       this.mode = "off";
@@ -5170,14 +4691,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
   // spicetify-cronotofy/src/chromeWidgets.ts
   var NAV_BTN_ID = "cronotofy-nav-btn";
-  function findCronotofyMainView() {
-    return document.querySelector(".Root__main-view") ||
-      document.querySelector('#main-view, [data-testid="main-view"], main[role="main"]') ||
-      document.querySelector("main");
-  }
   var NPB_TELEMETRY_ID = "cronotofy-npb-telemetry";
   var VOLUME_PCT_ID = "cronotofy-volume-pct";
-  var SLEEP_BTN_ID = "cronotofy-sleep-btn";
   function isCronotofyRoute(pathname) {
     const path = pathname ?? (typeof Spicetify !== "undefined" ? Spicetify?.Platform?.History?.location?.pathname : "") ?? (typeof window !== "undefined" ? window.location.pathname : "");
     return typeof path === "string" && path.startsWith("/cronotofy");
@@ -5197,13 +4712,9 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       this.sessionPill = null;
       this.todayPill = null;
       this.volumePctEl = null;
-      this.sleepBtn = null;
-      this.sleepLabelEl = null;
       this.lastSessionText = "";
       this.lastTodayText = "";
       this.lastVolumeText = "";
-      this.lastSleepLabel = "";
-      this.lastSleepActive = false;
       this.boundVolumeBars = /* @__PURE__ */ new WeakSet();
       this.boundScrollViewports = /* @__PURE__ */ new WeakSet();
       this.bannerScrollRaf = false;
@@ -5255,14 +4766,10 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       this.ensureMounted();
       this.updateTelemetry();
       this.updateVolumePct();
-      this.updateSleepButton();
       this.syncActiveRoute();
       this.tracker.subscribe(() => {
         this.updateTelemetry();
         this.updateVolumePct();
-      });
-      this.sleepTimer.subscribe(() => {
-        this.updateSleepButton();
       });
       const unsub = Spicetify?.Platform?.History?.listen?.((loc) => {
         this.syncActiveRoute(loc?.pathname);
@@ -5276,17 +4783,14 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
         window.addEventListener("keydown", this.handleShortcut);
       }
       if (document.body && typeof MutationObserver !== "undefined") {
-        this.observer = new MutationObserver((records) => {
-          if (records.every((record) => record.target.closest?.(
-            "#cronotofy-npb-telemetry, #cronotofy-ext-host, #cronotofy-global-wall, #cronotofy-lyrics-vinyl"
-          ))) return;
+        this.observer = new MutationObserver(() => {
           if (this.rafPending) return;
           this.rafPending = true;
-          setTimeout(() => {
+          requestAnimationFrame(() => {
             this.rafPending = false;
             this.ensureMounted();
             this.syncActiveRoute();
-          }, 150);
+          });
         });
         this.observer.observe(document.body, { childList: true, subtree: true });
       }
@@ -5301,52 +4805,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       } else {
         const mins = Math.round(modeDurationSeconds(next) / 60);
         Spicetify?.showNotification?.(t.sleepTimer.minutesToast(mins));
-      }
-    }
-    getOrCreateSleepButton() {
-      if (this.sleepBtn) return this.sleepBtn;
-      const btn = document.createElement("button");
-      btn.id = SLEEP_BTN_ID;
-      btn.type = "button";
-      btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>`;
-      const label = document.createElement("span");
-      label.className = "cronotofy-sleep-label";
-      btn.appendChild(label);
-      btn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.cycleSleepTimerWithToast();
-      });
-      btn.addEventListener("contextmenu", (e) => {
-        if (!this.sleepTimer.getState().active) return;
-        e.preventDefault();
-        e.stopPropagation();
-        this.sleepTimer.cancel();
-        Spicetify?.showNotification?.(getTranslations().t.sleepTimer.offToast);
-      });
-      this.sleepBtn = btn;
-      this.sleepLabelEl = label;
-      return btn;
-    }
-    updateSleepButton() {
-      const btn = this.getOrCreateSleepButton();
-      const state = this.sleepTimer.getState();
-      const { t } = getTranslations();
-      const label = state.mode === "off" ? "" : state.mode === "end-of-track" ? t.sleepTimer.endOfTrackShort : formatRemainingBadge(state.remainingSeconds);
-      if (this.lastSleepActive !== state.active) {
-        this.lastSleepActive = state.active;
-        btn.classList.toggle("active", state.active);
-      }
-      if (this.sleepLabelEl && this.lastSleepLabel !== label) {
-        this.lastSleepLabel = label;
-        this.sleepLabelEl.textContent = label;
-      }
-      const tooltip = state.active ? t.sleepTimer.tooltipActive(
-        state.mode === "end-of-track" ? t.sleepTimer.endOfTrackToast : formatRemainingBadge(state.remainingSeconds)
-      ) : t.sleepTimer.tooltipIdle;
-      if (btn.title !== tooltip) {
-        btn.title = tooltip;
-        btn.setAttribute("aria-label", tooltip);
       }
     }
     getOrCreateNavButton() {
@@ -5434,8 +4892,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
       }
     }
     ensureMounted() {
-      const searchContainer = document.querySelector(".main-globalNav-searchContainer") ||
-        document.querySelector('#global-nav-bar, [data-testid="global-nav-bar"], .Root__globalNav');
+      const searchContainer = document.querySelector(".main-globalNav-searchContainer");
       if (searchContainer) {
         const btn = this.getOrCreateNavButton();
         const orphan = document.getElementById(NAV_BTN_ID);
@@ -5444,8 +4901,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           searchContainer.appendChild(btn);
         }
       }
-      const leftBar = document.querySelector(".main-nowPlayingBar-left") ||
-        document.querySelector('[data-testid="now-playing-widget"]')?.parentElement;
+      const leftBar = document.querySelector(".main-nowPlayingBar-left");
       if (leftBar) {
         const telemetry = this.getOrCreateTelemetry();
         const orphan = document.getElementById(NPB_TELEMETRY_ID);
@@ -5454,21 +4910,8 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
           leftBar.appendChild(telemetry);
         }
       }
+      document.getElementById("cronotofy-sleep-btn")?.remove();
       const volumeBar = document.querySelector('[data-testid="volume-bar"]');
-      const extraControls = document.querySelector(".main-nowPlayingBar-extraControls") || volumeBar?.parentElement;
-      if (extraControls) {
-        const sleepBtn = this.getOrCreateSleepButton();
-        const orphanSleep = document.getElementById(SLEEP_BTN_ID);
-        if (orphanSleep && orphanSleep !== sleepBtn) orphanSleep.remove();
-        if (volumeBar && volumeBar.parentElement === extraControls) {
-          if (sleepBtn.parentElement !== extraControls || sleepBtn.nextElementSibling !== volumeBar) {
-            extraControls.insertBefore(sleepBtn, volumeBar);
-          }
-        } else if (sleepBtn.parentElement !== extraControls || extraControls.lastElementChild !== sleepBtn) {
-          extraControls.appendChild(sleepBtn);
-        }
-        this.updateSleepButton();
-      }
       if (volumeBar) {
         const volEl = this.getOrCreateVolumePct();
         const orphan = document.getElementById(VOLUME_PCT_ID);
@@ -5525,7 +4968,7 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     updateTelemetry() {
       this.getOrCreateTelemetry();
       const { t } = getTranslations();
-      const snapshot = this.tracker.getCounters();
+      const snapshot = this.tracker.getSnapshot();
       const sessionText = `${t.currentSession}: ${formatSecondsHuman(snapshot.currentTrackSeconds)}`;
       const todayText = `${t.today}: ${formatSecondsHuman(snapshot.todaySeconds)}`;
       if (this.sessionPill && this.lastSessionText !== sessionText) {
@@ -5561,32 +5004,191 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     }
   };
 
+  // spicetify-cronotofy/src/albumWall.ts
+  function normalizeImageKey(url) {
+    const clean = (url || "").trim().split("?")[0];
+    const scdnMatch = clean.match(/i\.scdn\.co\/image\/([a-zA-Z0-9]+)/);
+    if (scdnMatch) return scdnMatch[1];
+    return clean;
+  }
+  function normalizeAlbumTitleKey(title, artistName) {
+    let cleanTitle = (title || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (!cleanTitle) return "";
+    cleanTitle = cleanTitle.replace(
+      /\s*[\(\[]\s*(?:instrumental|deluxe|super deluxe|explicit|clean|bonus|expanded|remaster(?:ed)?|remix(?:es)?|live|acoustic|acustico|version|edition|edicion|from\s+[^)\]]*|anniversary|mono|stereo)[^)\]]*[\)\]]/gi,
+      ""
+    ).replace(/\s*-\s*(?:single|ep|deluxe|instrumental|explicit|clean|remastered).*$/i, "").replace(/[^a-z0-9]+/g, " ").trim();
+    if (!cleanTitle) return "";
+    const primaryArtist = (artistName || "").split(",")[0].toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+    return primaryArtist ? `${cleanTitle}::${primaryArtist}` : cleanTitle;
+  }
+  function deduplicateWallCovers(covers) {
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
+    const unique = [];
+    for (const cover of covers) {
+      if (!cover) continue;
+      const url = normalizeSpotifyImage(cover.imageUrl);
+      if (!url) continue;
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) continue;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) continue;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
+      unique.push({ ...cover, imageUrl: url });
+    }
+    return unique;
+  }
+  function deterministicShuffle(items, seedStr) {
+    const arr = [...items];
+    let s = seedStr.split("").reduce((acc, ch) => acc + ch.charCodeAt(0), 9876);
+    const rand = () => {
+      s = (s * 9301 + 49297) % 233280;
+      return s / 233280;
+    };
+    let m = arr.length;
+    while (m > 0) {
+      const i = Math.floor(rand() * m--);
+      const tmp = arr[m];
+      arr[m] = arr[i];
+      arr[i] = tmp;
+    }
+    return arr;
+  }
+  function readWallCache(userId) {
+    try {
+      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.savedAt === "number" && Array.isArray(parsed.covers) && Date.now() - parsed.savedAt < CRONOTOFY_MOD_CONFIG.albumWall.cacheTtlMs && parsed.covers.length > 0) {
+        return parsed.covers;
+      }
+    } catch {
+    }
+    return null;
+  }
+  function writeWallCache(userId, covers) {
+    try {
+      const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${userId || "default"}`;
+      const payload = { savedAt: Date.now(), covers };
+      localStorage.setItem(key, JSON.stringify(payload));
+    } catch {
+    }
+  }
+  async function collectFavoriteArtistCovers(params) {
+    const { userId, artistCandidates, seedTrackCovers } = params;
+    const collected = [];
+    const seenImages = /* @__PURE__ */ new Set();
+    const seenTitles = /* @__PURE__ */ new Set();
+    const addCover = (cover) => {
+      const url = normalizeSpotifyImage(cover.imageUrl);
+      if (!url) return;
+      const imgKey = normalizeImageKey(url);
+      if (!imgKey || seenImages.has(imgKey)) return;
+      const titleKey = normalizeAlbumTitleKey(cover.title, cover.artistName);
+      if (titleKey && seenTitles.has(titleKey)) return;
+      seenImages.add(imgKey);
+      if (titleKey) seenTitles.add(titleKey);
+      collected.push({ ...cover, imageUrl: url });
+    };
+    for (const c of seedTrackCovers) {
+      addCover(c);
+    }
+    const cached = readWallCache(userId);
+    if (cached) {
+      for (const c of cached) {
+        addCover(c);
+      }
+      if (collected.length >= 130) {
+        return collected;
+      }
+    }
+    const artistsWithId = [];
+    const seenArtistIds = /* @__PURE__ */ new Set();
+    for (const a of artistCandidates) {
+      if (a.id && !a.id.startsWith("local:") && !seenArtistIds.has(a.id)) {
+        seenArtistIds.add(a.id);
+        artistsWithId.push({ id: a.id, name: a.name });
+        if (artistsWithId.length >= CRONOTOFY_MOD_CONFIG.albumWall.maxArtistsToFetch) break;
+      }
+    }
+    const maxPerArtist = CRONOTOFY_MOD_CONFIG.albumWall.maxCoversPerArtist;
+    const batchSize = 4;
+    for (let i = 0; i < artistsWithId.length; i += batchSize) {
+      const batch = artistsWithId.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (artist) => {
+          try {
+            const gqlAlbums = await fetchArtistDiscographyFromDesktop(artist.id, maxPerArtist);
+            for (const alb of gqlAlbums) {
+              addCover({
+                id: alb.id,
+                title: alb.name,
+                artistName: artist.name,
+                imageUrl: alb.imageUrl,
+                releaseType: alb.releaseType
+              });
+            }
+          } catch {
+          }
+        })
+      );
+    }
+    if (collected.length > 0) {
+      writeWallCache(userId, collected);
+    }
+    return collected;
+  }
+  function buildAlbumWallLanes(covers, seedKey, laneCount, minPerLane) {
+    const unique = deduplicateWallCovers(covers);
+    if (unique.length === 0 || laneCount <= 0) return [];
+    const shuffled = deterministicShuffle(unique, seedKey || "cronotofy");
+    const lanes = Array.from({ length: laneCount }, () => []);
+    shuffled.forEach((cover, idx) => {
+      lanes[idx % laneCount].push(cover);
+    });
+    if (minPerLane <= 0) return lanes;
+    const target = Math.min(minPerLane, shuffled.length);
+    return lanes.map((lane, lIdx) => {
+      if (lane.length >= target) return lane;
+      const filled = [...lane];
+      const usedInLane = new Set(filled.map((c) => normalizeImageKey(c.imageUrl)));
+      const nearby = /* @__PURE__ */ new Set();
+      for (const offset of [-2, -1, 1, 2]) {
+        const neighbor = lanes[lIdx + offset];
+        if (!neighbor) continue;
+        for (const c of neighbor) nearby.add(normalizeImageKey(c.imageUrl));
+      }
+      const startOffset = (lIdx * 7 + Math.floor(shuffled.length / 2)) % shuffled.length;
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        if (nearby.has(key) && shuffled.length > filled.length + nearby.size) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
+      }
+      for (let step = 0; step < shuffled.length && filled.length < target; step++) {
+        const candidate = shuffled[(startOffset + step) % shuffled.length];
+        const key = normalizeImageKey(candidate.imageUrl);
+        if (usedInLane.has(key)) continue;
+        usedInLane.add(key);
+        filled.push(candidate);
+      }
+      return filled;
+    });
+  }
+
   // spicetify-cronotofy/src/globalWall.ts
   var GLOBAL_WALL_STYLE_ID = "cronotofy-global-wall-style";
   var GLOBAL_WALL_ROOT_ID = "cronotofy-global-wall";
   var GLOBAL_WALL_CSS = `
-:root[data-cronotofy-preset="focus"] body *,
-:root[data-cronotofy-preset="focus"] body *::before,
-:root[data-cronotofy-preset="focus"] body *::after {
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
-}
-:root[data-cronotofy-preset="focus"] .cronotofy-page *,
-:root[data-cronotofy-preset="focus"] #cronotofy-lyrics-vinyl * {
-  animation: none !important;
-  transition: none !important;
-  text-shadow: none !important;
-}
-:root[data-cronotofy-preset="focus"] body {
-  background: #0b0f17 !important;
-}
-:root[data-cronotofy-preset="focus"] :is(.Root__globalNav, .main-nowPlayingBar-nowPlayingBar, .cronotofy-island) {
-  background: #111722 !important;
-}
 #${GLOBAL_WALL_ROOT_ID} {
   position: fixed;
   inset: 0;
-  z-index: 0;
+  z-index: -1;
   pointer-events: none;
   overflow: hidden;
   contain: strict;
@@ -5614,14 +5216,6 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
 
 .cronotofy-gwall-row.left {
   animation: cronotofyGlobalMarqueeLeft var(--cronotofy-gmarquee-duration, 118s) linear infinite;
-}
-
-:root[data-cronotofy-preset="still"] .cronotofy-gwall-row {
-  animation: none;
-}
-
-:root[data-cronotofy-preset="focus"] #cronotofy-global-wall {
-  display: none !important;
 }
 
 .cronotofy-gwall-row.right {
@@ -5674,25 +5268,16 @@ html.cronotofy-playing-theme .x-progressBar-fillColor {
     radial-gradient(ellipse at 50% 100%, rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.10) 0%, transparent 60%),
     linear-gradient(
       180deg,
-      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.48) 0%,
-      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.54) 50%,
-      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.62) 100%
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.35) 0%,
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.39) 50%,
+      rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.45) 100%
     );
   pointer-events: none;
+  transition: background-color 0.45s ease;
 }
 
-/* Global Encore & Spice translucent variables (clean smoked Apple crystal) */
-:root,
-.encore-dark-theme,
-.encore-dark-theme .encore-base-set {
-  --background-base: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.18) !important;
-  --background-elevated-base: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
-  --background-elevated-highlight: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.36) !important;
-  --background-highlight: rgba(255, 255, 255, 0.08) !important;
-  --background-press: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.48) !important;
-  --background-tinted-base: rgba(255, 255, 255, 0.06) !important;
-  --background-tinted-highlight: rgba(255, 255, 255, 0.12) !important;
-  --section-background-base: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.22) !important;
+html.cronotofy-lyrics-open .cronotofy-gwall-scrim {
+  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.22);
 }
 
 /* Transparent root shell so the animated album wall shows behind the entire app */
@@ -5704,102 +5289,49 @@ body,
   background-color: transparent !important;
 }
 
-#main,
-.Root__top-container {
-  position: relative;
-  z-index: 1;
-}
-
-.Root__top-container:has(.Root__now-playing-bar .main-nowPlayingBar-nowPlayingBar) {
+/* Remove reserved bottom grid row so panels extend full-height behind the floating capsule */
+.Root__top-container:has(> .Root__globalNav) {
   grid-template-areas:
     "top-banner top-banner top-banner"
     "global-nav global-nav global-nav"
     "left-sidebar main-view right-sidebar" !important;
-  grid-template-rows: auto auto 1fr !important;
+  grid-template-rows: auto auto minmax(0, 1fr) !important;
 }
 
 .Root__main-view .main-view-container__scroll-node-child,
 .Root__nav-bar [data-overlayscrollbars-viewport],
 .Root__right-sidebar [data-overlayscrollbars-viewport],
+.Root__cinema-view [data-overlayscrollbars-viewport],
 #cronotofy-ext-host {
-  padding-bottom: 92px !important;
+  padding-bottom: 104px !important;
 }
 
-/* Top Global Nav Bar \u2014 Clean Dark Apple Liquid Glass
-   Keep backdrop-filter on ::before so .Root__globalNav stays above .Root__main-view
-   and descendants (Recent Searches dropdown) are not trapped behind a Backdrop Root */
 .Root__globalNav {
-  position: relative !important;
-  z-index: 100 !important;
   background: transparent !important;
-  background-color: transparent !important;
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
-  border: none !important;
   box-shadow: none !important;
-  overflow: visible !important;
-}
-
-.Root__globalNav::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.14) !important;
-  box-shadow:
-    0 10px 28px -8px rgba(0, 0, 0, 0.48),
-    inset 0 1px 0 rgba(255, 255, 255, 0.24),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-}
-
-/* Search / Recent Searches dropdown over Liquid Glass */
-.Root__globalNav [role="listbox"],
-.qGPO5O89umT0jc_uov5X {
-  z-index: 100 !important;
-}
-
-.Root__globalNav [role="listbox"] > div,
-.main-globalNav-searchInputSection [role="listbox"] > div,
-.ATzSlFakPhgCcp6m2wgQ {
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.62) !important;
-  backdrop-filter: blur(18px) saturate(175%) brightness(0.84) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(175%) brightness(0.84) !important;
-  border: 1px solid rgba(255, 255, 255, 0.16) !important;
-  border-radius: 18px !important;
-  box-shadow:
-    0 20px 48px -8px rgba(0, 0, 0, 0.68),
-    inset 0 1px 0 rgba(255, 255, 255, 0.26),
-    inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
 }
 
 .main-topBar-searchBar,
 .Root__globalNav .main-globalNav-navLink {
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.17) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
 }
 
 /* Left Sidebar ("Your Library") \u2014 Clean Dark Apple Liquid Glass */
 .Root__nav-bar {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.19) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   border-radius: 20px !important;
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-  overflow: hidden !important;
 }
 
 .main-yourLibraryX-libraryContainer,
@@ -5811,41 +5343,112 @@ body,
   background-color: transparent !important;
 }
 
-/* Right Sidebar ("Now Playing View") \u2014 Clean Dark Apple Liquid Glass */
-.Root__right-sidebar,
-.Root__right-sidebar-peek {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.26) !important;
-  backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(10px) saturate(170%) brightness(0.88) !important;
+/* Right Sidebar ("Now Playing View") \u2014 Liquid Glass only when expanded; zero ghost bar when collapsed */
+.Root__right-sidebar:not(:empty):not(:has(.Root__right-sidebar-collapsed)) {
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.22) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   border-radius: 20px !important;
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-  overflow: hidden !important;
+}
+
+.Root__right-sidebar:empty,
+.Root__right-sidebar:has(.Root__right-sidebar-collapsed),
+.Root__right-sidebar-peek,
+.Root__right-sidebar-overlayWrapper,
+.Root__right-sidebar-overlay,
+.Root__right-sidebar-fauxMainViewEnd {
+  background: transparent !important;
+  background-color: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.Root__right-sidebar:has(.Root__right-sidebar-collapsed) {
+  width: 0 !important;
+  min-width: 0 !important;
+  margin-inline-start: calc(var(--panel-gap, 8px) * -1) !important;
+  overflow: visible !important;
+}
+
+.Root__right-sidebar-peek.Root__right-sidebar-collapsed {
+  width: 0 !important;
+  min-width: 0 !important;
+  margin: 0 !important;
+  overflow: visible !important;
+}
+
+.Root__right-sidebar-collapsed .Root__right-sidebar-peekContent {
+  display: none !important;
+}
+
+.Root__right-sidebar-collapsed .Root__right-sidebar-overlayWrapper {
+  width: 30px !important;
+  height: 60px !important;
+  top: 50% !important;
+  inset-inline-end: 0 !important;
+  transform: translateY(-50%) !important;
+}
+
+.Root__right-sidebar-collapsed .Root__right-sidebar-overlayButton {
+  width: 26px !important;
+  height: 48px !important;
+  border-radius: 999px 0 0 999px !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.44) !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-inline-end: none !important;
+  opacity: 0.48;
+  transform: translateX(4px) !important;
+  transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.2s ease !important;
+}
+
+.Root__right-sidebar-collapsed:hover .Root__right-sidebar-overlayButton,
+.Root__right-sidebar-collapsed .Root__right-sidebar-overlayButton:focus-visible {
+  opacity: 1;
+  transform: translateX(0) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.76) !important;
 }
 
 .Root__right-sidebar > div,
 .Root__right-sidebar aside,
 [data-testid="NPV_Panel_OpenDiv"],
-.Root__right-sidebar [data-overlayscrollbars-viewport] {
+.Root__right-sidebar [data-overlayscrollbars-viewport],
+.Root__right-sidebar .NowPlayingView,
+.Root__right-sidebar .gLQcUF0SFsNfYVPkrZkQ,
+.Root__right-sidebar .D56jlo4eZiO_uR9CJ0hc,
+.Root__right-sidebar .CAP54BpfdsYIPrtt0Ek6,
+.Root__right-sidebar .SqIm5m6a8PZOH0pUaooJ,
+.Root__right-sidebar .ZQzSUDc81lpJjVOwgkfW::before {
   background: transparent !important;
   background-color: transparent !important;
+}
+
+/* Spotify can extend cinema across the right column while opening Connect; keep above cinema (5) and below/at floating player bar (6). */
+.Root__right-sidebar:has(:is(
+  [data-testid="device-picker-section-heading"],
+  [data-testid="device-picker-row-sidepanel"],
+  [data-testid="system-audio-outputs-list"]
+)):not(:has([hidden] [data-testid="device-picker-row-sidepanel"])) {
+  z-index: var(--now-playing-bar-grid-area-z-index, 6) !important;
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb, 11, 15, 23), 0.62) !important;
 }
 
 .main-nowPlayingView-section,
 .main-nowPlayingView-aboutArtist,
 .tMptdCSOI4gCghRCF74n,
 [data-testid="NPV_Panel_OpenDiv"] section {
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.17) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
   border-radius: 18px !important;
 }
 
@@ -5858,16 +5461,16 @@ body,
   --lyrics-color-active: #ffffff !important;
   --lyrics-color-inactive: rgba(255, 255, 255, 0.56) !important;
   --lyrics-color-passed: rgba(255, 255, 255, 0.72) !important;
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
-  background-color: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.28) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.20) !important;
+  background-color: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.20) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   border-radius: 18px !important;
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.22),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05) !important;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
 }
 
 .Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .ZZZvR59MO7b3EXPV7ZmC,
@@ -5883,10 +5486,10 @@ body,
 
 .Root__right-sidebar .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON,
 [data-testid="NPV_Panel_OpenDiv"] .NknVk8hYvXI6ovbE8Zj0 .J58r1nzcj4ASPsC_2MON {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.62) !important;
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.45) !important;
   border: 1px solid rgba(255, 255, 255, 0.12) !important;
-  backdrop-filter: blur(10px) saturate(160%) !important;
-  -webkit-backdrop-filter: blur(10px) saturate(160%) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
 }
 
 [data-testid="NPV_Panel_OpenDiv"] section:has(.NknVk8hYvXI6ovbE8Zj0) {
@@ -5895,52 +5498,6 @@ body,
   box-shadow: none !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
-}
-
-/* Bottom Player Bar \u2014 Floating Smoked Liquid Glass Capsule */
-.Root__now-playing-bar:has(.main-nowPlayingBar-nowPlayingBar) {
-  position: fixed !important;
-  left: 50% !important;
-  bottom: 10px !important;
-  transform: translateX(-50%) !important;
-  z-index: 60 !important;
-  width: min(880px, calc(100vw - 24px)) !important;
-  background: transparent !important;
-  background-color: transparent !important;
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
-  border: none !important;
-  box-shadow: none !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  display: flex !important;
-  justify-content: center !important;
-  align-items: center !important;
-  overflow: visible !important;
-  pointer-events: none !important;
-}
-
-.Root__now-playing-bar :is(footer, [data-testid="now-playing-bar"], .main-nowPlayingBar-container):has(.main-nowPlayingBar-nowPlayingBar) {
-  background: transparent !important;
-  background-color: transparent !important;
-  width: 100% !important;
-  min-width: 0 !important;
-  margin: 0 auto !important;
-  overflow: visible !important;
-  pointer-events: none !important;
-}
-
-/* Keep Spotify's native layout and hit targets when the player classes are unavailable. */
-[data-testid="now-playing-bar"]:not(.main-nowPlayingBar-nowPlayingBar):not(:has(.main-nowPlayingBar-nowPlayingBar)):not(.main-nowPlayingBar-nowPlayingBar *) {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.78) !important;
-  border-radius: 18px;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
-}
-
-.RgDSkGVKeiIGEZLtWcYj {
-  background: transparent !important;
-  overflow: visible !important;
-  height: auto !important;
 }
 
 /* Center Panel (.Root__main-view) \u2014 Near-invisible shell so cards float cleanly */
@@ -6012,11 +5569,11 @@ html.cronotofy-route-active .Root__main-view {
 
 /* Scrolled sticky topbar on Spotify pages (Artist/Album/Playlist) \u2014 clean dark Liquid Glass */
 .main-topBar-background {
-  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
-  background-color: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.56) !important;
+  background: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.40) !important;
+  background-color: rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.40) !important;
   background-image: none !important;
-  backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(14px) saturate(170%) brightness(0.88) !important;
+  backdrop-filter: blur(3px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(3px) saturate(115%) !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
 }
 
@@ -6027,13 +5584,10 @@ html.cronotofy-route-active .Root__main-view {
 
 .main-card-card,
 .view-homeShortcutsGrid-shortcut,
-.main-contextMenu-menu,
-[role="menu"],
-.GenericModal,
 .main-trackList-trackListHeader {
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24) !important;
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90) !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.17) !important;
+  backdrop-filter: blur(2px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(2px) saturate(115%) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   border-radius: 18px !important;
   box-shadow:
@@ -6077,14 +5631,14 @@ html.cronotofy-route-active .main-topBar-overlay {
   justify-content: center;
   cursor: pointer;
   color: var(--text-subdued, #b3b3b3);
-  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.24);
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.17);
   border: 1px solid rgba(255, 255, 255, 0.14);
   box-shadow:
     0 10px 28px -8px rgba(0, 0, 0, 0.48),
     inset 0 1px 0 rgba(255, 255, 255, 0.24),
     inset 0 -1px 0 rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
-  -webkit-backdrop-filter: blur(8px) saturate(170%) brightness(0.90);
+  backdrop-filter: blur(2px) saturate(115%);
+  -webkit-backdrop-filter: blur(2px) saturate(115%);
   -webkit-app-region: no-drag;
   transition: transform 0.16s ease, color 0.16s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
@@ -6141,9 +5695,52 @@ html.cronotofy-route-active .main-topBar-overlay {
 }
 
 /* Bottom Floating Capsule Grid: [controls | recessed track card + Cronotofy telemetry | extras + volume%] + full-width progress bar */
+.Root__now-playing-bar {
+  anchor-name: --cronotofy-player-capsule;
+  position: fixed !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 12px !important;
+  z-index: var(--now-playing-bar-grid-area-z-index, 6) !important;
+  width: auto !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  overflow: visible !important;
+  pointer-events: none !important;
+}
+
+.Root__now-playing-bar footer,
+[data-testid="now-playing-bar"],
+.Root__now-playing-bar .main-nowPlayingBar-container {
+  width: 100% !important;
+  margin: 0 auto !important;
+  padding: 0 !important;
+  display: flex !important;
+  flex-direction: column-reverse !important;
+  align-items: center !important;
+  gap: 6px !important;
+  background: transparent !important;
+  background-color: transparent !important;
+  overflow: visible !important;
+  pointer-events: none !important;
+}
+
+.RgDSkGVKeiIGEZLtWcYj {
+  background: transparent !important;
+  overflow: visible !important;
+  height: auto !important;
+}
+
 .main-nowPlayingBar-nowPlayingBar {
   display: grid !important;
-  grid-template-columns: auto minmax(220px, 1fr) auto !important;
+  grid-template-columns: auto minmax(0, 1fr) auto !important;
   grid-template-rows: auto auto !important;
   grid-template-areas:
     "controls track extras"
@@ -6151,18 +5748,20 @@ html.cronotofy-route-active .main-topBar-overlay {
   align-items: center !important;
   column-gap: 10px !important;
   row-gap: 4px !important;
-  width: 100% !important;
+  box-sizing: border-box;
+  width: min(880px, calc(100vw - 24px)) !important;
+  margin-inline: auto !important;
   height: auto !important;
   min-height: 68px !important;
   padding: 7px 20px 7px !important;
   border-radius: 999px !important;
   background: linear-gradient(
     180deg,
-    rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.56) 0%,
-    rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.64) 100%
+    rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.58) 0%,
+    rgba(var(--cronotofy-bg-sidebar-rgb, 8, 11, 18), 0.66) 100%
   ) !important;
-  backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
-  -webkit-backdrop-filter: blur(18px) saturate(180%) brightness(0.88) !important;
+  backdrop-filter: blur(12px) saturate(150%) !important;
+  -webkit-backdrop-filter: blur(12px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.14) !important;
   box-shadow:
     0 14px 36px -6px rgba(0, 0, 0, 0.62),
@@ -6172,6 +5771,16 @@ html.cronotofy-route-active .main-topBar-overlay {
   overflow: visible !important;
   position: relative !important;
   pointer-events: auto !important;
+}
+
+/* Keep notifications & snackbars above the actual floating capsule height, even after a resize or Connect bar. */
+body:has(.Root__now-playing-bar .main-nowPlayingBar-nowPlayingBar) .notistack-SnackbarContainer,
+body:has(.Root__now-playing-bar .main-nowPlayingBar-nowPlayingBar) [class*="-snackbar"] {
+  position: fixed !important;
+  bottom: 104px !important;
+  bottom: calc(anchor(--cronotofy-player-capsule top, 92px) + 12px) !important;
+  inset-block-end: 104px !important;
+  inset-block-end: calc(anchor(--cronotofy-player-capsule top, 92px) + 12px) !important;
 }
 
 .main-nowPlayingBar-center,
@@ -6236,7 +5845,7 @@ html.cronotofy-route-active .main-topBar-overlay {
   justify-self: center !important;
   padding: 4px 8px 4px 5px !important;
   border-radius: 12px !important;
-  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.44) !important;
+  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.32) !important;
   border: 1px solid rgba(255, 255, 255, 0.09) !important;
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.08),
@@ -6436,50 +6045,15 @@ html.cronotofy-route-active .main-topBar-overlay {
   line-height: 1;
 }
 
-#cronotofy-sleep-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  height: 26px;
-  min-width: 26px;
-  padding: 0 7px;
-  margin-inline: 2px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.32);
-  color: rgba(255, 255, 255, 0.72);
-  font-family: var(--encore-body-font-stack, SpotifyMixUI, sans-serif);
-  font-size: 10.5px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
-}
-
-#cronotofy-sleep-btn:hover {
-  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.16);
-  border-color: rgba(255, 255, 255, 0.24);
-  color: #ffffff;
-}
-
-#cronotofy-sleep-btn.active {
-  background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.22);
-  border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48);
-  color: var(--cronotofy-accent-soft, #f1f5f9);
-  box-shadow: 0 0 12px -2px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.42);
-}
-
-#cronotofy-sleep-btn:not(.active) .cronotofy-sleep-label:empty {
-  display: none;
-}
-
 .main-nowPlayingBar-container .main-connectBar-connectBar {
-  margin: 5px auto 0 !important;
+  margin: 0 auto !important;
   border-radius: 999px !important;
   width: fit-content !important;
   padding-inline: 14px !important;
+  background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.72) !important;
+  border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.34) !important;
+  backdrop-filter: blur(10px) saturate(140%) !important;
+  -webkit-backdrop-filter: blur(10px) saturate(140%) !important;
   pointer-events: auto !important;
 }
 
@@ -6530,8 +6104,7 @@ html.cronotofy-route-active .main-topBar-overlay {
   }
 
   #cronotofy-npb-telemetry,
-  #cronotofy-volume-pct,
-  #cronotofy-sleep-btn:not(.active) {
+  #cronotofy-volume-pct {
     display: none;
   }
 }
@@ -6539,18 +6112,15 @@ html.cronotofy-route-active .main-topBar-overlay {
 #cronotofy-ext-host {
   position: absolute;
   inset: 0;
-  z-index: 45;
+  z-index: 1;
+  isolation: isolate;
   overflow-y: auto;
   overflow-x: hidden;
   background: transparent;
 }
 
-.cronotofy-panel-anchor {
-  position: relative;
-}
-
-.cronotofy-panel-anchor .main-view-container__scroll-node,
-.cronotofy-panel-anchor [data-overlayscrollbars-viewport] {
+html.cronotofy-ext-open .Root__main-view .main-view-container__scroll-node,
+html.cronotofy-ext-open .Root__main-view [data-overlayscrollbars-viewport] {
   visibility: hidden !important;
   pointer-events: none !important;
 }
@@ -6580,76 +6150,40 @@ html.cronotofy-route-active .main-topBar-overlay {
     async init() {
       if (this.initialized) return;
       this.initialized = true;
+      ensureGlobalWallStyle();
       this.ensureMounted();
-      const user = await resolveCurrentSpotifyUser();
-      this.userId = user?.id || "default";
-      this.loadCachedImmediately(this.userId);
       if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
       try {
-        const [topShort, topMid, topLong, libTracks, libAlbums, libArtists] = await Promise.all([
-          fetchTopContentFromDesktop("short_term", 50).catch(() => ({ tracks: [], artists: [] })),
-          fetchTopContentFromDesktop("medium_term", 50).catch(() => ({ tracks: [], artists: [] })),
-          fetchTopContentFromDesktop("long_term", 50).catch(() => ({ tracks: [], artists: [] })),
-          fetchLibraryTracksFromDesktop(150).catch(() => []),
-          fetchLibraryAlbumsFromDesktop(100).catch(() => []),
-          fetchLibraryArtistsFromDesktop(50).catch(() => [])
-        ]);
-        const seedCovers = [];
-        const artistCandidates = [];
-        const seenArtistKeys = /* @__PURE__ */ new Set();
-        const pushArtist = (id, name) => {
-          const clean = (name || "").trim();
-          if (!clean) return;
-          const key = id || clean.toLowerCase();
-          if (seenArtistKeys.has(key)) return;
-          seenArtistKeys.add(key);
-          artistCandidates.push({ id, name: clean });
-        };
-        const pushTrackSeed = (tr) => {
-          if (!tr) return;
-          const img = normalizeSpotifyImage(tr?.album?.images?.[0]?.url);
-          if (img) {
-            seedCovers.push({
-              id: String(tr.album?.id || tr.id || img),
-              title: String(tr.album?.name || tr.name || ""),
-              artistName: String(tr.artists?.[0]?.name || ""),
-              imageUrl: img
-            });
-          }
-          if (Array.isArray(tr?.artists)) {
-            for (const a of tr.artists) {
-              if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
-            }
-          }
-        };
-        for (const a of [...topShort.artists, ...topMid.artists, ...topLong.artists, ...libArtists]) {
-          if (a?.name) pushArtist(a.id ? String(a.id) : void 0, String(a.name));
+        const user = await resolveCurrentSpotifyUser();
+        this.userId = user?.id || "default";
+        const top = await fetchTopContentFromDesktop("long_term", 50, false);
+        const candidates = top.artists.length ? top.artists : top.tracks.map((track) => track.artists?.[0]);
+        const artists = /* @__PURE__ */ new Map();
+        for (const artist of candidates) {
+          if (artist?.id && artist.name) artists.set(artist.id, artist);
+          if (artists.size >= CRONOTOFY_MOD_CONFIG.albumWall.maxArtistsToFetch) break;
         }
-        for (const alb of libAlbums) {
-          if (alb.imageUrl) {
-            seedCovers.push({
-              id: alb.id,
-              title: alb.name,
-              artistName: alb.artistName,
-              imageUrl: alb.imageUrl
+        if (!artists.size) return;
+        const seeds = [];
+        for (const track of top.tracks) {
+          const artist = track.artists?.[0];
+          const imageUrl = normalizeSpotifyImage(track.album?.images?.[0]?.url);
+          if (artists.has(artist?.id) && imageUrl) {
+            seeds.push({
+              id: track.album.id || track.id,
+              title: track.album.name,
+              artistName: artist.name,
+              imageUrl
             });
           }
         }
-        for (const tr of [...topShort.tracks, ...topMid.tracks, ...topLong.tracks, ...libTracks]) {
-          pushTrackSeed(tr);
-        }
-        const uniqueSeeds = deduplicateWallCovers(seedCovers);
-        if (uniqueSeeds.length > 0 && this.currentCovers.length === 0) {
-          this.updateCovers(uniqueSeeds, this.userId);
-        }
-        const enriched = await collectFavoriteArtistCovers({
-          userId: this.userId,
-          artistCandidates: artistCandidates.slice(0, 16),
-          seedTrackCovers: uniqueSeeds
+        this.updateCovers(seeds);
+        const covers = await collectFavoriteArtistCovers({
+          userId: this.userId + "_annual_" + [...artists.keys()].join("-"),
+          artistCandidates: [...artists.values()],
+          seedTrackCovers: seeds
         });
-        if (enriched.length > 0) {
-          this.updateCovers(enriched, this.userId);
-        }
+        this.updateCovers(covers);
       } catch {
       }
     }
@@ -6670,19 +6204,7 @@ html.cronotofy-route-active .main-topBar-overlay {
       this.container = el;
       return el;
     }
-    loadCachedImmediately(uid) {
-      try {
-        const key = `${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_${uid || "default"}`;
-        const raw = localStorage.getItem(key) || localStorage.getItem(`${CRONOTOFY_MOD_CONFIG.albumWall.cachePrefix}_default`);
-        if (!raw) return;
-        const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.covers) && parsed.covers.length > 0) {
-          this.updateCovers(parsed.covers, uid);
-        }
-      } catch {
-      }
-    }
-    updateCovers(covers, seedKey) {
+    updateCovers(covers) {
       if (!Array.isArray(covers) || covers.length === 0) return;
       if (!CRONOTOFY_MOD_CONFIG.ui.enableAlbumWall) return;
       const unique = deduplicateWallCovers(covers);
@@ -6691,7 +6213,6 @@ html.cronotofy-route-active .main-topBar-overlay {
         return;
       }
       this.currentCovers = unique;
-      if (seedKey) this.userId = seedKey;
       this.renderWall();
     }
     renderWall() {
@@ -6735,20 +6256,75 @@ html.cronotofy-route-active .main-topBar-overlay {
   // spicetify-cronotofy/src/neonLyrics.ts
   var NEON_LYRICS_STYLE_ID = "cronotofy-neon-lyrics-style";
   var VINYL_HOST_ID = "cronotofy-lyrics-vinyl";
+  var BROWSE_TIMEOUT_MS = 1e4;
+  function computeCharDisintegration(index, codePoint) {
+    const hash = Math.abs((index + 1) * 73 + codePoint * 31);
+    return {
+      dx: hash % 59 - 14,
+      dy: -16 - Math.floor(hash / 7) % 35,
+      rot: Math.floor(hash / 13) % 57 - 26,
+      spark: index % 4 === 0
+    };
+  }
   function findFullLyricsContainer() {
     return Array.from(document.querySelectorAll(".u42Yq3ZaAiFZXbkvIpwy .z5jGVvMKwt3RUCcmlwby")).find(
       (el) => !el.closest(".NknVk8hYvXI6ovbE8Zj0")
     ) || null;
   }
+  function findScrollParent(el) {
+    let cur = el.parentElement;
+    while (cur && cur !== document.documentElement) {
+      if (cur.hasAttribute("data-overlayscrollbars-viewport")) {
+        return cur;
+      }
+      const overflowY = window.getComputedStyle(cur).overflowY;
+      if ((overflowY === "auto" || overflowY === "scroll") && cur.scrollHeight >= cur.clientHeight) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
   var NEON_LYRICS_CSS = `
-/* Full Lyrics View \u2014 Transparent Album-Wall Backdrop (never flat cover tint) */
-html.cronotofy-lyrics-open .Root__main-view {
-  position: relative !important;
-  background-color: rgba(var(--cronotofy-bg-main-rgb, 11, 15, 23), 0.04) !important;
+/* Full Lyrics View \u2014 Seamless Full-Bleed Transparent Backdrop (zero border or tint seam) */
+html.cronotofy-lyrics-open .Root__main-view,
+html.cronotofy-cinema-lyrics .Root__cinema-view {
+  background: transparent !important;
+  background-color: transparent !important;
   background-image: none !important;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
 }
 
-html.cronotofy-lyrics-open .Root__cinema-view,
+html.cronotofy-lyrics-open .Root__main-view {
+  position: relative !important;
+}
+
+html.cronotofy-cinema-lyrics .Root__cinema-view.Root__cinema-view--controls-hidden {
+  margin-bottom: 0 !important;
+}
+
+/* Hide underlying panels behind full-width Cinema Lyrics unless Spotify explicitly opened a right-sidebar panel or Connect picker */
+html.cronotofy-cinema-lyrics:not([data-right-sidebar-open-duringEnter]):not([data-right-sidebar-open-postEnter]):not([data-right-sidebar-open-preExit]) .Root__top-container:not([data-right-sidebar-open-duringEnter]):not([data-right-sidebar-open-postEnter]):not([data-right-sidebar-open-preExit]) .Root__right-sidebar:not(:has(:is(
+  [data-testid="device-picker-section-heading"],
+  [data-testid="device-picker-row-sidepanel"],
+  [data-testid="system-audio-outputs-list"]
+))),
+html.cronotofy-cinema-lyrics .Root__right-sidebar:has([hidden] [data-testid="device-picker-row-sidepanel"]),
+html.cronotofy-cinema-lyrics .Root__nav-bar,
+html.cronotofy-cinema-lyrics .Root__main-view {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+html.cronotofy-cinema-lyrics:not(.cronotofy-nl-browsing) .Root__cinema-view .os-scrollbar {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
 html.cronotofy-lyrics-open .wtCMUhX_QmNKSCghbq4h,
 html.cronotofy-lyrics-open .jGYHNMjn1dKKjOUSxUdN,
 html.cronotofy-lyrics-open .frs5ZPluzLbWTu5dCHr0,
@@ -6757,6 +6333,10 @@ html.cronotofy-lyrics-open .KQ5SDwOFi3U9EYsWMAag,
 html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua,
 html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::before,
 html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua::after,
+html.cronotofy-lyrics-open .TEBHz9L27CyLntC68xQ2,
+html.cronotofy-lyrics-open .QwcIb5mGvbu4qb3_cnAQ,
+html.cronotofy-lyrics-open .ZDb8FjylyS1RZnYv3ubr,
+html.cronotofy-lyrics-open .XsSWx3aR_OYA3GMIEk7S,
 html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport],
 html.cronotofy-lyrics-open .Root__cinema-view [data-overlayscrollbars-viewport] > div,
 html.cronotofy-lyrics-open .Ke_cNZcH3Yvd2QEbgKJk::before,
@@ -6772,6 +6352,7 @@ html.cronotofy-lyrics-open .main-view-container__scroll-node-child {
   background-image: none !important;
   outline: none !important;
   border: none !important;
+  box-shadow: none !important;
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
   --lyrics-color-background: transparent !important;
@@ -6779,14 +6360,17 @@ html.cronotofy-lyrics-open .main-view-container__scroll-node-child {
   --cinema-mode-bg-color-to: transparent !important;
 }
 
-html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua {
+html.cronotofy-lyrics-open .f5IimFOcWI6VZcJ1ilua,
+html.cronotofy-lyrics-open .TEBHz9L27CyLntC68xQ2,
+html.cronotofy-lyrics-open .QwcIb5mGvbu4qb3_cnAQ {
   display: none !important;
 }
 
-/* Lift Spotify's floating Sync button cleanly above the Now Playing bar capsule */
+/* Lift Spotify's floating Sync button cleanly above the floating Now Playing bar capsule */
 html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW,
 html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW {
-  bottom: 120px !important;
+  bottom: 108px !important;
+  bottom: calc(anchor(--cronotofy-player-capsule top, 92px) + 14px) !important;
   z-index: 75 !important;
 }
 
@@ -6802,8 +6386,8 @@ html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) bu
   background: rgba(var(--cronotofy-bg-card-rgb, 17, 23, 34), 0.78) !important;
   color: var(--cronotofy-accent-soft, #f1f5f9) !important;
   border: 1px solid rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.48) !important;
-  backdrop-filter: blur(14px) saturate(180%) !important;
-  -webkit-backdrop-filter: blur(14px) saturate(180%) !important;
+  backdrop-filter: blur(3px) saturate(115%) !important;
+  -webkit-backdrop-filter: blur(3px) saturate(115%) !important;
   box-shadow:
     0 10px 28px rgba(0, 0, 0, 0.58),
     0 0 18px -4px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.45) !important;
@@ -6813,16 +6397,6 @@ html.cronotofy-lyrics-open .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) butt
 html.cronotofy-cinema-lyrics .rxth_Ddcp6DIwLpwR4ZW:not(.ROfvcnNlxs6JfVH_rwuP) button:hover {
   background: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.26) !important;
   border-color: rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
-}
-
-/* Hide underlying panels in Cinema Lyrics so no vertical bar bleeds behind vinyl */
-html.cronotofy-cinema-lyrics .Root__right-sidebar,
-html.cronotofy-cinema-lyrics .Root__right-sidebar-peek,
-html.cronotofy-cinema-lyrics .Root__nav-bar,
-html.cronotofy-cinema-lyrics .Root__main-view {
-  opacity: 0 !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
 }
 
 /* Shared layout geometry: large spinning vinyl on left + lyrics neatly beside it */
@@ -6853,20 +6427,173 @@ html.cronotofy-cinema-lyrics {
   letter-spacing: -0.015em;
 }
 
-/* Animate Spotify's current line directly so seeks take effect immediately. */
-@media (prefers-reduced-motion: no-preference) {
-  html:not([data-cronotofy-preset="focus"])
-  :is(.Root__main-view, .Root__cinema-view, .u42Yq3ZaAiFZXbkvIpwy)
-  :is(.lyrics-lyricsContent-lyric, .J4_kkGYm5hjbZlztykxr):is(.lyrics-lyricsContent-active, .SOT5gG00YqnGQ4uR7PwQ)
-  > :is(.lyrics-lyricsContent-text, span:first-child) {
-    display: inline-block;
-    animation: cronotofyLyricLift 200ms cubic-bezier(.2,.7,.3,1);
+/* Upcoming & unenhanced passed lines stay hidden until user scrolls */
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.y45YX8smwP4lW13IQulz:not(.cronotofy-nl-enhanced),
+html:not(.cronotofy-nl-browsing) .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.l_p6nU70V4sJ7XaycCp3:not(.cronotofy-nl-enhanced) {
+  opacity: 0 !important;
+  transform: translate3d(0, 8px, 0);
+  pointer-events: none !important;
+  transition: opacity 0.55s cubic-bezier(0.22, 1, 0.36, 1), transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced {
+  position: relative;
+  contain: layout style;
+}
+
+/* Keep React's text node in place untouched while visually presenting the kinetic stage */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced > .lyrics-lyricsContent-text {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.cronotofy-nl-stage {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 1.24;
+}
+
+.cronotofy-nl-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.cronotofy-nl-space {
+  display: inline-block;
+  width: 0.28em;
+}
+
+.cronotofy-nl-ch {
+  display: inline-block;
+  position: relative;
+  transform-origin: center 65%;
+}
+
+/* Upcoming & already-finished lines: hidden by default, smoothly fade back out 10s after scrolling stops */
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.y45YX8smwP4lW13IQulz:not(.cronotofy-nl-active) .cronotofy-nl-ch,
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-gone:not(.cronotofy-nl-active) .cronotofy-nl-ch {
+  opacity: 0;
+  transform: translate3d(0, 8px, 0);
+  pointer-events: none;
+  transition: opacity 0.55s cubic-bezier(0.22, 1, 0.36, 1), transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Manual scroll reveal (appears smoothly on scroll, fades out 10s after last scroll gesture) */
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:not(.cronotofy-nl-active):not(.cronotofy-nl-disintegrating) .cronotofy-nl-ch,
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr:not(.cronotofy-nl-enhanced) {
+  opacity: 0.48 !important;
+  filter: none !important;
+  transform: translate3d(0, 0, 0) !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9);
+  text-shadow: 0 0 12px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.32);
+  transition: opacity 0.38s cubic-bezier(0.22, 1, 0.36, 1), transform 0.38s cubic-bezier(0.22, 1, 0.36, 1) !important;
+  pointer-events: auto;
+}
+
+html.cronotofy-nl-browsing .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced:hover .cronotofy-nl-ch {
+  opacity: 0.94 !important;
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  text-shadow: 0 0 18px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.78) !important;
+}
+
+/* Active line: fluid GPU-composited neon materialization tinted with active cover palette */
+@keyframes cronotofyNeonFluidIn {
+  0% {
+    opacity: 0;
+    transform: translate3d(-8px, 14px, 0) scale(0.9) skewX(-4deg);
+  }
+  60% {
+    opacity: 0.96;
+    transform: translate3d(0.5px, -1px, 0) scale(1.015) skewX(0deg);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1) skewX(0deg);
   }
 }
 
-@keyframes cronotofyLyricLift {
-  from { opacity: .78; transform: translateY(.09em); }
-  to { opacity: 1; transform: translateY(0); }
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-active .cronotofy-nl-ch {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  will-change: transform, opacity;
+  text-shadow:
+    0 0 4px rgba(255, 255, 255, 0.72),
+    0 0 14px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+    0 0 32px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.58);
+  animation: cronotofyNeonFluidIn 480ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: calc(var(--i, 0) * var(--in-step, 20ms));
+}
+
+/* Passed bar: GPU-composited ash/ember disintegration + glowing sparks */
+@keyframes cronotofyNeonCharDisintegrate {
+  0% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) rotate(0deg) scale(1);
+  }
+  22% {
+    opacity: 0.9;
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.16), calc(var(--dy, -24px) * 0.16), 0)
+      rotate(calc(var(--rot, 8deg) * 0.16))
+      scale(1.03);
+  }
+  62% {
+    opacity: 0.34;
+    transform:
+      translate3d(calc(var(--dx, 12px) * 0.66), calc(var(--dy, -24px) * 0.66), 0)
+      rotate(calc(var(--rot, 8deg) * 0.66))
+      scale(0.74);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--dx, 12px), var(--dy, -24px), 0) rotate(var(--rot, 8deg)) scale(0.32);
+  }
+}
+
+@keyframes cronotofyNeonSpark {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 0, 0) scale(0.4);
+  }
+  25% {
+    opacity: 1;
+    transform: translate3d(calc(var(--dx, 12px) * 0.3), calc(var(--dy, -24px) * 0.4), 0) scale(1.1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(calc(var(--dx, 12px) * 1.35), calc(var(--dy, -24px) * 1.45), 0) scale(0.15);
+  }
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+  color: var(--cronotofy-accent-soft, #f1f5f9) !important;
+  will-change: transform, opacity;
+  text-shadow:
+    0 0 10px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.85),
+    0 0 24px rgba(var(--cronotofy-accent-2-rgb, 148, 163, 184), 0.45);
+  animation: cronotofyNeonCharDisintegrate 720ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 12ms));
+}
+
+.u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  pointer-events: none;
+  background: var(--cronotofy-accent, #e2e8f0);
+  box-shadow:
+    0 0 8px rgba(var(--cronotofy-accent-rgb, 226, 232, 240), 0.95),
+    0 0 14px #ffffff;
+  animation: cronotofyNeonSpark 780ms ease-out forwards;
+  animation-delay: calc(var(--i, 0) * var(--out-step, 16ms) + 60ms);
 }
 
 /* Right-side slow spinning vinyl record */
@@ -7049,6 +6776,8 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced .cronotofy-nl-ch,
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch.is-spark::after,
   .cronotofy-vinyl-disc {
     animation: none !important;
     filter: none !important;
@@ -7056,6 +6785,9 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
     transition: opacity 0.25s ease !important;
   }
 
+  .u42Yq3ZaAiFZXbkvIpwy .J4_kkGYm5hjbZlztykxr.cronotofy-nl-enhanced.cronotofy-nl-disintegrating .cronotofy-nl-ch {
+    opacity: 0;
+  }
 }
 `;
   function ensureNeonLyricsStyle() {
@@ -7077,6 +6809,12 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       this.observer = null;
       this.syncRafPending = false;
       this.initialized = false;
+      this.activeLineKeys = /* @__PURE__ */ new Set();
+      this.disintegratingKeys = /* @__PURE__ */ new Set();
+      this.disintegratedKeys = /* @__PURE__ */ new Set();
+      this.keyTimers = /* @__PURE__ */ new Map();
+      this.boundScrollTargets = /* @__PURE__ */ new WeakSet();
+      this.browseTimer = null;
       this.vinylHost = null;
       this.vinylImg = null;
       this.vinylTitleEl = null;
@@ -7084,8 +6822,20 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       this.lastVinylCover = "";
       this.lastVinylTitle = "";
       this.lastVinylArtist = "";
+      this.lastSongSignature = "";
+      this.handleKeydown = (e) => {
+        if (document.documentElement.classList.contains("cronotofy-lyrics-open") && (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "PageUp" || e.key === "PageDown" || e.key === "Home" || e.key === "End")) {
+          this.triggerBrowseReveal();
+        }
+      };
       this.handlePlayerUpdate = () => {
         this.syncVinyl(findFullLyricsContainer());
+      };
+      this.handleDocumentClick = (e) => {
+        const target = e.target;
+        if (target?.closest?.(".rxth_Ddcp6DIwLpwR4ZW")) {
+          this.clearBrowseReveal();
+        }
       };
     }
     init() {
@@ -7093,6 +6843,10 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       this.initialized = true;
       ensureNeonLyricsStyle();
       this.sync();
+      if (typeof window !== "undefined") {
+        window.addEventListener("keydown", this.handleKeydown);
+      }
+      document.addEventListener("click", this.handleDocumentClick, true);
       Spicetify?.Player?.addEventListener?.("songchange", this.handlePlayerUpdate);
       Spicetify?.Player?.addEventListener?.("onplaypause", this.handlePlayerUpdate);
       if (document.body && typeof MutationObserver !== "undefined") {
@@ -7103,12 +6857,12 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
             const target = r.target;
             if (!target) continue;
             if (r.type === "attributes") {
-              if (target.classList && (target.classList.contains("u42Yq3ZaAiFZXbkvIpwy") || target.classList.contains("wYWhVPZoG93lR7ogMIug") || target.classList.contains("Root__cinema-view"))) {
+              if (target.classList && (target.classList.contains("J4_kkGYm5hjbZlztykxr") || target.classList.contains("u42Yq3ZaAiFZXbkvIpwy") || target.classList.contains("wYWhVPZoG93lR7ogMIug") || target.classList.contains("Root__cinema-view"))) {
                 relevant = true;
                 break;
               }
             } else if (r.type === "childList") {
-              if (target.id === VINYL_HOST_ID || target.id === "cronotofy-npb-telemetry" || target.id === "cronotofy-global-wall" || target.closest && target.closest("#cronotofy-lyrics-vinyl, #cronotofy-npb-telemetry, #cronotofy-global-wall")) {
+              if (target.id === VINYL_HOST_ID || target.id === "cronotofy-npb-telemetry" || target.id === "cronotofy-global-wall" || target.classList && target.classList.contains("cronotofy-nl-stage") || target.closest && target.closest("#cronotofy-lyrics-vinyl, #cronotofy-npb-telemetry, #cronotofy-global-wall")) {
                 continue;
               }
               relevant = true;
@@ -7119,7 +6873,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           this.syncRafPending = true;
           requestAnimationFrame(() => {
             this.syncRafPending = false;
-            if (this.initialized) this.sync();
+            this.sync();
           });
         });
         this.observer.observe(document.body, {
@@ -7128,6 +6882,65 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           attributes: true,
           attributeFilter: ["class"]
         });
+      }
+    }
+    clearKeyTimer(key) {
+      const timer = this.keyTimers.get(key);
+      if (timer !== void 0) {
+        window.clearTimeout(timer);
+        this.keyTimers.delete(key);
+      }
+    }
+    clearBrowseReveal() {
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+        this.browseTimer = null;
+      }
+      if (typeof document !== "undefined") {
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }
+    }
+    triggerBrowseReveal() {
+      if (typeof document === "undefined") return;
+      document.documentElement.classList.add("cronotofy-nl-browsing");
+      if (this.browseTimer !== null) {
+        window.clearTimeout(this.browseTimer);
+      }
+      this.browseTimer = window.setTimeout(() => {
+        this.browseTimer = null;
+        document.documentElement.classList.remove("cronotofy-nl-browsing");
+      }, BROWSE_TIMEOUT_MS);
+    }
+    resetSongState() {
+      for (const timer of this.keyTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      this.keyTimers.clear();
+      this.activeLineKeys.clear();
+      this.disintegratingKeys.clear();
+      this.disintegratedKeys.clear();
+    }
+    ensureScrollBindings(container) {
+      const targets = [container];
+      const wrapper = container.closest(".wYWhVPZoG93lR7ogMIug");
+      if (wrapper) targets.push(wrapper);
+      const scrollParent = findScrollParent(container);
+      if (scrollParent) targets.push(scrollParent);
+      const cinemaView = container.closest(".Root__cinema-view");
+      if (cinemaView) targets.push(cinemaView);
+      const mainView = container.closest(".Root__main-view");
+      if (mainView) targets.push(mainView);
+      for (const target of targets) {
+        if (this.boundScrollTargets.has(target)) continue;
+        this.boundScrollTargets.add(target);
+        const onManualInteract = () => {
+          if (document.documentElement.classList.contains("cronotofy-lyrics-open")) {
+            this.triggerBrowseReveal();
+          }
+        };
+        target.addEventListener("wheel", onManualInteract, { passive: true });
+        target.addEventListener("touchmove", onManualInteract, { passive: true });
+        target.addEventListener("pointerdown", onManualInteract, { passive: true });
       }
     }
     getOrCreateVinylHost() {
@@ -7211,25 +7024,147 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       const isPlaying = Spicetify?.Player?.isPlaying?.();
       host.classList.toggle("is-paused", isPlaying === false);
     }
+    ensureEnhancedLine(line, textNode, text) {
+      if (line.dataset.cronotofyNlText === text && line.querySelector(".cronotofy-nl-stage")) {
+        return Number(line.dataset.cronotofyNlCount || "0");
+      }
+      line.querySelectorAll(":scope > .cronotofy-nl-stage").forEach((el) => el.remove());
+      const stage = document.createElement("span");
+      stage.className = "cronotofy-nl-stage";
+      stage.setAttribute("aria-hidden", "true");
+      const tokens = text.split(/(\s+)/);
+      let charIdx = 0;
+      for (const token of tokens) {
+        if (!token) continue;
+        if (/^\s+$/.test(token)) {
+          const space = document.createElement("span");
+          space.className = "cronotofy-nl-space";
+          space.textContent = "\xA0";
+          stage.appendChild(space);
+          continue;
+        }
+        const wordEl = document.createElement("span");
+        wordEl.className = "cronotofy-nl-word";
+        for (const ch of Array.from(token)) {
+          const span = document.createElement("span");
+          span.className = "cronotofy-nl-ch";
+          const vec = computeCharDisintegration(charIdx, ch.codePointAt(0) ?? 0);
+          if (vec.spark) span.classList.add("is-spark");
+          span.style.setProperty("--i", String(charIdx));
+          span.style.setProperty("--dx", `${vec.dx}px`);
+          span.style.setProperty("--dy", `${vec.dy}px`);
+          span.style.setProperty("--rot", `${vec.rot}deg`);
+          span.textContent = ch;
+          wordEl.appendChild(span);
+          charIdx++;
+        }
+        stage.appendChild(wordEl);
+      }
+      const inStep = Math.max(12, Math.min(24, Math.round(620 / Math.max(1, charIdx))));
+      const outStep = Math.max(8, Math.min(15, Math.round(320 / Math.max(1, charIdx))));
+      stage.style.setProperty("--in-step", `${inStep}ms`);
+      stage.style.setProperty("--out-step", `${outStep}ms`);
+      textNode.insertAdjacentElement("afterend", stage);
+      line.dataset.cronotofyNlText = text;
+      line.dataset.cronotofyNlCount = String(charIdx);
+      line.dataset.cronotofyNlOutStep = String(outStep);
+      line.classList.add("cronotofy-nl-enhanced");
+      return charIdx;
+    }
     sync() {
       const container = findFullLyricsContainer();
       if (!container) {
         document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+        this.clearBrowseReveal();
         this.syncVinyl(null);
         return;
       }
       const inCinema = Boolean(container.closest(".Root__cinema-view"));
       document.documentElement.classList.add("cronotofy-lyrics-open");
       document.documentElement.classList.toggle("cronotofy-cinema-lyrics", inCinema);
+      this.ensureScrollBindings(container);
       this.syncVinyl(container);
+      const lines = container.querySelectorAll(".J4_kkGYm5hjbZlztykxr");
+      const sigParts = [];
+      lines.forEach((line) => {
+        if (sigParts.length >= 3) return;
+        const t = line.querySelector(":scope > .lyrics-lyricsContent-text")?.textContent?.trim();
+        if (t) sigParts.push(t);
+      });
+      const songSig = sigParts.join("\n");
+      if (songSig && songSig !== this.lastSongSignature) {
+        this.lastSongSignature = songSig;
+        this.resetSongState();
+      }
+      lines.forEach((line, idx) => {
+        if (line.classList.contains("tTJvSBNfeQLp4kyD7ULO") || line.classList.contains("YtTJm1ld5AeUmuu75urR")) {
+          return;
+        }
+        const textNode = line.querySelector(":scope > .lyrics-lyricsContent-text");
+        const text = textNode?.textContent?.trim() || "";
+        if (!textNode || !text) return;
+        const totalChars = this.ensureEnhancedLine(line, textNode, text);
+        const outStep = Number(line.dataset.cronotofyNlOutStep || "16");
+        const key = `${idx}:${text}`;
+        if (line.classList.contains("SOT5gG00YqnGQ4uR7PwQ")) {
+          this.clearKeyTimer(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          this.activeLineKeys.add(key);
+          line.classList.remove("cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+          line.classList.add("cronotofy-nl-active");
+        } else if (line.classList.contains("l_p6nU70V4sJ7XaycCp3")) {
+          if (this.activeLineKeys.has(key)) {
+            this.activeLineKeys.delete(key);
+            this.clearKeyTimer(key);
+            this.disintegratedKeys.delete(key);
+            this.disintegratingKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+            const duration = Math.min(1400, totalChars * outStep + 780);
+            const timer = window.setTimeout(() => {
+              this.keyTimers.delete(key);
+              this.disintegratingKeys.delete(key);
+              if (!this.activeLineKeys.has(key)) {
+                this.disintegratedKeys.add(key);
+              }
+              if (line.isConnected && !line.classList.contains("cronotofy-nl-active")) {
+                line.classList.remove("cronotofy-nl-disintegrating");
+                line.classList.add("cronotofy-nl-gone");
+              }
+            }, duration);
+            this.keyTimers.set(key, timer);
+          } else if (this.disintegratingKeys.has(key)) {
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-gone");
+            line.classList.add("cronotofy-nl-disintegrating");
+          } else {
+            this.disintegratedKeys.add(key);
+            line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating");
+            line.classList.add("cronotofy-nl-gone");
+          }
+        } else {
+          this.clearKeyTimer(key);
+          this.activeLineKeys.delete(key);
+          this.disintegratingKeys.delete(key);
+          this.disintegratedKeys.delete(key);
+          line.classList.remove("cronotofy-nl-active", "cronotofy-nl-disintegrating", "cronotofy-nl-gone");
+        }
+      });
     }
     destroy() {
       this.observer?.disconnect();
       this.observer = null;
-      document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+      if (typeof window !== "undefined") {
+        window.removeEventListener("keydown", this.handleKeydown);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("click", this.handleDocumentClick, true);
+        document.documentElement.classList.remove("cronotofy-lyrics-open", "cronotofy-cinema-lyrics");
+      }
       Spicetify?.Player?.removeEventListener?.("songchange", this.handlePlayerUpdate);
       Spicetify?.Player?.removeEventListener?.("onplaypause", this.handlePlayerUpdate);
-      document.getElementById(NEON_LYRICS_STYLE_ID)?.remove();
+      this.clearBrowseReveal();
+      this.resetSongState();
       this.syncVinyl(null);
       this.initialized = false;
     }
@@ -7237,11 +7172,9 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
 
   // spicetify-cronotofy/src/bootstrap.ts
   function bootstrapCronotofy(options = {}) {
-    let remainingAttempts = 200;
-    const reportStartupError = (err) => console.warn("[Cronotofy] startup error:", err);
     const tryStart = () => {
-      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.Platform || !document.body) {
-        if (--remainingAttempts > 0) setTimeout(tryStart, 300);
+      if (typeof Spicetify === "undefined" || !Spicetify.Player || !Spicetify.CosmosAsync || !Spicetify.Platform) {
+        setTimeout(tryStart, 300);
         return;
       }
       if (window.__CRONOTOFY_MOD__) {
@@ -7251,19 +7184,6 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         const tracker = new ListeningTracker();
         const themeController = new DynamicThemeController();
         const globalWall = new GlobalAlbumWallController();
-        ensureGlobalWallStyle();
-        let visualInitTimer;
-        const setVisualPreset = (preset) => {
-          document.documentElement.dataset.cronotofyPreset = preset;
-          clearTimeout(visualInitTimer);
-          if (preset === "focus" && neonLyrics.initialized) neonLyrics.destroy();
-          if (preset !== "focus") {
-            visualInitTimer = setTimeout(() => {
-              void globalWall.init().catch(reportStartupError);
-              try { neonLyrics.init(); } catch (err) { reportStartupError(err); }
-            }, 1500);
-          }
-        };
         const chromeWidgets = new CronotofyChromeWidgets(tracker, {
           onOpen: options.onOpen,
           isOpen: options.isOpen
@@ -7272,14 +7192,14 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         let lastThemeKey = "";
         const syncThemeFromPlayer = () => {
           const live = tracker.getLiveTrack();
-          if (!live || !live.albumImageUrl) return;
-          const key = `${live.uri}|${live.albumImageUrl}`;
+          const key = live ? `${live.uri}|${live.albumImageUrl}` : "";
           if (key === lastThemeKey) return;
           lastThemeKey = key;
           void themeController.updateFromLiveTrack(live);
         };
         const seedThemeIfNeeded = async () => {
-          if (themeController.getPalette().isDynamic) return;
+          const live = tracker.getLiveTrack();
+          if (themeController.getPalette().isDynamic || live?.albumImageUrl) return;
           const snap = tracker.getSnapshot();
           const localCover = snap.recentPlays.find((p) => p.albumImageUrl) || snap.tracks.find((t) => t.albumImageUrl);
           if (localCover?.albumImageUrl) {
@@ -7315,7 +7235,6 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
           },
           clearLocalHistory: () => tracker.clearLocalHistory(),
           getDynamicPalette: () => themeController.getPalette(),
-          setVisualPreset,
           isDynamicThemeEnabled: () => themeController.isEnabled(),
           setDynamicThemeEnabled: (enabled) => {
             themeController.setEnabled(enabled);
@@ -7330,20 +7249,15 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
               void themeController.updateFromLiveTrack(live);
             }
           },
-          hasGeminiApiKey: () => Boolean(getConfiguredGeminiApiKey()),
-          updateWallCovers: (covers) => {
-            globalWall.updateCovers(covers);
-            if (!themeController.getPalette().isDynamic && covers[0]?.imageUrl) {
-              void themeController.seedFromCoverIfNeeded(covers[0].imageUrl);
-            }
-          }
+          hasGeminiApiKey: () => Boolean(getConfiguredGeminiApiKey())
         };
-        void tracker.init().then(async () => {
+        void tracker.init().then(() => {
           syncThemeFromPlayer();
-          await seedThemeIfNeeded();
-        }).catch(reportStartupError);
-        setVisualPreset(readVisualPreset());
+          void seedThemeIfNeeded();
+        });
+        void globalWall.init();
         chromeWidgets.init();
+        neonLyrics.init();
         options.onChromeReady?.(chromeWidgets);
         tracker.subscribe(syncThemeFromPlayer);
         Spicetify.Player.addEventListener?.("songchange", () => {
@@ -7356,7 +7270,7 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
         });
         syncThemeFromPlayer();
       } catch (err) {
-        reportStartupError(err);
+        console.warn("[Cronotofy] startup error:", err);
       }
     };
     tryStart();
@@ -7386,47 +7300,34 @@ html.cronotofy-ext-open #${VINYL_HOST_ID} {
       } catch {
       }
       reactRoot = null;
-      hostEl?.parentElement?.classList.remove("cronotofy-panel-anchor");
       hostEl?.remove();
       hostEl = null;
       widgetsRef?.syncActiveRoute();
     };
     const mountView = () => {
-      const mainView = findCronotofyMainView();
+      const mainView = document.querySelector(".Root__main-view");
       if (!mainView) return;
-      const createRoot = Spicetify?.ReactDOM?.createRoot || Spicetify?.ReactDOMClient?.createRoot;
-      const legacyRender = Spicetify?.ReactDOM?.render;
-      if (!Spicetify?.React || (typeof createRoot !== "function" && typeof legacyRender !== "function")) {
-        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
-        return;
-      }
-      if (hostEl && !mainView.contains(hostEl)) closeView();
       if (!hostEl || !mainView.contains(hostEl)) {
         document.getElementById(EXT_HOST_ID)?.remove();
         hostEl = document.createElement("div");
         hostEl.id = EXT_HOST_ID;
         mainView.appendChild(hostEl);
       }
-      try {
-        const appElement = render();
-        if (typeof createRoot === "function") {
-          reactRoot ??= createRoot(hostEl);
-          reactRoot.render(appElement);
-        } else {
-          Spicetify.ReactDOM.render(appElement, hostEl);
+      setOpenClasses(true);
+      const appElement = render();
+      const createRoot = Spicetify?.ReactDOM?.createRoot || Spicetify?.ReactDOMClient?.createRoot;
+      if (typeof createRoot === "function") {
+        if (!reactRoot) {
+          reactRoot = createRoot(hostEl);
         }
-        isOpen = true;
-        mainView.classList.add("cronotofy-panel-anchor");
-        setOpenClasses(true);
-        widgetsRef?.syncActiveRoute();
-      } catch (err) {
-        closeView();
-        console.warn("[Cronotofy] panel error:", err);
-        Spicetify?.showNotification?.(getTranslations().t.errorBoundary.fallbackMsg, true);
+        reactRoot.render(appElement);
+      } else {
+        Spicetify?.ReactDOM?.render?.(appElement, hostEl);
       }
+      isOpen = true;
+      widgetsRef?.syncActiveRoute();
     };
     const handleOpenOrToggle = () => {
-      if (isOpen && !hostEl?.isConnected) closeView();
       if (isOpen) {
         if (hostEl && hostEl.scrollTop > 12) {
           hostEl.scrollTo({ top: 0, behavior: "smooth" });
